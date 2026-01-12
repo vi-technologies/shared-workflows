@@ -315,6 +315,7 @@ jobs:
             
             // Parse cdk diff output into structured resources with property changes
             // CDK diff format: [+~-] AWS::Type::Name ConstructPath LogicalId
+            // Parse cdk diff - handles both simple changes and unified diff format
             function parseDiffOutput(diff) {
               const resources = [];
               if (!diff) return resources;
@@ -323,71 +324,102 @@ jobs:
               let currentResource = null;
               let currentProperty = null;
               let oldValue = null;
+              let inUnifiedDiff = false;
+              let removedLines = [];
+              let addedLines = [];
               
               for (const line of lines) {
                 // Match resource line: [+], [~], or [-] AWS::Type::Name ... LogicalId
                 const resourceMatch = line.match(/\[([+~-])\]\s+(AWS::\S+)\s+(.+)/);
                 if (resourceMatch) {
                   if (currentResource) {
-                    if (currentProperty && oldValue !== null) {
-                      currentResource.properties.push({ name: currentProperty, oldValue: oldValue, newValue: null });
+                    if (inUnifiedDiff && currentProperty) {
+                      currentResource.properties.push({
+                        name: currentProperty,
+                        oldValue: removedLines.length > 0 ? removedLines.join('\n') : null,
+                        newValue: addedLines.length > 0 ? addedLines.join('\n') : null,
+                        isUnifiedDiff: true
+                      });
+                    } else if (currentProperty && oldValue !== null) {
+                      currentResource.properties.push({ name: currentProperty, oldValue, newValue: null });
                     }
                     resources.push(currentResource);
                   }
                   const [, action, type, rest] = resourceMatch;
-                  const parts = rest.trim().split(/\s+/);
-                  const id = parts[parts.length - 1];
+                  const id = rest.trim().split(/\s+/).pop();
                   currentResource = {
                     action: action === '+' ? 'Add' : action === '-' ? 'Remove' : 'Modify',
                     type: type.replace('AWS::', ''),
-                    id: id,
-                    replace: line.toLowerCase().includes('replace'),
+                    id, replace: line.toLowerCase().includes('replace'),
                     properties: []
                   };
-                  currentProperty = null;
-                  oldValue = null;
+                  currentProperty = null; oldValue = null; inUnifiedDiff = false;
+                  removedLines = []; addedLines = [];
                   continue;
                 }
                 
                 if (!currentResource) continue;
                 
-                // Match property line with [~] only (property change indicator)
-                // Pattern: └─ [~] PropertyName or ├─ [~] PropertyName
+                // Match property line with [~]
                 const propMatch = line.match(/[└├]\s*─\s*\[~\]\s+(\S+)/);
                 if (propMatch) {
-                  if (currentProperty && oldValue !== null) {
-                    currentResource.properties.push({ name: currentProperty, oldValue: oldValue, newValue: null });
+                  if (inUnifiedDiff && currentProperty) {
+                    currentResource.properties.push({
+                      name: currentProperty,
+                      oldValue: removedLines.length > 0 ? removedLines.join('\n') : null,
+                      newValue: addedLines.length > 0 ? addedLines.join('\n') : null,
+                      isUnifiedDiff: true
+                    });
+                  } else if (currentProperty && oldValue !== null) {
+                    currentResource.properties.push({ name: currentProperty, oldValue, newValue: null });
                   }
-                  currentProperty = propMatch[1];
-                  oldValue = null;
+                  currentProperty = propMatch[1]; oldValue = null; inUnifiedDiff = false;
+                  removedLines = []; addedLines = [];
                   continue;
                 }
                 
-                // Match old value line with [-]
+                // Check for unified diff marker @@ -x,y +a,b @@
+                if (line.match(/@@ -\d+,\d+ \+\d+,\d+ @@/) && currentProperty) {
+                  inUnifiedDiff = true; removedLines = []; addedLines = [];
+                  continue;
+                }
+                
+                // Collect unified diff lines
+                if (inUnifiedDiff && currentProperty) {
+                  const rm = line.match(/\[-\]\s*(.*)/);
+                  if (rm) { removedLines.push(rm[1].trim()); continue; }
+                  const add = line.match(/\[\+\]\s*(.*)/);
+                  if (add) { addedLines.push(add[1].trim()); continue; }
+                  if (line.match(/\[ \]/)) continue;
+                }
+                
+                // Simple property change: [-] old_value
                 const oldMatch = line.match(/\[-\]\s+(.+)/);
-                if (oldMatch && currentProperty) {
+                if (oldMatch && currentProperty && !inUnifiedDiff) {
                   oldValue = oldMatch[1].trim();
                   continue;
                 }
                 
-                // Match new value line with [+]
+                // Simple property change: [+] new_value
                 const newMatch = line.match(/\[\+\]\s+(.+)/);
-                if (newMatch && currentProperty) {
-                  currentResource.properties.push({
-                    name: currentProperty,
-                    oldValue: oldValue,
-                    newValue: newMatch[1].trim()
-                  });
-                  currentProperty = null;
-                  oldValue = null;
+                if (newMatch && currentProperty && !inUnifiedDiff) {
+                  currentResource.properties.push({ name: currentProperty, oldValue, newValue: newMatch[1].trim() });
+                  currentProperty = null; oldValue = null;
                   continue;
                 }
               }
               
-              // Don't forget the last resource
+              // Save last resource
               if (currentResource) {
-                if (currentProperty && oldValue !== null) {
-                  currentResource.properties.push({ name: currentProperty, oldValue: oldValue, newValue: null });
+                if (inUnifiedDiff && currentProperty) {
+                  currentResource.properties.push({
+                    name: currentProperty,
+                    oldValue: removedLines.length > 0 ? removedLines.join('\n') : null,
+                    newValue: addedLines.length > 0 ? addedLines.join('\n') : null,
+                    isUnifiedDiff: true
+                  });
+                } else if (currentProperty && oldValue !== null) {
+                  currentResource.properties.push({ name: currentProperty, oldValue, newValue: null });
                 }
                 resources.push(currentResource);
               }
@@ -435,8 +467,19 @@ jobs:
                     if (res.properties.length > 0) {
                       content += '| Property | Current | New |\n|----------|---------|-----|\n';
                       for (const prop of res.properties) {
-                        const oldVal = prop.oldValue != null ? `\`${prop.oldValue}\`` : '_(not set)_';
-                        const newVal = prop.newValue != null ? `\`${prop.newValue}\`` : '_(removed)_';
+                        let oldVal, newVal;
+                        if (prop.isUnifiedDiff) {
+                          // Truncate unified diff values for readability
+                          const oldLines = prop.oldValue ? prop.oldValue.split('\n').slice(0, 3) : [];
+                          const newLines = prop.newValue ? prop.newValue.split('\n').slice(0, 3) : [];
+                          const truncOld = oldLines.join(' ').substring(0, 60);
+                          const truncNew = newLines.join(' ').substring(0, 60);
+                          oldVal = oldLines.length > 0 ? `\`${truncOld}${prop.oldValue.length > 60 ? '...' : ''}\`` : '_(none)_';
+                          newVal = newLines.length > 0 ? `\`${truncNew}${prop.newValue.length > 60 ? '...' : ''}\`` : '_(removed)_';
+                        } else {
+                          oldVal = prop.oldValue != null ? `\`${prop.oldValue}\`` : '_(not set)_';
+                          newVal = prop.newValue != null ? `\`${prop.newValue}\`` : '_(removed)_';
+                        }
                         content += `| \`${prop.name}\` | ${oldVal} | ${newVal} |\n`;
                       }
                     }
