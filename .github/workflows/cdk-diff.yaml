@@ -1,0 +1,303 @@
+name: CDK Diff
+
+on:
+  workflow_call:
+    inputs:
+      working-directory:
+        description: 'Working directory for CDK commands'
+        required: false
+        type: string
+        default: '.'
+      python-version:
+        description: 'Python version (for Python CDK apps)'
+        required: false
+        type: string
+        default: ''
+      node-version:
+        description: 'Node.js version'
+        required: false
+        type: string
+        default: '20'
+      aws-region:
+        description: 'AWS region'
+        required: false
+        type: string
+        default: 'us-east-1'
+      aws-role-arn:
+        description: 'AWS IAM role ARN to assume'
+        required: true
+        type: string
+      stacks:
+        description: 'Space-separated list of stack names to diff'
+        required: true
+        type: string
+      install-command:
+        description: 'Command to install dependencies'
+        required: false
+        type: string
+        default: 'npm ci'
+      enable-drift-detection:
+        description: 'Whether to run drift detection'
+        required: false
+        type: boolean
+        default: true
+
+jobs:
+  diff:
+    name: CDK Diff
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+      pull-requests: write
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        if: inputs.python-version != ''
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python-version }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+
+      - name: Install dependencies
+        run: ${{ inputs.install-command }}
+
+      - name: Install AWS CDK CLI
+        run: npm install -g aws-cdk
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ inputs.aws-role-arn }}
+          role-duration-seconds: 3600
+          aws-region: ${{ inputs.aws-region }}
+
+      - name: Synth CDK app
+        run: npx cdk synth --quiet --output cdk.out
+
+      - name: Run CDK Diff and Drift Detection
+        id: diff
+        env:
+          STACKS: ${{ inputs.stacks }}
+          ENABLE_DRIFT: ${{ inputs.enable-drift-detection }}
+          AWS_REGION: ${{ inputs.aws-region }}
+        run: |
+          #!/bin/bash
+          set -e
+          
+          RESULTS_FILE=$(mktemp)
+          echo "[]" > "$RESULTS_FILE"
+          
+          for STACK in $STACKS; do
+            echo "Processing stack: $STACK"
+            
+            # Run cdk diff
+            DIFF_OUTPUT=$(npx cdk diff "$STACK" --no-color 2>&1 || true)
+            
+            # Parse diff output for changes
+            ADDS=$(echo "$DIFF_OUTPUT" | grep -c '^\[+\]' || echo "0")
+            UPDATES=$(echo "$DIFF_OUTPUT" | grep -c '^\[~\]' || echo "0")
+            DESTROYS=$(echo "$DIFF_OUTPUT" | grep -c '^\[-\]' || echo "0")
+            REPLACES=$(echo "$DIFF_OUTPUT" | grep -ci 'replace' || echo "0")
+            
+            # Check if no changes
+            if echo "$DIFF_OUTPUT" | grep -q "no differences\|There were no differences"; then
+              ADDS=0
+              UPDATES=0
+              DESTROYS=0
+              REPLACES=0
+            fi
+            
+            # Drift detection
+            DRIFT_STATUS="⏭️ Skipped"
+            if [ "$ENABLE_DRIFT" = "true" ]; then
+              # Check if stack exists
+              STACK_EXISTS=$(aws cloudformation describe-stacks --stack-name "$STACK" 2>/dev/null && echo "yes" || echo "no")
+              
+              if [ "$STACK_EXISTS" = "yes" ]; then
+                echo "  Running drift detection for $STACK..."
+                
+                # Start drift detection
+                DRIFT_ID=$(aws cloudformation detect-stack-drift --stack-name "$STACK" --query 'StackDriftDetectionId' --output text 2>/dev/null || echo "")
+                
+                if [ -n "$DRIFT_ID" ]; then
+                  # Wait for drift detection to complete (max 60 seconds)
+                  for i in {1..12}; do
+                    DRIFT_CHECK=$(aws cloudformation describe-stack-drift-detection-status \
+                      --stack-drift-detection-id "$DRIFT_ID" \
+                      --query 'DetectionStatus' --output text 2>/dev/null || echo "FAILED")
+                    
+                    if [ "$DRIFT_CHECK" = "DETECTION_COMPLETE" ]; then
+                      DRIFT_RESULT=$(aws cloudformation describe-stack-drift-detection-status \
+                        --stack-drift-detection-id "$DRIFT_ID" \
+                        --query 'StackDriftStatus' --output text 2>/dev/null || echo "UNKNOWN")
+                      
+                      case "$DRIFT_RESULT" in
+                        "IN_SYNC") DRIFT_STATUS="✅ In Sync" ;;
+                        "DRIFTED") DRIFT_STATUS="🚨 Drifted" ;;
+                        "NOT_CHECKED") DRIFT_STATUS="⚠️ Not Checked" ;;
+                        *) DRIFT_STATUS="❓ $DRIFT_RESULT" ;;
+                      esac
+                      break
+                    elif [ "$DRIFT_CHECK" = "DETECTION_FAILED" ]; then
+                      DRIFT_STATUS="❌ Failed"
+                      break
+                    fi
+                    sleep 5
+                  done
+                else
+                  DRIFT_STATUS="❌ Error"
+                fi
+              else
+                DRIFT_STATUS="🆕 New Stack"
+              fi
+            fi
+            
+            # Escape diff output for JSON
+            DIFF_ESCAPED=$(echo "$DIFF_OUTPUT" | jq -Rs '.')
+            
+            # Add to results
+            jq --arg stack "$STACK" \
+               --arg adds "$ADDS" \
+               --arg updates "$UPDATES" \
+               --arg destroys "$DESTROYS" \
+               --arg replaces "$REPLACES" \
+               --arg drift "$DRIFT_STATUS" \
+               --argjson diff "$DIFF_ESCAPED" \
+               '. += [{"stack": $stack, "adds": ($adds|tonumber), "updates": ($updates|tonumber), "destroys": ($destroys|tonumber), "replaces": ($replaces|tonumber), "drift": $drift, "diff": $diff}]' \
+               "$RESULTS_FILE" > "${RESULTS_FILE}.tmp" && mv "${RESULTS_FILE}.tmp" "$RESULTS_FILE"
+            
+            echo "  Done: +$ADDS ~$UPDATES -$DESTROYS | Drift: $DRIFT_STATUS"
+          done
+          
+          # Output results as JSON
+          RESULTS=$(cat "$RESULTS_FILE")
+          echo "results<<EOF" >> $GITHUB_OUTPUT
+          echo "$RESULTS" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          
+          rm -f "$RESULTS_FILE"
+
+      - name: Post PR Comment
+        uses: actions/github-script@v7
+        env:
+          RESULTS: ${{ steps.diff.outputs.results }}
+          ENABLE_DRIFT: ${{ inputs.enable-drift-detection }}
+        with:
+          script: |
+            const results = JSON.parse(process.env.RESULTS || '[]');
+            const enableDrift = process.env.ENABLE_DRIFT === 'true';
+            
+            // Build summary table
+            let tableHeader = '| Stack | Diff | Drift |';
+            let tableSeparator = '|-------|------|-------|';
+            
+            if (!enableDrift) {
+              tableHeader = '| Stack | Diff |';
+              tableSeparator = '|-------|------|';
+            }
+            
+            const tableRows = results.map(r => {
+              const total = r.adds + r.updates + r.destroys + r.replaces;
+              let diffSummary;
+              
+              if (total === 0) {
+                diffSummary = '✅ No changes';
+              } else {
+                const parts = [];
+                if (r.adds > 0) parts.push(`🟢 +${r.adds}`);
+                if (r.updates > 0) parts.push(`🟡 ~${r.updates}`);
+                if (r.replaces > 0) parts.push(`🟠 ♻️${r.replaces}`);
+                if (r.destroys > 0) parts.push(`🔴 -${r.destroys}`);
+                diffSummary = parts.join(' ');
+              }
+              
+              if (enableDrift) {
+                return `| \`${r.stack}\` | ${diffSummary} | ${r.drift} |`;
+              } else {
+                return `| \`${r.stack}\` | ${diffSummary} |`;
+              }
+            });
+            
+            // Build details sections
+            const details = results.map(r => {
+              const diffContent = r.diff.trim();
+              if (!diffContent || diffContent.includes('no differences') || diffContent.includes('There were no differences')) {
+                return `<details>\n<summary>📦 <b>${r.stack}</b> - No changes</summary>\n\n\`\`\`\nNo differences\n\`\`\`\n</details>`;
+              }
+              return `<details>\n<summary>📦 <b>${r.stack}</b></summary>\n\n\`\`\`diff\n${diffContent}\n\`\`\`\n</details>`;
+            }).join('\n\n');
+            
+            // Calculate totals
+            const totals = results.reduce((acc, r) => ({
+              adds: acc.adds + r.adds,
+              updates: acc.updates + r.updates,
+              destroys: acc.destroys + r.destroys,
+              replaces: acc.replaces + r.replaces
+            }), { adds: 0, updates: 0, destroys: 0, replaces: 0 });
+            
+            const totalChanges = totals.adds + totals.updates + totals.destroys + totals.replaces;
+            let summaryLine = totalChanges === 0 
+              ? '✅ **No infrastructure changes**'
+              : `**${totalChanges} changes:** 🟢 ${totals.adds} to add, 🟡 ${totals.updates} to update, 🟠 ${totals.replaces} to replace, 🔴 ${totals.destroys} to destroy`;
+            
+            const hasDrift = results.some(r => r.drift.includes('Drifted'));
+            if (enableDrift && hasDrift) {
+              summaryLine += ' | 🚨 **Drift detected!**';
+            }
+            
+            const body = [
+              '## 🏗️ CDK Diff',
+              '',
+              summaryLine,
+              '',
+              tableHeader,
+              tableSeparator,
+              ...tableRows,
+              '',
+              '<details>',
+              '<summary>📋 <b>View Details</b></summary>',
+              '',
+              details,
+              '',
+              '</details>',
+              '',
+              '---',
+              `<sub>Generated at ${new Date().toISOString()} from commit <code>${context.sha.substring(0, 7)}</code></sub>`
+            ].join('\n');
+
+            // Find and update or create comment
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            
+            const botComment = comments.find(c => c.body.includes('## 🏗️ CDK Diff'));
+            
+            if (botComment) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: botComment.id,
+                body
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body
+              });
+            }

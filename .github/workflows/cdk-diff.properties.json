@@ -1,0 +1,6 @@
+{
+  "name": "CDK Diff Workflow",
+  "description": "Reusable workflow for CDK diff with table output and drift detection",
+  "iconName": "cloud",
+  "categories": ["Infrastructure", "CDK", "AWS"]
+}
