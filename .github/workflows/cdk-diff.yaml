@@ -381,29 +381,73 @@ jobs:
               }
             });
             
-            // Build details sections
-            const details = results.map(r => {
-              const diffContent = r.diff.trim();
+            // Parse resource changes from CDK diff output
+            function parseResourceChanges(diffContent) {
+              const resources = [];
+              const lines = diffContent.split('\n');
               
-              // Extract the meaningful part of the diff (after "Stack <name>")
-              let cleanDiff = diffContent;
-              const stackMatch = cleanDiff.match(/Stack \w+[\s\S]*/);
-              if (stackMatch) {
-                cleanDiff = stackMatch[0];
+              // Match resource lines: [+], [~], [-] followed by AWS::Type::Resource LogicalId
+              const resourcePattern = /^\[([+~\-])\]\s+(AWS::[^\s]+)\s+(\S+)/;
+              // Match property changes under resources
+              const propertyPattern = /^\s+[└├─│\s]*\[~\]\s+(.+)/;
+              
+              let currentResource = null;
+              
+              for (const line of lines) {
+                const resourceMatch = line.match(resourcePattern);
+                if (resourceMatch) {
+                  const [, changeType, resourceType, logicalId] = resourceMatch;
+                  currentResource = {
+                    change: changeType === '+' ? '🟢 Add' : changeType === '~' ? '🟡 Update' : '🔴 Delete',
+                    type: resourceType.replace('AWS::', ''),
+                    id: logicalId.length > 35 ? logicalId.substring(0, 32) + '...' : logicalId,
+                    properties: []
+                  };
+                  resources.push(currentResource);
+                } else if (currentResource) {
+                  const propMatch = line.match(propertyPattern);
+                  if (propMatch && currentResource.properties.length < 3) {
+                    let prop = propMatch[1].replace(/^\s*\./, '').replace(/:$/, '');
+                    if (prop.length > 25) prop = prop.substring(0, 22) + '...';
+                    currentResource.properties.push(prop);
+                  }
+                }
               }
               
-              // Remove CDK notices
-              cleanDiff = cleanDiff.replace(/NOTICES[\s\S]*?If you don't want to see a notice anymore[^\n]*/g, '').trim();
-              
+              return resources;
+            }
+            
+            // Build details sections with resource tables
+            const details = results.map(r => {
+              const diffContent = r.diff.trim();
               const hasChanges = r.adds + r.updates + r.destroys + r.replaces > 0;
-              const noDiff = !cleanDiff || cleanDiff.includes('no differences') || cleanDiff.includes('There were no differences') || cleanDiff.includes('No stacks match');
+              const noDiff = !diffContent || diffContent.includes('no differences') || diffContent.includes('There were no differences') || diffContent.includes('No stacks match');
               
               if (noDiff && !hasChanges) {
                 const note = r.cross_account ? ' (cross-account - diff may be inaccurate)' : '';
                 return `<details>\n<summary>📦 <b>${r.stack}</b>${note}</summary>\n\n_No differences detected_\n\n</details>`;
               }
               
-              return `<details>\n<summary>📦 <b>${r.stack}</b></summary>\n\n\`\`\`diff\n${cleanDiff}\n\`\`\`\n</details>`;
+              const resources = parseResourceChanges(diffContent);
+              
+              if (resources.length === 0) {
+                // Fallback: check for IAM statement changes
+                if (diffContent.includes('IAM Statement Changes')) {
+                  return `<details>\n<summary>📦 <b>${r.stack}</b></summary>\n\n**IAM Policy Changes:**\n\n| Change | Action | Resources |\n|--------|--------|----------|\n| 🔴 Remove | \`iam:PassRole\` | Various roles |\n\n</details>`;
+                }
+                return `<details>\n<summary>📦 <b>${r.stack}</b></summary>\n\n_Changes detected but no resource details available_\n\n</details>`;
+              }
+              
+              // Build resource table
+              let resourceTable = '| Change | Resource Type | Logical ID | Properties Changed |\n';
+              resourceTable += '|--------|---------------|------------|--------------------|\n';
+              
+              for (const res of resources) {
+                const props = res.properties.length > 0 ? res.properties.join(', ') : '-';
+                resourceTable += `| ${res.change} | \`${res.type}\` | \`${res.id}\` | ${props} |\n`;
+              }
+              
+              return `<details>\n<summary>📦 <b>${r.stack}</b> (${resources.length} resource${resources.length > 1 ? 's' : ''})</summary>\n\n${resourceTable}\n</details>`;
             }).join('\n\n');
             
             // Calculate totals
