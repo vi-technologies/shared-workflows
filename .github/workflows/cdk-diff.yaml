@@ -100,25 +100,16 @@ jobs:
           ACCOUNT_NAMES: ${{ inputs.account-names }}
         run: |
           echo "=== Starting CDK Diff ==="
-          echo "Stacks to process: $STACKS"
-          echo "Drift detection: $ENABLE_DRIFT"
           
-          # Get current account ID
           CURRENT_ACCOUNT=$(aws sts get-caller-identity --query 'Account' --output text)
           echo "Current AWS account: $CURRENT_ACCOUNT"
           
-          # Parse account names JSON
-          echo "Account names mapping: $ACCOUNT_NAMES"
-          
-          # Save original credentials
           ORIGINAL_ACCESS_KEY="$AWS_ACCESS_KEY_ID"
           ORIGINAL_SECRET_KEY="$AWS_SECRET_ACCESS_KEY"
           ORIGINAL_SESSION_TOKEN="$AWS_SESSION_TOKEN"
           
-          # Initialize results array
           RESULTS="[]"
           
-          # Function to get stack's target account from manifest
           get_stack_account() {
             local stack_name="$1"
             if [ -f "cdk.out/manifest.json" ]; then
@@ -131,7 +122,6 @@ jobs:
             echo "$CURRENT_ACCOUNT"
           }
           
-          # Function to get friendly account name
           get_account_name() {
             local account_id="$1"
             local name=$(echo "$ACCOUNT_NAMES" | jq -r ".[\"$account_id\"] // \"\"" 2>/dev/null)
@@ -142,7 +132,6 @@ jobs:
             fi
           }
           
-          # Function to get CloudFormation stack name from manifest
           get_cf_stack_name() {
             local cdk_stack="$1"
             if [ -f "cdk.out/manifest.json" ]; then
@@ -157,21 +146,16 @@ jobs:
             fi
           }
           
-          # Function to restore original credentials
           restore_credentials() {
             export AWS_ACCESS_KEY_ID="$ORIGINAL_ACCESS_KEY"
             export AWS_SECRET_ACCESS_KEY="$ORIGINAL_SECRET_KEY"
             export AWS_SESSION_TOKEN="$ORIGINAL_SESSION_TOKEN"
           }
           
-          # Function to assume role in target account
           assume_target_role() {
             local target_account="$1"
             local region="$AWS_REGION"
-            
             local lookup_role="arn:aws:iam::${target_account}:role/cdk-hnb659fds-lookup-role-${target_account}-${region}"
-            
-            echo "  Attempting to assume role: $lookup_role"
             
             local creds=$(aws sts assume-role \
               --role-arn "$lookup_role" \
@@ -183,57 +167,40 @@ jobs:
               export AWS_ACCESS_KEY_ID=$(echo "$creds" | cut -f1)
               export AWS_SECRET_ACCESS_KEY=$(echo "$creds" | cut -f2)
               export AWS_SESSION_TOKEN=$(echo "$creds" | cut -f3)
-              echo "  Successfully assumed role in account $target_account"
               return 0
-            else
-              echo "  Could not assume role in account $target_account"
-              return 1
             fi
+            return 1
           }
           
           for STACK in $STACKS; do
             echo ""
             echo "=== Processing stack: $STACK ==="
             
-            # Get target account and CF stack name
             TARGET_ACCOUNT=$(get_stack_account "$STACK")
             CF_STACK_NAME=$(get_cf_stack_name "$STACK")
             ACCOUNT_NAME=$(get_account_name "$TARGET_ACCOUNT")
             
             echo "Target account: $TARGET_ACCOUNT ($ACCOUNT_NAME)"
-            echo "CloudFormation stack name: $CF_STACK_NAME"
             
-            CROSS_ACCOUNT=false
-            CROSS_ACCOUNT_ACCESS=false
-            
+            # Assume role if cross-account
             if [ "$TARGET_ACCOUNT" != "$CURRENT_ACCOUNT" ]; then
-              CROSS_ACCOUNT=true
-              echo "  Cross-account stack detected"
-              
-              if assume_target_role "$TARGET_ACCOUNT"; then
-                CROSS_ACCOUNT_ACCESS=true
-              fi
+              assume_target_role "$TARGET_ACCOUNT" || true
             fi
             
             # Run cdk diff
             DIFF_OUTPUT=$(npx cdk diff "$STACK" --no-color 2>&1) || true
             
-            # Parse changes
-            ADDS=$(echo "$DIFF_OUTPUT" | grep -c '^\[+\]' || true)
-            ADDS=${ADDS:-0}
-            UPDATES=$(echo "$DIFF_OUTPUT" | grep -c '^\[~\]' || true)
-            UPDATES=${UPDATES:-0}
-            DESTROYS=$(echo "$DIFF_OUTPUT" | grep -c '^\[-\]' || true)
-            DESTROYS=${DESTROYS:-0}
-            REPLACES=$(echo "$DIFF_OUTPUT" | grep -ci 'replace' || true)
-            REPLACES=${REPLACES:-0}
+            # Count changes
+            ADDS=$(echo "$DIFF_OUTPUT" | grep -c '^\[+\]' || echo "0")
+            UPDATES=$(echo "$DIFF_OUTPUT" | grep -c '^\[~\]' || echo "0")
+            DESTROYS=$(echo "$DIFF_OUTPUT" | grep -c '^\[-\]' || echo "0")
+            REPLACES=$(echo "$DIFF_OUTPUT" | grep -c '(requires replacement)' || echo "0")
             
             ADDS=$((ADDS + 0))
             UPDATES=$((UPDATES + 0))
             DESTROYS=$((DESTROYS + 0))
             REPLACES=$((REPLACES + 0))
             
-            # Check for "no differences" 
             if echo "$DIFF_OUTPUT" | grep -qi "no differences\|There were no differences"; then
               ADDS=0
               UPDATES=0
@@ -241,70 +208,58 @@ jobs:
               REPLACES=0
             fi
             
-            echo "Changes: +$ADDS ~$UPDATES -$DESTROYS ♻️$REPLACES"
-            
             # Drift detection
             DRIFT_STATUS="⏭️ Skipped"
+            DRIFT_DETAILS=""
+            
             if [ "$ENABLE_DRIFT" = "true" ]; then
-              echo "Running drift detection for CloudFormation stack: $CF_STACK_NAME"
-              
-              if [ "$CROSS_ACCOUNT" = "true" ] && [ "$CROSS_ACCOUNT_ACCESS" = "false" ]; then
-                DRIFT_STATUS="🌐 Cross-account (no access)"
-              else
-                # Check if stack exists using CF stack name
-                if aws cloudformation describe-stacks --stack-name "$CF_STACK_NAME" >/dev/null 2>&1; then
-                  echo "  Stack exists, starting drift detection..."
-                  
-                  DRIFT_ID=$(aws cloudformation detect-stack-drift --stack-name "$CF_STACK_NAME" --query 'StackDriftDetectionId' --output text 2>/dev/null) || true
-                  
-                  if [ -n "$DRIFT_ID" ] && [ "$DRIFT_ID" != "None" ]; then
-                    echo "  Drift detection ID: $DRIFT_ID"
+              if aws cloudformation describe-stacks --stack-name "$CF_STACK_NAME" >/dev/null 2>&1; then
+                DRIFT_ID=$(aws cloudformation detect-stack-drift --stack-name "$CF_STACK_NAME" --query 'StackDriftDetectionId' --output text 2>/dev/null) || true
+                
+                if [ -n "$DRIFT_ID" ] && [ "$DRIFT_ID" != "None" ]; then
+                  for i in {1..12}; do
+                    sleep 5
+                    DRIFT_CHECK=$(aws cloudformation describe-stack-drift-detection-status \
+                      --stack-drift-detection-id "$DRIFT_ID" \
+                      --query 'DetectionStatus' --output text 2>/dev/null) || echo "FAILED"
                     
-                    for i in {1..12}; do
-                      sleep 5
-                      DRIFT_CHECK=$(aws cloudformation describe-stack-drift-detection-status \
+                    if [ "$DRIFT_CHECK" = "DETECTION_COMPLETE" ]; then
+                      DRIFT_RESULT=$(aws cloudformation describe-stack-drift-detection-status \
                         --stack-drift-detection-id "$DRIFT_ID" \
-                        --query 'DetectionStatus' --output text 2>/dev/null) || echo "FAILED"
+                        --query 'StackDriftStatus' --output text 2>/dev/null) || echo "UNKNOWN"
                       
-                      echo "  Drift check status: $DRIFT_CHECK"
-                      
-                      if [ "$DRIFT_CHECK" = "DETECTION_COMPLETE" ]; then
-                        DRIFT_RESULT=$(aws cloudformation describe-stack-drift-detection-status \
-                          --stack-drift-detection-id "$DRIFT_ID" \
-                          --query 'StackDriftStatus' --output text 2>/dev/null) || echo "UNKNOWN"
-                        
-                        case "$DRIFT_RESULT" in
-                          "IN_SYNC") DRIFT_STATUS="✅ In Sync" ;;
-                          "DRIFTED") DRIFT_STATUS="🚨 Drifted" ;;
-                          "NOT_CHECKED") DRIFT_STATUS="⚠️ Partial" ;;
-                          *) DRIFT_STATUS="❓ $DRIFT_RESULT" ;;
-                        esac
-                        break
-                      elif [ "$DRIFT_CHECK" = "DETECTION_FAILED" ]; then
-                        DRIFT_STATUS="⚠️ Not Supported"
-                        break
+                      if [ "$DRIFT_RESULT" = "IN_SYNC" ]; then
+                        DRIFT_STATUS="✅ In Sync"
+                      elif [ "$DRIFT_RESULT" = "DRIFTED" ]; then
+                        DRIFT_STATUS="🚨 Drifted"
+                        # Get drifted resources
+                        DRIFT_DETAILS=$(aws cloudformation describe-stack-resource-drifts \
+                          --stack-name "$CF_STACK_NAME" \
+                          --stack-resource-drift-status-filters MODIFIED DELETED \
+                          --query 'StackResourceDrifts[].{Type:ResourceType,Id:LogicalResourceId,Status:StackResourceDriftStatus}' \
+                          --output json 2>/dev/null) || echo "[]"
+                      else
+                        DRIFT_STATUS="⚠️ $DRIFT_RESULT"
                       fi
-                    done
-                  else
-                    DRIFT_STATUS="⚠️ Not Supported"
-                  fi
+                      break
+                    elif [ "$DRIFT_CHECK" = "DETECTION_FAILED" ]; then
+                      DRIFT_STATUS="⚠️ Not Supported"
+                      break
+                    fi
+                  done
                 else
-                  DRIFT_STATUS="🆕 Not Deployed"
+                  DRIFT_STATUS="⚠️ Not Supported"
                 fi
+              else
+                DRIFT_STATUS="🆕 Not Deployed"
               fi
             fi
             
-            # Restore credentials
             restore_credentials
             
-            echo "Drift status: $DRIFT_STATUS"
-            echo "Diff output preview:"
-            echo "$DIFF_OUTPUT" | head -30
-            
-            # Escape diff output for JSON
             DIFF_ESCAPED=$(echo "$DIFF_OUTPUT" | jq -Rs '.')
+            DRIFT_DETAILS_ESCAPED=$(echo "$DRIFT_DETAILS" | jq -c '.' 2>/dev/null || echo "[]")
             
-            # Build result object
             RESULT=$(jq -n \
               --arg stack "$STACK" \
               --argjson adds "$ADDS" \
@@ -312,20 +267,13 @@ jobs:
               --argjson destroys "$DESTROYS" \
               --argjson replaces "$REPLACES" \
               --arg drift "$DRIFT_STATUS" \
+              --argjson drift_details "$DRIFT_DETAILS_ESCAPED" \
               --argjson diff "$DIFF_ESCAPED" \
-              --arg target_account "$TARGET_ACCOUNT" \
               --arg account_name "$ACCOUNT_NAME" \
-              --argjson cross_account "$CROSS_ACCOUNT" \
-              '{stack: $stack, adds: $adds, updates: $updates, destroys: $destroys, replaces: $replaces, drift: $drift, diff: $diff, target_account: $target_account, account_name: $account_name, cross_account: $cross_account}')
+              '{stack: $stack, adds: $adds, updates: $updates, destroys: $destroys, replaces: $replaces, drift: $drift, drift_details: $drift_details, diff: $diff, account_name: $account_name}')
             
             RESULTS=$(echo "$RESULTS" | jq --argjson result "$RESULT" '. + [$result]')
-            
-            echo "=== Done with $STACK ==="
           done
-          
-          echo ""
-          echo "=== Final Results ==="
-          echo "$RESULTS" | jq '.'
           
           echo "results<<EOF" >> $GITHUB_OUTPUT
           echo "$RESULTS" >> $GITHUB_OUTPUT
@@ -341,113 +289,144 @@ jobs:
             const results = JSON.parse(process.env.RESULTS || '[]');
             const enableDrift = process.env.ENABLE_DRIFT === 'true';
             
-            console.log('Results:', JSON.stringify(results, null, 2));
-            
-            // Build summary table
-            let tableHeader = '| Stack | Account | Diff | Drift |';
-            let tableSeparator = '|-------|---------|------|-------|';
-            
-            if (!enableDrift) {
-              tableHeader = '| Stack | Account | Diff |';
-              tableSeparator = '|-------|---------|------|';
-            }
-            
-            const tableRows = results.map(r => {
-              const total = r.adds + r.updates + r.destroys + r.replaces;
-              let diffSummary;
-              
-              if (r.cross_account && total === 0) {
-                diffSummary = '⚠️ Cross-account';
-              } else if (total === 0) {
-                diffSummary = '✅ No changes';
-              } else {
-                const parts = [];
-                if (r.adds > 0) parts.push(`🟢 +${r.adds}`);
-                if (r.updates > 0) parts.push(`🟡 ~${r.updates}`);
-                if (r.replaces > 0) parts.push(`🟠 ♻️${r.replaces}`);
-                if (r.destroys > 0) parts.push(`🔴 -${r.destroys}`);
-                diffSummary = parts.join(' ');
-              }
-              
-              // Use account name, fallback to last 4 digits of account ID
-              const accountDisplay = r.account_name !== r.target_account 
-                ? r.account_name 
-                : `...${r.target_account.slice(-4)}`;
-              
-              if (enableDrift) {
-                return `| \`${r.stack}\` | ${accountDisplay} | ${diffSummary} | ${r.drift} |`;
-              } else {
-                return `| \`${r.stack}\` | ${accountDisplay} | ${diffSummary} |`;
-              }
-            });
-            
-            // Parse resource changes from CDK diff output
-            function parseResourceChanges(diffContent) {
-              const resources = [];
+            // Parse CDK diff output into structured changes
+            function parseDiffOutput(diffContent) {
+              const changes = [];
               const lines = diffContent.split('\n');
               
-              // Match resource lines: [+], [~], [-] followed by AWS::Type::Resource LogicalId
-              const resourcePattern = /^\[([+~\-])\]\s+(AWS::[^\s]+)\s+(\S+)/;
-              // Match property changes under resources
-              const propertyPattern = /^\s+[└├─│\s]*\[~\]\s+(.+)/;
+              let currentSection = null;
+              let iamChanges = [];
               
-              let currentResource = null;
-              
-              for (const line of lines) {
-                const resourceMatch = line.match(resourcePattern);
+              for (let i = 0; i < lines.length; i++) {
+                const line = lines[i];
+                
+                // Parse IAM Statement Changes table
+                if (line.includes('IAM Statement Changes')) {
+                  currentSection = 'iam';
+                  continue;
+                }
+                
+                // Parse resource changes: [+], [~], [-]
+                const resourceMatch = line.match(/^\[([+~\-])\]\s+(AWS::[^\s]+)\s+(\S+)/);
                 if (resourceMatch) {
                   const [, changeType, resourceType, logicalId] = resourceMatch;
-                  currentResource = {
-                    change: changeType === '+' ? '🟢 Add' : changeType === '~' ? '🟡 Update' : '🔴 Delete',
+                  const change = {
+                    action: changeType === '+' ? 'Add' : changeType === '~' ? 'Update' : 'Delete',
+                    icon: changeType === '+' ? '🟢' : changeType === '~' ? '🟡' : '🔴',
                     type: resourceType.replace('AWS::', ''),
-                    id: logicalId.length > 35 ? logicalId.substring(0, 32) + '...' : logicalId,
-                    properties: []
+                    id: logicalId,
+                    details: [],
+                    replace: false
                   };
-                  resources.push(currentResource);
-                } else if (currentResource) {
-                  const propMatch = line.match(propertyPattern);
-                  if (propMatch && currentResource.properties.length < 3) {
-                    let prop = propMatch[1].replace(/^\s*\./, '').replace(/:$/, '');
-                    if (prop.length > 25) prop = prop.substring(0, 22) + '...';
-                    currentResource.properties.push(prop);
+                  
+                  // Check if this requires replacement
+                  if (line.includes('replace')) {
+                    change.replace = true;
+                    change.icon = '🟠';
+                    change.action = 'Replace';
+                  }
+                  
+                  // Look ahead for property changes
+                  for (let j = i + 1; j < lines.length && j < i + 20; j++) {
+                    const propLine = lines[j];
+                    if (propLine.match(/^\[/)) break; // Next resource
+                    
+                    // Match property changes with values
+                    const propMatch = propLine.match(/[└├─│\s]*\[~\]\s+(\S+)/);
+                    if (propMatch) {
+                      change.details.push(propMatch[1].replace(/^\./, ''));
+                    }
+                    
+                    // Match added/removed lines in diff format
+                    const addedMatch = propLine.match(/\[\+\]\s+(.+)/);
+                    const removedMatch = propLine.match(/\[-\]\s+(.+)/);
+                    if (addedMatch && change.details.length < 5) {
+                      change.details.push(`+ ${addedMatch[1].substring(0, 50)}`);
+                    }
+                    if (removedMatch && change.details.length < 5) {
+                      change.details.push(`- ${removedMatch[1].substring(0, 50)}`);
+                    }
+                  }
+                  
+                  changes.push(change);
+                  continue;
+                }
+                
+                // Parse IAM statement rows (look for | - | or | + |)
+                if (currentSection === 'iam') {
+                  const iamMatch = line.match(/│\s*([+-])\s*│\s*([^│]+)│\s*(\w+)\s*│\s*([^│]+)/);
+                  if (iamMatch) {
+                    const [, changeType, resource, effect, action] = iamMatch;
+                    iamChanges.push({
+                      action: changeType === '+' ? 'Add' : 'Remove',
+                      icon: changeType === '+' ? '🟢' : '🔴',
+                      type: 'IAM::Statement',
+                      id: action.trim(),
+                      details: [resource.trim().substring(0, 60)],
+                      replace: false
+                    });
+                  }
+                  if (line.includes('└') || line.includes('Resources')) {
+                    currentSection = null;
                   }
                 }
               }
               
-              return resources;
+              // Add IAM changes to the list
+              changes.push(...iamChanges);
+              
+              return changes;
             }
             
-            // Build details sections with resource tables
-            const details = results.map(r => {
-              const diffContent = r.diff.trim();
+            // Build the comment body
+            const stackSections = results.map(r => {
               const hasChanges = r.adds + r.updates + r.destroys + r.replaces > 0;
-              const noDiff = !diffContent || diffContent.includes('no differences') || diffContent.includes('There were no differences') || diffContent.includes('No stacks match');
+              const noDiff = r.diff.includes('no differences') || r.diff.includes('There were no differences');
+              
+              // Stack header with summary
+              let header = `### 📦 ${r.stack}`;
+              header += ` _(${r.account_name})_`;
+              
+              let content = '';
               
               if (noDiff && !hasChanges) {
-                const note = r.cross_account ? ' (cross-account - diff may be inaccurate)' : '';
-                return `<details>\n<summary>📦 <b>${r.stack}</b>${note}</summary>\n\n_No differences detected_\n\n</details>`;
-              }
-              
-              const resources = parseResourceChanges(diffContent);
-              
-              if (resources.length === 0) {
-                // Fallback: check for IAM statement changes
-                if (diffContent.includes('IAM Statement Changes')) {
-                  return `<details>\n<summary>📦 <b>${r.stack}</b></summary>\n\n**IAM Policy Changes:**\n\n| Change | Action | Resources |\n|--------|--------|----------|\n| 🔴 Remove | \`iam:PassRole\` | Various roles |\n\n</details>`;
+                content = '\n\n✅ No changes\n';
+              } else {
+                const changes = parseDiffOutput(r.diff);
+                
+                if (changes.length > 0) {
+                  content = '\n\n| | Type | Resource | What\'s Changing |\n';
+                  content += '|---|------|----------|------------------|\n';
+                  
+                  for (const c of changes) {
+                    const details = c.details.length > 0 
+                      ? c.details.slice(0, 3).map(d => `\`${d.substring(0, 40)}\``).join(', ')
+                      : '-';
+                    const idDisplay = c.id.length > 30 ? c.id.substring(0, 27) + '...' : c.id;
+                    content += `| ${c.icon} ${c.action} | \`${c.type}\` | \`${idDisplay}\` | ${details} |\n`;
+                  }
+                } else {
+                  // Fallback for unparseable diff
+                  content = '\n\n_Changes detected - see raw diff below_\n';
+                  content += '\n<details><summary>Raw diff</summary>\n\n```\n';
+                  content += r.diff.substring(0, 2000);
+                  content += '\n```\n</details>\n';
                 }
-                return `<details>\n<summary>📦 <b>${r.stack}</b></summary>\n\n_Changes detected but no resource details available_\n\n</details>`;
               }
               
-              // Build resource table
-              let resourceTable = '| Change | Resource Type | Logical ID | Properties Changed |\n';
-              resourceTable += '|--------|---------------|------------|--------------------|\n';
-              
-              for (const res of resources) {
-                const props = res.properties.length > 0 ? res.properties.join(', ') : '-';
-                resourceTable += `| ${res.change} | \`${res.type}\` | \`${res.id}\` | ${props} |\n`;
+              // Drift section
+              if (enableDrift) {
+                content += `\n**Drift:** ${r.drift}`;
+                
+                if (r.drift.includes('Drifted') && r.drift_details && r.drift_details.length > 0) {
+                  content += '\n\n| Resource | Type | Status |\n|----------|------|--------|\n';
+                  for (const d of r.drift_details.slice(0, 10)) {
+                    content += `| \`${d.Id}\` | \`${d.Type.replace('AWS::', '')}\` | ${d.Status} |\n`;
+                  }
+                }
               }
               
-              return `<details>\n<summary>📦 <b>${r.stack}</b> (${resources.length} resource${resources.length > 1 ? 's' : ''})</summary>\n\n${resourceTable}\n</details>`;
+              return `<details open>\n<summary>${header}</summary>\n${content}\n</details>`;
             }).join('\n\n');
             
             // Calculate totals
@@ -459,19 +438,14 @@ jobs:
             }), { adds: 0, updates: 0, destroys: 0, replaces: 0 });
             
             const totalChanges = totals.adds + totals.updates + totals.destroys + totals.replaces;
-            const crossAccountCount = results.filter(r => r.cross_account).length;
             
             let summaryLine = totalChanges === 0 
               ? '✅ **No infrastructure changes**'
-              : `**${totalChanges} changes:** 🟢 ${totals.adds} to add, 🟡 ${totals.updates} to update, 🟠 ${totals.replaces} to replace, 🔴 ${totals.destroys} to destroy`;
-            
-            if (crossAccountCount > 0) {
-              summaryLine += ` | 🌐 ${crossAccountCount} cross-account`;
-            }
+              : `**${totalChanges} resource changes:** 🟢 ${totals.adds} add | 🟡 ${totals.updates} update | 🟠 ${totals.replaces} replace | 🔴 ${totals.destroys} destroy`;
             
             const hasDrift = results.some(r => r.drift.includes('Drifted'));
             if (enableDrift && hasDrift) {
-              summaryLine += ' | 🚨 **Drift detected!**';
+              summaryLine += ' | 🚨 **Drift detected**';
             }
             
             const body = [
@@ -479,16 +453,7 @@ jobs:
               '',
               summaryLine,
               '',
-              tableHeader,
-              tableSeparator,
-              ...tableRows,
-              '',
-              '<details>',
-              '<summary>📋 <b>View Details</b></summary>',
-              '',
-              details,
-              '',
-              '</details>',
+              stackSections,
               '',
               '---',
               `<sub>Generated at ${new Date().toISOString()} from commit <code>${context.sha.substring(0, 7)}</code></sub>`
