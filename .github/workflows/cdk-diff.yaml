@@ -282,11 +282,36 @@ jobs:
                   --change-set-name "$CHANGE_SET_NAME" 2>/dev/null || true
               else
                 echo "Failed to create change set: $CREATE_OUTPUT"
-                # If stack doesn't exist, this is a new stack
-                if [ "$STACK_EXISTS" = "false" ]; then
-                  # Count resources in template as adds
-                  ADDS=$(jq '.Resources | length' "$TEMPLATE_FILE" 2>/dev/null || echo "0")
-                fi
+                echo "Falling back to cdk diff..."
+                
+                # Fall back to cdk diff for counting changes
+                DIFF_OUTPUT=$(npx cdk diff "$STACK" --no-color 2>&1) || true
+                
+                ADDS=$(echo "$DIFF_OUTPUT" | grep -c '^\[+\]' 2>/dev/null || true)
+                UPDATES=$(echo "$DIFF_OUTPUT" | grep -c '^\[~\]' 2>/dev/null || true)
+                DESTROYS=$(echo "$DIFF_OUTPUT" | grep -c '^\[-\]' 2>/dev/null || true)
+                REPLACES=$(echo "$DIFF_OUTPUT" | grep -c '(requires replacement)' 2>/dev/null || true)
+                
+                # Parse diff output into changes array
+                while IFS= read -r line; do
+                  if [[ "$line" =~ ^\[([+~-])\]\ (AWS::[^\ ]+)\ ([^\ ]+) ]]; then
+                    CHANGE_TYPE="${BASH_REMATCH[1]}"
+                    RES_TYPE="${BASH_REMATCH[2]}"
+                    LOGICAL_ID="${BASH_REMATCH[3]}"
+                    
+                    if [ "$CHANGE_TYPE" = "+" ]; then ACTION="Add"
+                    elif [ "$CHANGE_TYPE" = "~" ]; then ACTION="Modify"
+                    else ACTION="Remove"
+                    fi
+                    
+                    IS_REPLACE="false"
+                    if echo "$line" | grep -q "replace"; then
+                      IS_REPLACE="true"
+                    fi
+                    
+                    CHANGE_SET_CHANGES=$(echo "$CHANGE_SET_CHANGES" | jq --arg action "$ACTION" --arg id "$LOGICAL_ID" --arg type "$RES_TYPE" --argjson replace "$IS_REPLACE" '. + [{Action: $action, LogicalId: $id, Type: $type, Replacement: $replace, Details: []}]')
+                  fi
+                done <<< "$DIFF_OUTPUT"
               fi
             fi
             
