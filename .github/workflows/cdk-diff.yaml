@@ -204,10 +204,11 @@ jobs:
             fi
             
             # Count changes - look for resource-level changes (AWS:: type)
-            ADDS=$(echo "$DIFF_OUTPUT" | grep -c '\[+\] AWS::' 2>/dev/null || true)
-            UPDATES=$(echo "$DIFF_OUTPUT" | grep -c '\[~\] AWS::' 2>/dev/null || true)
-            DESTROYS=$(echo "$DIFF_OUTPUT" | grep -c '\[-\] AWS::' 2>/dev/null || true)
-            REPLACES=$(echo "$DIFF_OUTPUT" | grep -c 'replace' 2>/dev/null || true)
+            # Use grep -E and handle exit codes properly (grep returns 1 when no matches)
+            ADDS=$(echo "$DIFF_OUTPUT" | grep -E '\[\+\] AWS::' | wc -l | tr -d ' ')
+            UPDATES=$(echo "$DIFF_OUTPUT" | grep -E '\[~\] AWS::' | wc -l | tr -d ' ')
+            DESTROYS=$(echo "$DIFF_OUTPUT" | grep -E '\[-\] AWS::' | wc -l | tr -d ' ')
+            REPLACES=$(echo "$DIFF_OUTPUT" | grep -i 'replace' | wc -l | tr -d ' ')
             
             # Ensure numbers are valid
             ADDS=${ADDS:-0}
@@ -226,6 +227,8 @@ jobs:
               DESTROYS=0
               REPLACES=0
             fi
+            
+            echo "Change counts: adds=$ADDS, updates=$UPDATES, destroys=$DESTROYS, replaces=$REPLACES"
             
             # Drift detection
             DRIFT_STATUS="⏭️ Skipped"
@@ -331,22 +334,15 @@ jobs:
               
               for (const line of lines) {
                 // Match resource line: [+], [~], or [-] AWS::Type::Name ... LogicalId
-                // LogicalId is the last word on the line
                 const resourceMatch = line.match(/\[([+~-])\]\s+(AWS::\S+)\s+(.+)/);
                 if (resourceMatch) {
                   if (currentResource) {
-                    // Save pending property
-                    if (currentProperty && (oldValue !== null || currentResource.action === 'Add')) {
-                      currentResource.properties.push({
-                        name: currentProperty,
-                        oldValue: oldValue,
-                        newValue: null
-                      });
+                    if (currentProperty && oldValue !== null) {
+                      currentResource.properties.push({ name: currentProperty, oldValue: oldValue, newValue: null });
                     }
                     resources.push(currentResource);
                   }
                   const [, action, type, rest] = resourceMatch;
-                  // LogicalId is the last word
                   const parts = rest.trim().split(/\s+/);
                   const id = parts[parts.length - 1];
                   currentResource = {
@@ -363,31 +359,27 @@ jobs:
                 
                 if (!currentResource) continue;
                 
-                // Match property line: └── [~] PropertyName or ├── [~] PropertyName
-                const propMatch = line.match(/[└├─│]\s*[└├─]*\s*\[([+~-])\]\s+(\S+)/);
-                if (propMatch && !line.includes('AWS::')) {
-                  // Save previous property if exists
+                // Match property line with [~] only (property change indicator)
+                // Pattern: └─ [~] PropertyName or ├─ [~] PropertyName
+                const propMatch = line.match(/[└├]\s*─\s*\[~\]\s+(\S+)/);
+                if (propMatch) {
                   if (currentProperty && oldValue !== null) {
-                    currentResource.properties.push({
-                      name: currentProperty,
-                      oldValue: oldValue,
-                      newValue: null
-                    });
+                    currentResource.properties.push({ name: currentProperty, oldValue: oldValue, newValue: null });
                   }
-                  currentProperty = propMatch[2];
+                  currentProperty = propMatch[1];
                   oldValue = null;
                   continue;
                 }
                 
-                // Match old value: ├── [-] value or │   └── [-] value
-                const oldMatch = line.match(/[├│└─]\s*[├│└─]*\s*\[-\]\s*(.+)/);
+                // Match old value line with [-]
+                const oldMatch = line.match(/\[-\]\s+(.+)/);
                 if (oldMatch && currentProperty) {
                   oldValue = oldMatch[1].trim();
                   continue;
                 }
                 
-                // Match new value: └── [+] value or │   └── [+] value
-                const newMatch = line.match(/[├│└─]\s*[├│└─]*\s*\[\+\]\s*(.+)/);
+                // Match new value line with [+]
+                const newMatch = line.match(/\[\+\]\s+(.+)/);
                 if (newMatch && currentProperty) {
                   currentResource.properties.push({
                     name: currentProperty,
@@ -403,11 +395,7 @@ jobs:
               // Don't forget the last resource
               if (currentResource) {
                 if (currentProperty && oldValue !== null) {
-                  currentResource.properties.push({
-                    name: currentProperty,
-                    oldValue: oldValue,
-                    newValue: null
-                  });
+                  currentResource.properties.push({ name: currentProperty, oldValue: oldValue, newValue: null });
                 }
                 resources.push(currentResource);
               }
