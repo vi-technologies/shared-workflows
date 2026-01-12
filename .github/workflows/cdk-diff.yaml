@@ -181,39 +181,124 @@ jobs:
             ACCOUNT_NAME=$(get_account_name "$TARGET_ACCOUNT")
             
             echo "Target account: $TARGET_ACCOUNT ($ACCOUNT_NAME)"
+            echo "CloudFormation stack name: $CF_STACK_NAME"
             
             # Assume role if cross-account
             if [ "$TARGET_ACCOUNT" != "$CURRENT_ACCOUNT" ]; then
               assume_target_role "$TARGET_ACCOUNT" || true
             fi
             
-            # Run cdk diff
-            DIFF_OUTPUT=$(npx cdk diff "$STACK" --no-color 2>&1) || true
+            # Initialize variables
+            ADDS=0
+            UPDATES=0
+            DESTROYS=0
+            REPLACES=0
+            CHANGE_SET_CHANGES="[]"
+            STACK_EXISTS="false"
             
-            # Count changes - use grep with proper error handling
-            ADDS=$(echo "$DIFF_OUTPUT" | grep -c '^\[+\]' 2>/dev/null || true)
-            UPDATES=$(echo "$DIFF_OUTPUT" | grep -c '^\[~\]' 2>/dev/null || true)
-            DESTROYS=$(echo "$DIFF_OUTPUT" | grep -c '^\[-\]' 2>/dev/null || true)
-            REPLACES=$(echo "$DIFF_OUTPUT" | grep -c '(requires replacement)' 2>/dev/null || true)
+            # Check if stack exists
+            if aws cloudformation describe-stacks --stack-name "$CF_STACK_NAME" >/dev/null 2>&1; then
+              STACK_EXISTS="true"
+            fi
             
-            # Ensure numbers are valid integers
+            # Get the template from cdk.out
+            TEMPLATE_FILE="cdk.out/${STACK}.template.json"
+            if [ ! -f "$TEMPLATE_FILE" ]; then
+              echo "Template file not found: $TEMPLATE_FILE"
+              TEMPLATE_FILE="cdk.out/${CF_STACK_NAME}.template.json"
+            fi
+            
+            if [ -f "$TEMPLATE_FILE" ]; then
+              echo "Using template: $TEMPLATE_FILE"
+              
+              # Create a change set to get structured diff
+              CHANGE_SET_NAME="cdk-diff-$(date +%s)-$RANDOM"
+              
+              echo "Creating change set: $CHANGE_SET_NAME"
+              
+              if [ "$STACK_EXISTS" = "true" ]; then
+                CHANGE_SET_TYPE="UPDATE"
+              else
+                CHANGE_SET_TYPE="CREATE"
+              fi
+              
+              # Create the change set
+              CREATE_OUTPUT=$(aws cloudformation create-change-set \
+                --stack-name "$CF_STACK_NAME" \
+                --change-set-name "$CHANGE_SET_NAME" \
+                --template-body "file://$TEMPLATE_FILE" \
+                --change-set-type "$CHANGE_SET_TYPE" \
+                --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM CAPABILITY_AUTO_EXPAND \
+                2>&1) || true
+              
+              if echo "$CREATE_OUTPUT" | grep -q "ChangeSetId"; then
+                echo "Change set created, waiting for it to complete..."
+                
+                # Wait for change set to be ready
+                for i in {1..30}; do
+                  sleep 2
+                  CS_STATUS=$(aws cloudformation describe-change-set \
+                    --stack-name "$CF_STACK_NAME" \
+                    --change-set-name "$CHANGE_SET_NAME" \
+                    --query 'Status' --output text 2>/dev/null) || echo "FAILED"
+                  
+                  if [ "$CS_STATUS" = "CREATE_COMPLETE" ] || [ "$CS_STATUS" = "FAILED" ]; then
+                    break
+                  fi
+                done
+                
+                echo "Change set status: $CS_STATUS"
+                
+                if [ "$CS_STATUS" = "CREATE_COMPLETE" ]; then
+                  # Get the changes from the change set
+                  CHANGE_SET_CHANGES=$(aws cloudformation describe-change-set \
+                    --stack-name "$CF_STACK_NAME" \
+                    --change-set-name "$CHANGE_SET_NAME" \
+                    --query 'Changes[].ResourceChange.{Action:Action,LogicalId:LogicalResourceId,Type:ResourceType,Replacement:Replacement,Details:Details}' \
+                    --output json 2>/dev/null) || echo "[]"
+                  
+                  # Count changes by type
+                  ADDS=$(echo "$CHANGE_SET_CHANGES" | jq '[.[] | select(.Action == "Add")] | length' 2>/dev/null || echo "0")
+                  UPDATES=$(echo "$CHANGE_SET_CHANGES" | jq '[.[] | select(.Action == "Modify")] | length' 2>/dev/null || echo "0")
+                  DESTROYS=$(echo "$CHANGE_SET_CHANGES" | jq '[.[] | select(.Action == "Remove")] | length' 2>/dev/null || echo "0")
+                  REPLACES=$(echo "$CHANGE_SET_CHANGES" | jq '[.[] | select(.Replacement == true or .Replacement == "True")] | length' 2>/dev/null || echo "0")
+                elif [ "$CS_STATUS" = "FAILED" ]; then
+                  # Check if failed because no changes
+                  CS_REASON=$(aws cloudformation describe-change-set \
+                    --stack-name "$CF_STACK_NAME" \
+                    --change-set-name "$CHANGE_SET_NAME" \
+                    --query 'StatusReason' --output text 2>/dev/null) || echo ""
+                  
+                  if echo "$CS_REASON" | grep -qi "didn't contain changes\|No updates are to be performed"; then
+                    echo "No changes detected"
+                  else
+                    echo "Change set failed: $CS_REASON"
+                  fi
+                fi
+                
+                # Delete the change set
+                aws cloudformation delete-change-set \
+                  --stack-name "$CF_STACK_NAME" \
+                  --change-set-name "$CHANGE_SET_NAME" 2>/dev/null || true
+              else
+                echo "Failed to create change set: $CREATE_OUTPUT"
+                # If stack doesn't exist, this is a new stack
+                if [ "$STACK_EXISTS" = "false" ]; then
+                  # Count resources in template as adds
+                  ADDS=$(jq '.Resources | length' "$TEMPLATE_FILE" 2>/dev/null || echo "0")
+                fi
+              fi
+            fi
+            
+            # Ensure numbers are valid
             ADDS=${ADDS:-0}
             UPDATES=${UPDATES:-0}
             DESTROYS=${DESTROYS:-0}
             REPLACES=${REPLACES:-0}
-            
-            # Convert to integers, handling empty strings
             [[ "$ADDS" =~ ^[0-9]+$ ]] || ADDS=0
             [[ "$UPDATES" =~ ^[0-9]+$ ]] || UPDATES=0
             [[ "$DESTROYS" =~ ^[0-9]+$ ]] || DESTROYS=0
             [[ "$REPLACES" =~ ^[0-9]+$ ]] || REPLACES=0
-            
-            if echo "$DIFF_OUTPUT" | grep -qi "no differences\|There were no differences"; then
-              ADDS=0
-              UPDATES=0
-              DESTROYS=0
-              REPLACES=0
-            fi
             
             # Drift detection
             DRIFT_STATUS="⏭️ Skipped"
@@ -264,8 +349,11 @@ jobs:
             
             restore_credentials
             
-            # Safely escape diff output - handle potential failures
-            DIFF_ESCAPED=$(printf '%s' "$DIFF_OUTPUT" | jq -Rs '.' 2>/dev/null || echo '""')
+            # Handle change set changes
+            if [ -z "$CHANGE_SET_CHANGES" ] || [ "$CHANGE_SET_CHANGES" = "null" ]; then
+              CHANGE_SET_CHANGES="[]"
+            fi
+            CHANGES_ESCAPED=$(echo "$CHANGE_SET_CHANGES" | jq -c '.' 2>/dev/null || echo "[]")
             
             # Handle drift details
             if [ -z "$DRIFT_DETAILS" ]; then
@@ -274,7 +362,7 @@ jobs:
               DRIFT_DETAILS_ESCAPED=$(echo "$DRIFT_DETAILS" | jq -c '.' 2>/dev/null || echo "[]")
             fi
             
-            # Build result using --arg for diff to avoid JSON escaping issues
+            # Build result with structured change set data
             RESULT=$(jq -n \
               --arg stack "$STACK" \
               --argjson adds "$ADDS" \
@@ -283,9 +371,10 @@ jobs:
               --argjson replaces "$REPLACES" \
               --arg drift "$DRIFT_STATUS" \
               --argjson drift_details "$DRIFT_DETAILS_ESCAPED" \
-              --arg diff "$DIFF_OUTPUT" \
+              --argjson changes "$CHANGES_ESCAPED" \
               --arg account_name "$ACCOUNT_NAME" \
-              '{stack: $stack, adds: $adds, updates: $updates, destroys: $destroys, replaces: $replaces, drift: $drift, drift_details: $drift_details, diff: $diff, account_name: $account_name}')
+              --arg stack_exists "$STACK_EXISTS" \
+              '{stack: $stack, adds: $adds, updates: $updates, destroys: $destroys, replaces: $replaces, drift: $drift, drift_details: $drift_details, changes: $changes, account_name: $account_name, stack_exists: $stack_exists}')
             
             RESULTS=$(echo "$RESULTS" | jq --argjson result "$RESULT" '. + [$result]')
           done
@@ -304,130 +393,10 @@ jobs:
             const results = JSON.parse(process.env.RESULTS || '[]');
             const enableDrift = process.env.ENABLE_DRIFT === 'true';
             
-            // Parse CDK diff output into structured changes
-            function parseDiffOutput(diffContent) {
-              const resources = [];
-              const lines = diffContent.split('\n');
-              
-              let currentResource = null;
-              let iamStatements = [];
-              let inIamSection = false;
-              
-              for (let i = 0; i < lines.length; i++) {
-                const line = lines[i];
-                
-                // Parse IAM Statement Changes table
-                if (line.includes('IAM Statement Changes')) {
-                  inIamSection = true;
-                  continue;
-                }
-                
-                // End IAM section
-                if (inIamSection && (line.includes('└') || line.match(/^Resources$/))) {
-                  inIamSection = false;
-                }
-                
-                // Parse IAM statement rows
-                if (inIamSection) {
-                  const iamMatch = line.match(/│\s*([+-])\s*│\s*([^│]+)│\s*(\w+)\s*│\s*([^│]+)/);
-                  if (iamMatch) {
-                    const [, changeType, resource, effect, action] = iamMatch;
-                    iamStatements.push({
-                      changeType: changeType === '+' ? 'Add' : 'Remove',
-                      icon: changeType === '+' ? '🟢' : '🔴',
-                      action: action.trim(),
-                      resource: resource.trim(),
-                      effect: effect.trim()
-                    });
-                  }
-                  continue;
-                }
-                
-                // Parse resource changes: [+], [~], [-]
-                const resourceMatch = line.match(/^\[([+~\-])\]\s+(AWS::[^\s]+)\s+(\S+)/);
-                if (resourceMatch) {
-                  // Save previous resource
-                  if (currentResource) {
-                    resources.push(currentResource);
-                  }
-                  
-                  const [, changeType, resourceType, logicalId] = resourceMatch;
-                  const isReplace = line.includes('replace');
-                  
-                  currentResource = {
-                    changeType: isReplace ? 'Replace' : (changeType === '+' ? 'Add' : changeType === '~' ? 'Update' : 'Delete'),
-                    icon: isReplace ? '🟠' : (changeType === '+' ? '🟢' : changeType === '~' ? '🟡' : '🔴'),
-                    type: resourceType.replace('AWS::', ''),
-                    id: logicalId,
-                    properties: []
-                  };
-                  continue;
-                }
-                
-                // Parse property changes within a resource
-                if (currentResource) {
-                  // Property update: [~] .PropertyName
-                  const propUpdateMatch = line.match(/[└├─│\s]*\[~\]\s+\.?(\S+)/);
-                  if (propUpdateMatch) {
-                    const propName = propUpdateMatch[1];
-                    // Look for old/new values in subsequent lines
-                    let oldVal = null;
-                    let newVal = null;
-                    for (let j = i + 1; j < lines.length && j < i + 5; j++) {
-                      const valLine = lines[j];
-                      if (valLine.match(/^\[/)) break;
-                      const oldMatch = valLine.match(/\[-\]\s*(.+)/);
-                      const newMatch = valLine.match(/\[\+\]\s*(.+)/);
-                      if (oldMatch) oldVal = oldMatch[1].trim();
-                      if (newMatch) newVal = newMatch[1].trim();
-                    }
-                    currentResource.properties.push({
-                      name: propName,
-                      change: '~',
-                      oldValue: oldVal,
-                      newValue: newVal
-                    });
-                    continue;
-                  }
-                  
-                  // Property add: [+] .PropertyName: value
-                  const propAddMatch = line.match(/[└├─│\s]*\[\+\]\s+\.?([^:]+):\s*(.+)/);
-                  if (propAddMatch) {
-                    currentResource.properties.push({
-                      name: propAddMatch[1].trim(),
-                      change: '+',
-                      oldValue: null,
-                      newValue: propAddMatch[2].trim()
-                    });
-                    continue;
-                  }
-                  
-                  // Property remove: [-] .PropertyName: value
-                  const propRemoveMatch = line.match(/[└├─│\s]*\[-\]\s+\.?([^:]+):\s*(.+)/);
-                  if (propRemoveMatch) {
-                    currentResource.properties.push({
-                      name: propRemoveMatch[1].trim(),
-                      change: '-',
-                      oldValue: propRemoveMatch[2].trim(),
-                      newValue: null
-                    });
-                    continue;
-                  }
-                }
-              }
-              
-              // Don't forget the last resource
-              if (currentResource) {
-                resources.push(currentResource);
-              }
-              
-              return { resources, iamStatements };
-            }
-            
             // Build the comment body
             const stackSections = results.map(r => {
               const hasChanges = r.adds + r.updates + r.destroys + r.replaces > 0;
-              const noDiff = r.diff.includes('no differences') || r.diff.includes('There were no differences');
+              const changes = r.changes || [];
               
               // Stack header with summary
               let header = `### 📦 ${r.stack}`;
@@ -435,40 +404,61 @@ jobs:
               
               let content = '';
               
-              if (noDiff && !hasChanges) {
+              // Check if this is a new stack
+              if (r.stack_exists === 'false') {
+                content = `\n\n🆕 **New Stack** - ${r.adds} resources will be created\n`;
+              } else if (!hasChanges || changes.length === 0) {
                 content = '\n\n✅ No changes\n';
               } else {
-                const { resources, iamStatements } = parseDiffOutput(r.diff);
-                
-                if (resources.length > 0 || iamStatements.length > 0) {
-                  // Show each resource with its property changes
-                  for (const res of resources) {
-                    content += `\n\n${res.icon} **${res.changeType}** \`${res.id}\` (\`${res.type}\`)\n`;
+                // Show each resource change from the change set
+                for (const change of changes) {
+                  const action = change.Action;
+                  const logicalId = change.LogicalId;
+                  const resourceType = (change.Type || '').replace('AWS::', '');
+                  const isReplace = change.Replacement === true || change.Replacement === 'True' || change.Replacement === 'Conditional';
+                  const details = change.Details || [];
+                  
+                  // Determine icon and action text
+                  let icon, actionText;
+                  if (isReplace) {
+                    icon = '🟠';
+                    actionText = 'Replace';
+                  } else if (action === 'Add') {
+                    icon = '🟢';
+                    actionText = 'Add';
+                  } else if (action === 'Modify') {
+                    icon = '🟡';
+                    actionText = 'Update';
+                  } else if (action === 'Remove') {
+                    icon = '🔴';
+                    actionText = 'Delete';
+                  } else {
+                    icon = '❓';
+                    actionText = action;
+                  }
+                  
+                  content += `\n\n${icon} **${actionText}** \`${logicalId}\` (\`${resourceType}\`)\n`;
+                  
+                  // Show property changes if available
+                  if (details.length > 0) {
+                    const propertyChanges = details
+                      .filter(d => d.Target && d.Target.Name)
+                      .map(d => ({
+                        name: d.Target.Name,
+                        requiresRecreation: d.Target.RequiresRecreation,
+                        changeSource: d.ChangeSource
+                      }));
                     
-                    if (res.properties.length > 0) {
-                      content += '| Property | Current | New |\n|----------|---------|-----|\n';
-                      for (const prop of res.properties) {
-                        const current = prop.oldValue != null ? `\`${prop.oldValue}\`` : '_(not set)_';
-                        const next = prop.newValue != null ? `\`${prop.newValue}\`` : '_(removed)_';
-                        content += `| \`${prop.name}\` | ${current} | ${next} |\n`;
+                    if (propertyChanges.length > 0) {
+                      content += '| Property | Recreate? |\n|----------|----------|\n';
+                      for (const prop of propertyChanges) {
+                        const recreate = prop.requiresRecreation === 'Always' ? '⚠️ Yes' 
+                          : prop.requiresRecreation === 'Conditionally' ? '❓ Maybe' 
+                          : '✅ No';
+                        content += `| \`${prop.name}\` | ${recreate} |\n`;
                       }
                     }
                   }
-                  
-                  // Show IAM statement changes
-                  if (iamStatements.length > 0) {
-                    content += '\n\n**IAM Statement Changes**\n';
-                    content += '| | Action | Resource | Effect |\n|---|--------|----------|--------|\n';
-                    for (const stmt of iamStatements) {
-                      content += `| ${stmt.icon} ${stmt.changeType} | \`${stmt.action}\` | \`${stmt.resource}\` | ${stmt.effect} |\n`;
-                    }
-                  }
-                } else if (hasChanges) {
-                  // Fallback for unparseable diff
-                  content = '\n\n_Changes detected - see raw diff below_\n';
-                  content += '\n<details><summary>Raw diff</summary>\n\n```\n';
-                  content += r.diff.substring(0, 3000);
-                  content += '\n```\n</details>\n';
                 }
               }
               
