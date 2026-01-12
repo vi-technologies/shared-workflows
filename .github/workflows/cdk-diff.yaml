@@ -109,11 +109,21 @@ jobs:
             echo "Diff output:"
             echo "$DIFF_OUTPUT"
             
-            # Parse changes - use grep with || true to handle no matches
-            ADDS=$(echo "$DIFF_OUTPUT" | grep -c '^\[+\]' 2>/dev/null || echo "0")
-            UPDATES=$(echo "$DIFF_OUTPUT" | grep -c '^\[~\]' 2>/dev/null || echo "0")
-            DESTROYS=$(echo "$DIFF_OUTPUT" | grep -c '^\[-\]' 2>/dev/null || echo "0")
-            REPLACES=$(echo "$DIFF_OUTPUT" | grep -ci 'replace' 2>/dev/null || echo "0")
+            # Parse changes - count lines with specific patterns
+            ADDS=$(echo "$DIFF_OUTPUT" | grep -c '^\[+\]' || true)
+            ADDS=${ADDS:-0}
+            UPDATES=$(echo "$DIFF_OUTPUT" | grep -c '^\[~\]' || true)
+            UPDATES=${UPDATES:-0}
+            DESTROYS=$(echo "$DIFF_OUTPUT" | grep -c '^\[-\]' || true)
+            DESTROYS=${DESTROYS:-0}
+            REPLACES=$(echo "$DIFF_OUTPUT" | grep -ci 'replace' || true)
+            REPLACES=${REPLACES:-0}
+            
+            # Ensure they're valid integers
+            ADDS=$((ADDS + 0))
+            UPDATES=$((UPDATES + 0))
+            DESTROYS=$((DESTROYS + 0))
+            REPLACES=$((REPLACES + 0))
             
             # Check for "no differences" message
             if echo "$DIFF_OUTPUT" | grep -qi "no differences\|There were no differences"; then
