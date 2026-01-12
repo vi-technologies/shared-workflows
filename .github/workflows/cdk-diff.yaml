@@ -469,13 +469,9 @@ jobs:
                       for (const prop of res.properties) {
                         let oldVal, newVal;
                         if (prop.isUnifiedDiff) {
-                          // Truncate unified diff values for readability
-                          const oldLines = prop.oldValue ? prop.oldValue.split('\n').slice(0, 3) : [];
-                          const newLines = prop.newValue ? prop.newValue.split('\n').slice(0, 3) : [];
-                          const truncOld = oldLines.join(' ').substring(0, 60);
-                          const truncNew = newLines.join(' ').substring(0, 60);
-                          oldVal = oldLines.length > 0 ? `\`${truncOld}${prop.oldValue.length > 60 ? '...' : ''}\`` : '_(none)_';
-                          newVal = newLines.length > 0 ? `\`${truncNew}${prop.newValue.length > 60 ? '...' : ''}\`` : '_(removed)_';
+                          // Show full unified diff values
+                          oldVal = prop.oldValue ? `\`${prop.oldValue.replace(/\n/g, ' ')}\`` : '_(none)_';
+                          newVal = prop.newValue ? `\`${prop.newValue.replace(/\n/g, ' ')}\`` : '_(removed)_';
                         } else {
                           oldVal = prop.oldValue != null ? `\`${prop.oldValue}\`` : '_(not set)_';
                           newVal = prop.newValue != null ? `\`${prop.newValue}\`` : '_(removed)_';
