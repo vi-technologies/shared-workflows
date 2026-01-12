@@ -46,6 +46,11 @@ on:
         required: false
         type: string
         default: '{}'
+      pr-number:
+        description: 'Pull request number'
+        required: false
+        type: number
+        default: 0
 
 jobs:
   diff:
@@ -198,11 +203,11 @@ jobs:
               STACK_EXISTS="false"
             fi
             
-            # Count changes
-            ADDS=$(echo "$DIFF_OUTPUT" | grep -c '^\[+\]' 2>/dev/null || true)
-            UPDATES=$(echo "$DIFF_OUTPUT" | grep -c '^\[~\]' 2>/dev/null || true)
-            DESTROYS=$(echo "$DIFF_OUTPUT" | grep -c '^\[-\]' 2>/dev/null || true)
-            REPLACES=$(echo "$DIFF_OUTPUT" | grep -c '(requires replacement)' 2>/dev/null || true)
+            # Count changes - look for resource-level changes (AWS:: type)
+            ADDS=$(echo "$DIFF_OUTPUT" | grep -c '\[+\] AWS::' 2>/dev/null || true)
+            UPDATES=$(echo "$DIFF_OUTPUT" | grep -c '\[~\] AWS::' 2>/dev/null || true)
+            DESTROYS=$(echo "$DIFF_OUTPUT" | grep -c '\[-\] AWS::' 2>/dev/null || true)
+            REPLACES=$(echo "$DIFF_OUTPUT" | grep -c 'replace' 2>/dev/null || true)
             
             # Ensure numbers are valid
             ADDS=${ADDS:-0}
@@ -307,13 +312,14 @@ jobs:
         env:
           RESULTS: ${{ steps.diff.outputs.results }}
           ENABLE_DRIFT: ${{ inputs.enable-drift-detection }}
+          PR_NUMBER: ${{ inputs.pr-number }}
         with:
           script: |
             const results = JSON.parse(process.env.RESULTS || '[]');
             const enableDrift = process.env.ENABLE_DRIFT === 'true';
             
             // Parse cdk diff output into structured resources with property changes
-            // Format: [+] AWS::Type LogicalId, [~] property changes follow
+            // CDK diff format: [+~-] AWS::Type::Name ConstructPath LogicalId
             function parseDiffOutput(diff) {
               const resources = [];
               if (!diff) return resources;
@@ -324,8 +330,9 @@ jobs:
               let oldValue = null;
               
               for (const line of lines) {
-                // Match resource line: [+], [~], or [-] AWS::Type LogicalId
-                const resourceMatch = line.match(/^\[([+~-])\]\s+(AWS::\S+)\s+(\S+)/);
+                // Match resource line: [+], [~], or [-] AWS::Type::Name ... LogicalId
+                // LogicalId is the last word on the line
+                const resourceMatch = line.match(/\[([+~-])\]\s+(AWS::\S+)\s+(.+)/);
                 if (resourceMatch) {
                   if (currentResource) {
                     // Save pending property
@@ -338,12 +345,15 @@ jobs:
                     }
                     resources.push(currentResource);
                   }
-                  const [, action, type, id] = resourceMatch;
+                  const [, action, type, rest] = resourceMatch;
+                  // LogicalId is the last word
+                  const parts = rest.trim().split(/\s+/);
+                  const id = parts[parts.length - 1];
                   currentResource = {
                     action: action === '+' ? 'Add' : action === '-' ? 'Remove' : 'Modify',
                     type: type.replace('AWS::', ''),
                     id: id,
-                    replace: line.includes('replace'),
+                    replace: line.toLowerCase().includes('replace'),
                     properties: []
                   };
                   currentProperty = null;
@@ -354,8 +364,8 @@ jobs:
                 if (!currentResource) continue;
                 
                 // Match property line: └── [~] PropertyName or ├── [~] PropertyName
-                const propMatch = line.match(/[└├]──\s+\[([+~-])\]\s+(\S+)/);
-                if (propMatch) {
+                const propMatch = line.match(/[└├─│]\s*[└├─]*\s*\[([+~-])\]\s+(\S+)/);
+                if (propMatch && !line.includes('AWS::')) {
                   // Save previous property if exists
                   if (currentProperty && oldValue !== null) {
                     currentResource.properties.push({
@@ -370,14 +380,14 @@ jobs:
                 }
                 
                 // Match old value: ├── [-] value or │   └── [-] value
-                const oldMatch = line.match(/[├│└]\s*──?\s*\[-\]\s*(.+)/);
+                const oldMatch = line.match(/[├│└─]\s*[├│└─]*\s*\[-\]\s*(.+)/);
                 if (oldMatch && currentProperty) {
                   oldValue = oldMatch[1].trim();
                   continue;
                 }
                 
                 // Match new value: └── [+] value or │   └── [+] value
-                const newMatch = line.match(/[├│└]\s*──?\s*\[+\]\s*(.+)/);
+                const newMatch = line.match(/[├│└─]\s*[├│└─]*\s*\[\+\]\s*(.+)/);
                 if (newMatch && currentProperty) {
                   currentResource.properties.push({
                     name: currentProperty,
@@ -514,26 +524,48 @@ jobs:
               `<sub>Generated at ${new Date().toISOString()} from commit <code>${context.sha.substring(0, 7)}</code></sub>`
             ].join('\n');
 
-            const { data: comments } = await github.rest.issues.listComments({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.issue.number,
-            });
-            
-            const botComment = comments.find(c => c.body.includes('## 🏗️ CDK Diff'));
-            
-            if (botComment) {
-              await github.rest.issues.updateComment({
+            try {
+              // Get PR number from env (passed from caller) or context
+              const envPrNumber = parseInt(process.env.PR_NUMBER, 10);
+              const prNumber = envPrNumber > 0 ? envPrNumber : (context.payload.pull_request?.number || context.issue?.number);
+              
+              if (!prNumber) {
+                console.log('No PR number found');
+                console.log('PR_NUMBER env:', process.env.PR_NUMBER);
+                console.log('Context issue:', context.issue);
+                return;
+              }
+              
+              console.log(`Posting comment to PR #${prNumber}`);
+              
+              const { data: comments } = await github.rest.issues.listComments({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
-                comment_id: botComment.id,
-                body
+                issue_number: prNumber,
               });
-            } else {
-              await github.rest.issues.createComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: context.issue.number,
-                body
-              });
+              
+              const botComment = comments.find(c => c.body && c.body.includes('## 🏗️ CDK Diff'));
+              
+              if (botComment) {
+                console.log(`Updating existing comment ${botComment.id}`);
+                await github.rest.issues.updateComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  comment_id: botComment.id,
+                  body
+                });
+              } else {
+                console.log('Creating new comment');
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: prNumber,
+                  body
+                });
+              }
+              console.log('Comment posted successfully');
+            } catch (error) {
+              console.error('Error posting comment:', error.message);
+              console.error('Stack:', error.stack);
+              throw error;
             }
