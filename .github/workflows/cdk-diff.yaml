@@ -97,19 +97,95 @@ jobs:
           echo "Stacks to process: $STACKS"
           echo "Drift detection: $ENABLE_DRIFT"
           
+          # Get current account ID
+          CURRENT_ACCOUNT=$(aws sts get-caller-identity --query 'Account' --output text)
+          echo "Current AWS account: $CURRENT_ACCOUNT"
+          
+          # Save original credentials
+          ORIGINAL_ACCESS_KEY="$AWS_ACCESS_KEY_ID"
+          ORIGINAL_SECRET_KEY="$AWS_SECRET_ACCESS_KEY"
+          ORIGINAL_SESSION_TOKEN="$AWS_SESSION_TOKEN"
+          
           # Initialize results array
           RESULTS="[]"
+          
+          # Function to get stack's target account from manifest
+          get_stack_account() {
+            local stack_name="$1"
+            if [ -f "cdk.out/manifest.json" ]; then
+              # Try to get account from manifest
+              local account=$(jq -r ".artifacts[\"$stack_name\"].environment // \"\"" cdk.out/manifest.json 2>/dev/null | sed -E 's/aws:\/\/([0-9]+)\/.*/\1/')
+              if [ -n "$account" ] && [ "$account" != "null" ] && [ "$account" != "" ]; then
+                echo "$account"
+                return
+              fi
+            fi
+            # Default to current account
+            echo "$CURRENT_ACCOUNT"
+          }
+          
+          # Function to restore original credentials
+          restore_credentials() {
+            export AWS_ACCESS_KEY_ID="$ORIGINAL_ACCESS_KEY"
+            export AWS_SECRET_ACCESS_KEY="$ORIGINAL_SECRET_KEY"
+            export AWS_SESSION_TOKEN="$ORIGINAL_SESSION_TOKEN"
+          }
+          
+          # Function to assume role in target account
+          assume_target_role() {
+            local target_account="$1"
+            local region="$AWS_REGION"
+            
+            # Try CDK lookup role first
+            local lookup_role="arn:aws:iam::${target_account}:role/cdk-hnb659fds-lookup-role-${target_account}-${region}"
+            
+            echo "  Attempting to assume role: $lookup_role"
+            
+            local creds=$(aws sts assume-role \
+              --role-arn "$lookup_role" \
+              --role-session-name "cdk-diff-session" \
+              --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' \
+              --output text 2>/dev/null) || true
+            
+            if [ -n "$creds" ]; then
+              export AWS_ACCESS_KEY_ID=$(echo "$creds" | cut -f1)
+              export AWS_SECRET_ACCESS_KEY=$(echo "$creds" | cut -f2)
+              export AWS_SESSION_TOKEN=$(echo "$creds" | cut -f3)
+              echo "  Successfully assumed role in account $target_account"
+              return 0
+            else
+              echo "  Could not assume role in account $target_account"
+              return 1
+            fi
+          }
           
           for STACK in $STACKS; do
             echo ""
             echo "=== Processing stack: $STACK ==="
             
-            # Run cdk diff and capture output
+            # Get target account for this stack
+            TARGET_ACCOUNT=$(get_stack_account "$STACK")
+            echo "Target account: $TARGET_ACCOUNT (current: $CURRENT_ACCOUNT)"
+            
+            CROSS_ACCOUNT=false
+            CROSS_ACCOUNT_ACCESS=false
+            
+            if [ "$TARGET_ACCOUNT" != "$CURRENT_ACCOUNT" ]; then
+              CROSS_ACCOUNT=true
+              echo "  Cross-account stack detected"
+              
+              # Try to assume role in target account
+              if assume_target_role "$TARGET_ACCOUNT"; then
+                CROSS_ACCOUNT_ACCESS=true
+              fi
+            fi
+            
+            # Run cdk diff
             DIFF_OUTPUT=$(npx cdk diff "$STACK" --no-color 2>&1) || true
             echo "Diff output:"
             echo "$DIFF_OUTPUT"
             
-            # Parse changes - count lines with specific patterns
+            # Parse changes
             ADDS=$(echo "$DIFF_OUTPUT" | grep -c '^\[+\]' || true)
             ADDS=${ADDS:-0}
             UPDATES=$(echo "$DIFF_OUTPUT" | grep -c '^\[~\]' || true)
@@ -125,12 +201,20 @@ jobs:
             DESTROYS=$((DESTROYS + 0))
             REPLACES=$((REPLACES + 0))
             
-            # Check for "no differences" message
+            # Check for "no differences" or cross-account issues
             if echo "$DIFF_OUTPUT" | grep -qi "no differences\|There were no differences"; then
               ADDS=0
               UPDATES=0
               DESTROYS=0
               REPLACES=0
+            fi
+            
+            # If cross-account without access and showing no diff, mark it
+            if [ "$CROSS_ACCOUNT" = "true" ] && [ "$CROSS_ACCOUNT_ACCESS" = "false" ]; then
+              if [ $((ADDS + UPDATES + DESTROYS + REPLACES)) -eq 0 ]; then
+                # Diff might be inaccurate due to cross-account
+                DIFF_OUTPUT="⚠️ Cross-account stack (account: $TARGET_ACCOUNT)\nDiff may be inaccurate - cannot access deployed stack.\n\n$DIFF_OUTPUT"
+              fi
             fi
             
             echo "Changes: +$ADDS ~$UPDATES -$DESTROYS ♻️$REPLACES"
@@ -140,48 +224,55 @@ jobs:
             if [ "$ENABLE_DRIFT" = "true" ]; then
               echo "Running drift detection..."
               
-              # Check if stack exists
-              if aws cloudformation describe-stacks --stack-name "$STACK" >/dev/null 2>&1; then
-                echo "  Stack exists, starting drift detection..."
-                
-                DRIFT_ID=$(aws cloudformation detect-stack-drift --stack-name "$STACK" --query 'StackDriftDetectionId' --output text 2>/dev/null) || true
-                
-                if [ -n "$DRIFT_ID" ] && [ "$DRIFT_ID" != "None" ]; then
-                  echo "  Drift detection ID: $DRIFT_ID"
-                  
-                  # Wait for completion (max 60 seconds)
-                  for i in {1..12}; do
-                    sleep 5
-                    DRIFT_CHECK=$(aws cloudformation describe-stack-drift-detection-status \
-                      --stack-drift-detection-id "$DRIFT_ID" \
-                      --query 'DetectionStatus' --output text 2>/dev/null) || echo "FAILED"
-                    
-                    echo "  Drift check status: $DRIFT_CHECK"
-                    
-                    if [ "$DRIFT_CHECK" = "DETECTION_COMPLETE" ]; then
-                      DRIFT_RESULT=$(aws cloudformation describe-stack-drift-detection-status \
-                        --stack-drift-detection-id "$DRIFT_ID" \
-                        --query 'StackDriftStatus' --output text 2>/dev/null) || echo "UNKNOWN"
-                      
-                      case "$DRIFT_RESULT" in
-                        "IN_SYNC") DRIFT_STATUS="✅ In Sync" ;;
-                        "DRIFTED") DRIFT_STATUS="🚨 Drifted" ;;
-                        "NOT_CHECKED") DRIFT_STATUS="⚠️ Not Checked" ;;
-                        *) DRIFT_STATUS="❓ $DRIFT_RESULT" ;;
-                      esac
-                      break
-                    elif [ "$DRIFT_CHECK" = "DETECTION_FAILED" ]; then
-                      DRIFT_STATUS="❌ Failed"
-                      break
-                    fi
-                  done
-                else
-                  DRIFT_STATUS="❌ Error"
-                fi
+              if [ "$CROSS_ACCOUNT" = "true" ] && [ "$CROSS_ACCOUNT_ACCESS" = "false" ]; then
+                DRIFT_STATUS="🌐 Cross-account"
               else
-                DRIFT_STATUS="🆕 New Stack"
+                # Check if stack exists
+                if aws cloudformation describe-stacks --stack-name "$STACK" >/dev/null 2>&1; then
+                  echo "  Stack exists, starting drift detection..."
+                  
+                  DRIFT_ID=$(aws cloudformation detect-stack-drift --stack-name "$STACK" --query 'StackDriftDetectionId' --output text 2>/dev/null) || true
+                  
+                  if [ -n "$DRIFT_ID" ] && [ "$DRIFT_ID" != "None" ]; then
+                    echo "  Drift detection ID: $DRIFT_ID"
+                    
+                    # Wait for completion (max 60 seconds)
+                    for i in {1..12}; do
+                      sleep 5
+                      DRIFT_CHECK=$(aws cloudformation describe-stack-drift-detection-status \
+                        --stack-drift-detection-id "$DRIFT_ID" \
+                        --query 'DetectionStatus' --output text 2>/dev/null) || echo "FAILED"
+                      
+                      echo "  Drift check status: $DRIFT_CHECK"
+                      
+                      if [ "$DRIFT_CHECK" = "DETECTION_COMPLETE" ]; then
+                        DRIFT_RESULT=$(aws cloudformation describe-stack-drift-detection-status \
+                          --stack-drift-detection-id "$DRIFT_ID" \
+                          --query 'StackDriftStatus' --output text 2>/dev/null) || echo "UNKNOWN"
+                        
+                        case "$DRIFT_RESULT" in
+                          "IN_SYNC") DRIFT_STATUS="✅ In Sync" ;;
+                          "DRIFTED") DRIFT_STATUS="🚨 Drifted" ;;
+                          "NOT_CHECKED") DRIFT_STATUS="⚠️ Not Checked" ;;
+                          *) DRIFT_STATUS="❓ $DRIFT_RESULT" ;;
+                        esac
+                        break
+                      elif [ "$DRIFT_CHECK" = "DETECTION_FAILED" ]; then
+                        DRIFT_STATUS="❌ Failed"
+                        break
+                      fi
+                    done
+                  else
+                    DRIFT_STATUS="❌ Error"
+                  fi
+                else
+                  DRIFT_STATUS="🆕 New Stack"
+                fi
               fi
             fi
+            
+            # Restore original credentials for next iteration
+            restore_credentials
             
             echo "Drift status: $DRIFT_STATUS"
             
@@ -197,7 +288,9 @@ jobs:
               --argjson replaces "$REPLACES" \
               --arg drift "$DRIFT_STATUS" \
               --argjson diff "$DIFF_ESCAPED" \
-              '{stack: $stack, adds: $adds, updates: $updates, destroys: $destroys, replaces: $replaces, drift: $drift, diff: $diff}')
+              --arg target_account "$TARGET_ACCOUNT" \
+              --argjson cross_account "$CROSS_ACCOUNT" \
+              '{stack: $stack, adds: $adds, updates: $updates, destroys: $destroys, replaces: $replaces, drift: $drift, diff: $diff, target_account: $target_account, cross_account: $cross_account}')
             
             # Add to results array
             RESULTS=$(echo "$RESULTS" | jq --argjson result "$RESULT" '. + [$result]')
@@ -227,12 +320,12 @@ jobs:
             console.log('Results:', JSON.stringify(results, null, 2));
             
             // Build summary table
-            let tableHeader = '| Stack | Diff | Drift |';
-            let tableSeparator = '|-------|------|-------|';
+            let tableHeader = '| Stack | Account | Diff | Drift |';
+            let tableSeparator = '|-------|---------|------|-------|';
             
             if (!enableDrift) {
-              tableHeader = '| Stack | Diff |';
-              tableSeparator = '|-------|------|';
+              tableHeader = '| Stack | Account | Diff |';
+              tableSeparator = '|-------|---------|------|';
             }
             
             const tableRows = results.map(r => {
@@ -240,7 +333,7 @@ jobs:
               let diffSummary;
               
               if (total === 0) {
-                diffSummary = '✅ No changes';
+                diffSummary = r.cross_account ? '⚠️ Cross-account' : '✅ No changes';
               } else {
                 const parts = [];
                 if (r.adds > 0) parts.push(`🟢 +${r.adds}`);
@@ -250,10 +343,12 @@ jobs:
                 diffSummary = parts.join(' ');
               }
               
+              const accountDisplay = r.target_account ? `\`${r.target_account.slice(-4)}\`` : '-';
+              
               if (enableDrift) {
-                return `| \`${r.stack}\` | ${diffSummary} | ${r.drift} |`;
+                return `| \`${r.stack}\` | ${accountDisplay} | ${diffSummary} | ${r.drift} |`;
               } else {
-                return `| \`${r.stack}\` | ${diffSummary} |`;
+                return `| \`${r.stack}\` | ${accountDisplay} | ${diffSummary} |`;
               }
             });
             
@@ -261,7 +356,8 @@ jobs:
             const details = results.map(r => {
               const diffContent = r.diff.trim();
               if (!diffContent || diffContent.includes('no differences') || diffContent.includes('There were no differences')) {
-                return `<details>\n<summary>📦 <b>${r.stack}</b> - No changes</summary>\n\n\`\`\`\nNo differences\n\`\`\`\n</details>`;
+                const note = r.cross_account ? ' (cross-account - diff may be inaccurate)' : '';
+                return `<details>\n<summary>📦 <b>${r.stack}</b> - No changes${note}</summary>\n\n\`\`\`\nNo differences\n\`\`\`\n</details>`;
               }
               return `<details>\n<summary>📦 <b>${r.stack}</b></summary>\n\n\`\`\`diff\n${diffContent}\n\`\`\`\n</details>`;
             }).join('\n\n');
@@ -275,9 +371,15 @@ jobs:
             }), { adds: 0, updates: 0, destroys: 0, replaces: 0 });
             
             const totalChanges = totals.adds + totals.updates + totals.destroys + totals.replaces;
+            const crossAccountCount = results.filter(r => r.cross_account).length;
+            
             let summaryLine = totalChanges === 0 
               ? '✅ **No infrastructure changes**'
               : `**${totalChanges} changes:** 🟢 ${totals.adds} to add, 🟡 ${totals.updates} to update, 🟠 ${totals.replaces} to replace, 🔴 ${totals.destroys} to destroy`;
+            
+            if (crossAccountCount > 0) {
+              summaryLine += ` | 🌐 ${crossAccountCount} cross-account`;
+            }
             
             const hasDrift = results.some(r => r.drift.includes('Drifted'));
             if (enableDrift && hasDrift) {
