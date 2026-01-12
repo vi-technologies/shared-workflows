@@ -276,17 +276,17 @@ jobs:
                         case "$DRIFT_RESULT" in
                           "IN_SYNC") DRIFT_STATUS="✅ In Sync" ;;
                           "DRIFTED") DRIFT_STATUS="🚨 Drifted" ;;
-                          "NOT_CHECKED") DRIFT_STATUS="⚠️ Not Checked" ;;
+                          "NOT_CHECKED") DRIFT_STATUS="⚠️ Partial" ;;
                           *) DRIFT_STATUS="❓ $DRIFT_RESULT" ;;
                         esac
                         break
                       elif [ "$DRIFT_CHECK" = "DETECTION_FAILED" ]; then
-                        DRIFT_STATUS="❌ Failed"
+                        DRIFT_STATUS="⚠️ Not Supported"
                         break
                       fi
                     done
                   else
-                    DRIFT_STATUS="❌ Error"
+                    DRIFT_STATUS="⚠️ Not Supported"
                   fi
                 else
                   DRIFT_STATUS="🆕 Not Deployed"
