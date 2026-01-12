@@ -264,9 +264,17 @@ jobs:
             
             restore_credentials
             
-            DIFF_ESCAPED=$(echo "$DIFF_OUTPUT" | jq -Rs '.')
-            DRIFT_DETAILS_ESCAPED=$(echo "$DRIFT_DETAILS" | jq -c '.' 2>/dev/null || echo "[]")
+            # Safely escape diff output - handle potential failures
+            DIFF_ESCAPED=$(printf '%s' "$DIFF_OUTPUT" | jq -Rs '.' 2>/dev/null || echo '""')
             
+            # Handle drift details
+            if [ -z "$DRIFT_DETAILS" ]; then
+              DRIFT_DETAILS_ESCAPED="[]"
+            else
+              DRIFT_DETAILS_ESCAPED=$(echo "$DRIFT_DETAILS" | jq -c '.' 2>/dev/null || echo "[]")
+            fi
+            
+            # Build result using --arg for diff to avoid JSON escaping issues
             RESULT=$(jq -n \
               --arg stack "$STACK" \
               --argjson adds "$ADDS" \
@@ -275,7 +283,7 @@ jobs:
               --argjson replaces "$REPLACES" \
               --arg drift "$DRIFT_STATUS" \
               --argjson drift_details "$DRIFT_DETAILS_ESCAPED" \
-              --argjson diff "$DIFF_ESCAPED" \
+              --arg diff "$DIFF_OUTPUT" \
               --arg account_name "$ACCOUNT_NAME" \
               '{stack: $stack, adds: $adds, updates: $updates, destroys: $destroys, replaces: $replaces, drift: $drift, drift_details: $drift_details, diff: $diff, account_name: $account_name}')
             
