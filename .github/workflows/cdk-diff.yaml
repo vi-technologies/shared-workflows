@@ -190,16 +190,23 @@ jobs:
             # Run cdk diff
             DIFF_OUTPUT=$(npx cdk diff "$STACK" --no-color 2>&1) || true
             
-            # Count changes
-            ADDS=$(echo "$DIFF_OUTPUT" | grep -c '^\[+\]' || echo "0")
-            UPDATES=$(echo "$DIFF_OUTPUT" | grep -c '^\[~\]' || echo "0")
-            DESTROYS=$(echo "$DIFF_OUTPUT" | grep -c '^\[-\]' || echo "0")
-            REPLACES=$(echo "$DIFF_OUTPUT" | grep -c '(requires replacement)' || echo "0")
+            # Count changes - use grep with proper error handling
+            ADDS=$(echo "$DIFF_OUTPUT" | grep -c '^\[+\]' 2>/dev/null || true)
+            UPDATES=$(echo "$DIFF_OUTPUT" | grep -c '^\[~\]' 2>/dev/null || true)
+            DESTROYS=$(echo "$DIFF_OUTPUT" | grep -c '^\[-\]' 2>/dev/null || true)
+            REPLACES=$(echo "$DIFF_OUTPUT" | grep -c '(requires replacement)' 2>/dev/null || true)
             
-            ADDS=$((ADDS + 0))
-            UPDATES=$((UPDATES + 0))
-            DESTROYS=$((DESTROYS + 0))
-            REPLACES=$((REPLACES + 0))
+            # Ensure numbers are valid integers
+            ADDS=${ADDS:-0}
+            UPDATES=${UPDATES:-0}
+            DESTROYS=${DESTROYS:-0}
+            REPLACES=${REPLACES:-0}
+            
+            # Convert to integers, handling empty strings
+            [[ "$ADDS" =~ ^[0-9]+$ ]] || ADDS=0
+            [[ "$UPDATES" =~ ^[0-9]+$ ]] || UPDATES=0
+            [[ "$DESTROYS" =~ ^[0-9]+$ ]] || DESTROYS=0
+            [[ "$REPLACES" =~ ^[0-9]+$ ]] || REPLACES=0
             
             if echo "$DIFF_OUTPUT" | grep -qi "no differences\|There were no differences"; then
               ADDS=0
