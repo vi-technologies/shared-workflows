@@ -434,23 +434,19 @@ jobs:
                 content += `\n**Drift:** ${r.drift}`;
                 
                 if (r.drift.includes('Drifted') && r.drift_details && r.drift_details.length > 0) {
-                  content += '\n\n| Resource | Type | What Drifted |\n|----------|------|---------------|\n';
-                  for (const d of r.drift_details.slice(0, 10)) {
-                    // Extract property changes
-                    let propsChanged = '-';
+                  for (const d of r.drift_details.slice(0, 15)) {
+                    content += `\n\n**\`${d.Id}\`** (\`${d.Type.replace('AWS::', '')}\`)\n`;
                     if (d.Props && d.Props.length > 0) {
-                      propsChanged = d.Props.slice(0, 3).map(p => {
+                      content += '| Property | Expected | Actual |\n|----------|----------|--------|\n';
+                      for (const p of d.Props) {
                         const path = p.PropertyPath || 'unknown';
-                        const expected = p.ExpectedValue ? String(p.ExpectedValue).substring(0, 20) : '(none)';
-                        const actual = p.ActualValue ? String(p.ActualValue).substring(0, 20) : '(none)';
-                        return `\`${path}\`: ${expected} → ${actual}`;
-                      }).join('<br>');
-                      if (d.Props.length > 3) {
-                        propsChanged += `<br>_+${d.Props.length - 3} more_`;
+                        const expected = p.ExpectedValue != null ? String(p.ExpectedValue) : '_(not set)_';
+                        const actual = p.ActualValue != null ? String(p.ActualValue) : '_(not set)_';
+                        content += `| \`${path}\` | \`${expected}\` | \`${actual}\` |\n`;
                       }
+                    } else {
+                      content += '_No property details available_\n';
                     }
-                    const idShort = d.Id.length > 25 ? d.Id.substring(0, 22) + '...' : d.Id;
-                    content += `| \`${idShort}\` | \`${d.Type.replace('AWS::', '')}\` | ${propsChanged} |\n`;
                   }
                 }
               }
