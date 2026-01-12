@@ -239,11 +239,11 @@ jobs:
                         DRIFT_STATUS="✅ In Sync"
                       elif [ "$DRIFT_RESULT" = "DRIFTED" ]; then
                         DRIFT_STATUS="🚨 Drifted"
-                        # Get drifted resources
+                        # Get drifted resources with property differences
                         DRIFT_DETAILS=$(aws cloudformation describe-stack-resource-drifts \
                           --stack-name "$CF_STACK_NAME" \
                           --stack-resource-drift-status-filters MODIFIED DELETED \
-                          --query 'StackResourceDrifts[].{Type:ResourceType,Id:LogicalResourceId,Status:StackResourceDriftStatus}' \
+                          --query 'StackResourceDrifts[].{Type:ResourceType,Id:LogicalResourceId,Status:StackResourceDriftStatus,Props:PropertyDifferences}' \
                           --output json 2>/dev/null) || echo "[]"
                       else
                         DRIFT_STATUS="⚠️ $DRIFT_RESULT"
@@ -434,9 +434,23 @@ jobs:
                 content += `\n**Drift:** ${r.drift}`;
                 
                 if (r.drift.includes('Drifted') && r.drift_details && r.drift_details.length > 0) {
-                  content += '\n\n| Resource | Type | Status |\n|----------|------|--------|\n';
+                  content += '\n\n| Resource | Type | What Drifted |\n|----------|------|---------------|\n';
                   for (const d of r.drift_details.slice(0, 10)) {
-                    content += `| \`${d.Id}\` | \`${d.Type.replace('AWS::', '')}\` | ${d.Status} |\n`;
+                    // Extract property changes
+                    let propsChanged = '-';
+                    if (d.Props && d.Props.length > 0) {
+                      propsChanged = d.Props.slice(0, 3).map(p => {
+                        const path = p.PropertyPath || 'unknown';
+                        const expected = p.ExpectedValue ? String(p.ExpectedValue).substring(0, 20) : '(none)';
+                        const actual = p.ActualValue ? String(p.ActualValue).substring(0, 20) : '(none)';
+                        return `\`${path}\`: ${expected} → ${actual}`;
+                      }).join('<br>');
+                      if (d.Props.length > 3) {
+                        propsChanged += `<br>_+${d.Props.length - 3} more_`;
+                      }
+                    }
+                    const idShort = d.Id.length > 25 ? d.Id.substring(0, 22) + '...' : d.Id;
+                    content += `| \`${idShort}\` | \`${d.Type.replace('AWS::', '')}\` | ${propsChanged} |\n`;
                   }
                 }
               }
