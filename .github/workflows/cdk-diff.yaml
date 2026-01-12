@@ -220,14 +220,6 @@ jobs:
             [[ "$DESTROYS" =~ ^[0-9]+$ ]] || DESTROYS=0
             [[ "$REPLACES" =~ ^[0-9]+$ ]] || REPLACES=0
             
-            # Check for no changes
-            if echo "$DIFF_OUTPUT" | grep -qi "no differences\|There were no differences"; then
-              ADDS=0
-              UPDATES=0
-              DESTROYS=0
-              REPLACES=0
-            fi
-            
             echo "Change counts: adds=$ADDS, updates=$UPDATES, destroys=$DESTROYS, replaces=$REPLACES"
             
             # Drift detection
