@@ -513,19 +513,22 @@ jobs:
               return `<details open>\n<summary>${header}</summary>\n${content}\n</details>`;
             }).join('\n\n');
             
-            // Calculate totals
-            const totals = results.reduce((acc, r) => ({
-              adds: acc.adds + r.adds,
-              updates: acc.updates + r.updates,
-              destroys: acc.destroys + r.destroys,
-              replaces: acc.replaces + r.replaces
-            }), { adds: 0, updates: 0, destroys: 0, replaces: 0 });
+            // Calculate totals from actual parsed resources (more accurate than grep counts)
+            let totalAdds = 0, totalUpdates = 0, totalDestroys = 0;
+            for (const r of results) {
+              const resources = parseDiffOutput(r.diff);
+              for (const res of resources) {
+                if (res.action === 'Add') totalAdds++;
+                else if (res.action === 'Modify') totalUpdates++;
+                else if (res.action === 'Remove') totalDestroys++;
+              }
+            }
             
-            const totalChanges = totals.adds + totals.updates + totals.destroys + totals.replaces;
+            const totalChanges = totalAdds + totalUpdates + totalDestroys;
             
             let summaryLine = totalChanges === 0 
               ? '✅ **No infrastructure changes**'
-              : `**${totalChanges} resource changes:** 🟢 ${totals.adds} add | 🟡 ${totals.updates} update | 🟠 ${totals.replaces} replace | 🔴 ${totals.destroys} destroy`;
+              : `**${totalChanges} resource changes:** 🟢 ${totalAdds} add | 🟡 ${totalUpdates} update | 🔴 ${totalDestroys} destroy`;
             
             const hasDrift = results.some(r => r.drift.includes('Drifted'));
             if (enableDrift && hasDrift) {
