@@ -1,51 +1,98 @@
+# =============================================================================
+# CDK DIFF WORKFLOW
+# =============================================================================
+# This reusable workflow performs CDK diff operations on AWS CDK stacks and
+# optionally runs CloudFormation drift detection. Results are posted as a
+# formatted comment on the pull request.
+#
+# FEATURES:
+#   - Runs `cdk diff` against specified stacks
+#   - Supports cross-account deployments via role assumption
+#   - Detects CloudFormation drift (optional)
+#   - Posts detailed, formatted results to the PR
+#
+# SECTIONS IN THIS FILE:
+#   1. Workflow Inputs          (line ~20)  - Configuration parameters
+#   2. Job Setup               (line ~75)  - Environment preparation
+#   3. CDK Diff & Drift        (line ~115) - Main diff/drift logic (bash)
+#   4. PR Comment Generation   (line ~320) - Comment formatting (JavaScript)
+# =============================================================================
+
 name: CDK Diff
 
 on:
   workflow_call:
+    # =========================================================================
+    # SECTION 1: WORKFLOW INPUTS
+    # =========================================================================
+    # All configurable parameters for the workflow. Only `aws-role-arn` and
+    # `stacks` are required.
+    # =========================================================================
     inputs:
+      # -----------------------------------------------------------------------
+      # Build Environment Configuration
+      # -----------------------------------------------------------------------
       working-directory:
         description: 'Working directory for CDK commands'
         required: false
         type: string
         default: '.'
+
       python-version:
         description: 'Python version (for Python CDK apps)'
         required: false
         type: string
         default: ''
+
       node-version:
         description: 'Node.js version'
         required: false
         type: string
         default: '20'
-      aws-region:
-        description: 'AWS region'
-        required: false
-        type: string
-        default: 'us-east-1'
-      aws-role-arn:
-        description: 'AWS IAM role ARN to assume'
-        required: true
-        type: string
-      stacks:
-        description: 'Space-separated list of stack names to diff'
-        required: true
-        type: string
+
       install-command:
         description: 'Command to install dependencies'
         required: false
         type: string
         default: 'npm ci'
+
+      # -----------------------------------------------------------------------
+      # AWS Configuration
+      # -----------------------------------------------------------------------
+      aws-region:
+        description: 'AWS region'
+        required: false
+        type: string
+        default: 'us-east-1'
+
+      aws-role-arn:
+        description: 'AWS IAM role ARN to assume'
+        required: true
+        type: string
+
+      # -----------------------------------------------------------------------
+      # CDK Diff Configuration
+      # -----------------------------------------------------------------------
+      stacks:
+        description: 'Space-separated list of stack names to diff'
+        required: true
+        type: string
+
       enable-drift-detection:
         description: 'Whether to run drift detection'
         required: false
         type: boolean
         default: true
+
+      # -----------------------------------------------------------------------
+      # Display Configuration
+      # -----------------------------------------------------------------------
       account-names:
         description: 'JSON map of account IDs to friendly names (e.g. {"123456789012": "production"})'
         required: false
         type: string
         default: '{}'
+
       pr-number:
         description: 'Pull request number'
         required: false
@@ -57,18 +104,32 @@ jobs:
     name: CDK Diff
     runs-on: ubuntu-latest
     permissions:
-      id-token: write
-      contents: read
-      pull-requests: write
+      id-token: write      # Required for OIDC authentication with AWS
+      contents: read       # Required to checkout code
+      pull-requests: write # Required to post PR comments
     defaults:
       run:
         working-directory: ${{ inputs.working-directory }}
+
     steps:
+      # =======================================================================
+      # SECTION 2: JOB SETUP
+      # =======================================================================
+      # Prepares the environment: checkout code, setup runtimes, install deps,
+      # configure AWS credentials, and synthesize the CDK app.
+      # =======================================================================
+
+      # -----------------------------------------------------------------------
+      # 2.1 Source Code Checkout
+      # -----------------------------------------------------------------------
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          fetch-depth: 0  # Full history needed for some CDK operations
 
+      # -----------------------------------------------------------------------
+      # 2.2 Runtime Setup
+      # -----------------------------------------------------------------------
       - name: Setup Python
         if: inputs.python-version != ''
         uses: actions/setup-python@v5
@@ -80,12 +141,18 @@ jobs:
         with:
           node-version: ${{ inputs.node-version }}
 
+      # -----------------------------------------------------------------------
+      # 2.3 Dependency Installation
+      # -----------------------------------------------------------------------
       - name: Install dependencies
         run: ${{ inputs.install-command }}
 
       - name: Install AWS CDK CLI
         run: npm install -g aws-cdk
 
+      # -----------------------------------------------------------------------
+      # 2.4 AWS Authentication
+      # -----------------------------------------------------------------------
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -93,9 +160,29 @@ jobs:
           role-duration-seconds: 3600
           aws-region: ${{ inputs.aws-region }}
 
+      # -----------------------------------------------------------------------
+      # 2.5 CDK Synthesis
+      # -----------------------------------------------------------------------
       - name: Synth CDK app
         run: npx cdk synth --quiet --output cdk.out
 
+      # =======================================================================
+      # SECTION 3: CDK DIFF & DRIFT DETECTION
+      # =======================================================================
+      # This is the main logic that:
+      #   - Iterates through each stack
+      #   - Handles cross-account role assumption
+      #   - Runs `cdk diff` to detect changes
+      #   - Runs CloudFormation drift detection (if enabled)
+      #   - Aggregates results into JSON output
+      #
+      # HELPER FUNCTIONS:
+      #   - get_stack_account()    : Gets AWS account ID from CDK manifest
+      #   - get_account_name()     : Maps account ID to friendly name
+      #   - get_cf_stack_name()    : Gets CloudFormation stack name from CDK
+      #   - restore_credentials()  : Restores original AWS credentials
+      #   - assume_target_role()   : Assumes CDK lookup role in target account
+      # =======================================================================
       - name: Run CDK Diff and Drift Detection
         id: diff
         env:
@@ -106,6 +193,12 @@ jobs:
         run: |
           echo "=== Starting CDK Diff ==="
           
+          # ---------------------------------------------------------------------
+          # 3.1 Initialize: Capture Current Account & Store Original Credentials
+          # ---------------------------------------------------------------------
+          # We need to save original credentials so we can restore them after
+          # assuming roles in other accounts (for cross-account deployments).
+          # ---------------------------------------------------------------------
           CURRENT_ACCOUNT=$(aws sts get-caller-identity --query 'Account' --output text)
           echo "Current AWS account: $CURRENT_ACCOUNT"
           
@@ -113,11 +206,22 @@ jobs:
           ORIGINAL_SECRET_KEY="$AWS_SECRET_ACCESS_KEY"
           ORIGINAL_SESSION_TOKEN="$AWS_SESSION_TOKEN"
           
+          # Results array - will hold diff results for all stacks
           RESULTS="[]"
           
+          # ---------------------------------------------------------------------
+          # 3.2 Helper Function: get_stack_account
+          # ---------------------------------------------------------------------
+          # Extracts the target AWS account ID for a stack from the CDK manifest.
+          # Falls back to current account if not found.
+          #
+          # Args: $1 = CDK stack name
+          # Returns: AWS account ID (12-digit number)
+          # ---------------------------------------------------------------------
           get_stack_account() {
             local stack_name="$1"
             if [ -f "cdk.out/manifest.json" ]; then
+              # Extract account from environment field: "aws://123456789012/us-east-1"
               local account=$(jq -r ".artifacts[\"$stack_name\"].environment // \"\"" cdk.out/manifest.json 2>/dev/null | sed -E 's/aws:\/\/([0-9]+)\/.*/\1/')
               if [ -n "$account" ] && [ "$account" != "null" ] && [ "$account" != "" ]; then
                 echo "$account"
@@ -127,6 +231,15 @@ jobs:
             echo "$CURRENT_ACCOUNT"
           }
           
+          # ---------------------------------------------------------------------
+          # 3.3 Helper Function: get_account_name
+          # ---------------------------------------------------------------------
+          # Maps an AWS account ID to a friendly name using the ACCOUNT_NAMES
+          # input parameter. Returns the account ID if no mapping exists.
+          #
+          # Args: $1 = AWS account ID
+          # Returns: Friendly name or account ID
+          # ---------------------------------------------------------------------
           get_account_name() {
             local account_id="$1"
             local name=$(echo "$ACCOUNT_NAMES" | jq -r ".[\"$account_id\"] // \"\"" 2>/dev/null)
@@ -137,6 +250,16 @@ jobs:
             fi
           }
           
+          # ---------------------------------------------------------------------
+          # 3.4 Helper Function: get_cf_stack_name
+          # ---------------------------------------------------------------------
+          # Gets the actual CloudFormation stack name from the CDK manifest.
+          # CDK allows overriding the CF stack name, so it may differ from the
+          # CDK construct name.
+          #
+          # Args: $1 = CDK stack name
+          # Returns: CloudFormation stack name
+          # ---------------------------------------------------------------------
           get_cf_stack_name() {
             local cdk_stack="$1"
             if [ -f "cdk.out/manifest.json" ]; then
@@ -151,12 +274,29 @@ jobs:
             fi
           }
           
+          # ---------------------------------------------------------------------
+          # 3.5 Helper Function: restore_credentials
+          # ---------------------------------------------------------------------
+          # Restores the original AWS credentials after assuming a cross-account
+          # role. Called after processing each stack.
+          # ---------------------------------------------------------------------
           restore_credentials() {
             export AWS_ACCESS_KEY_ID="$ORIGINAL_ACCESS_KEY"
             export AWS_SECRET_ACCESS_KEY="$ORIGINAL_SECRET_KEY"
             export AWS_SESSION_TOKEN="$ORIGINAL_SESSION_TOKEN"
           }
           
+          # ---------------------------------------------------------------------
+          # 3.6 Helper Function: assume_target_role
+          # ---------------------------------------------------------------------
+          # Assumes the CDK lookup role in a target account for cross-account
+          # operations. CDK creates this role during bootstrap.
+          #
+          # Role pattern: arn:aws:iam::{account}:role/cdk-hnb659fds-lookup-role-{account}-{region}
+          #
+          # Args: $1 = Target AWS account ID
+          # Returns: 0 on success, 1 on failure
+          # ---------------------------------------------------------------------
           assume_target_role() {
             local target_account="$1"
             local region="$AWS_REGION"
@@ -177,10 +317,24 @@ jobs:
             return 1
           }
           
+          # =====================================================================
+          # 3.7 Main Loop: Process Each Stack
+          # =====================================================================
+          # For each stack:
+          #   1. Determine target account and CF stack name
+          #   2. Assume cross-account role if needed
+          #   3. Run cdk diff
+          #   4. Count changes (adds, updates, destroys, replaces)
+          #   5. Run drift detection (if enabled)
+          #   6. Aggregate results
+          # =====================================================================
           for STACK in $STACKS; do
             echo ""
             echo "=== Processing stack: $STACK ==="
             
+            # -------------------------------------------------------------------
+            # 3.7.1 Resolve Stack Metadata
+            # -------------------------------------------------------------------
             TARGET_ACCOUNT=$(get_stack_account "$STACK")
             CF_STACK_NAME=$(get_cf_stack_name "$STACK")
             ACCOUNT_NAME=$(get_account_name "$TARGET_ACCOUNT")
@@ -188,29 +342,45 @@ jobs:
             echo "Target account: $TARGET_ACCOUNT ($ACCOUNT_NAME)"
             echo "CloudFormation stack name: $CF_STACK_NAME"
             
-            # Assume role if cross-account
+            # -------------------------------------------------------------------
+            # 3.7.2 Cross-Account Role Assumption
+            # -------------------------------------------------------------------
+            # If the stack deploys to a different account, assume the CDK lookup
+            # role in that account to perform drift detection.
+            # -------------------------------------------------------------------
             if [ "$TARGET_ACCOUNT" != "$CURRENT_ACCOUNT" ]; then
               assume_target_role "$TARGET_ACCOUNT" || true
             fi
             
-            # Run cdk diff to get the actual changes
+            # -------------------------------------------------------------------
+            # 3.7.3 Run CDK Diff
+            # -------------------------------------------------------------------
+            # Execute cdk diff and capture output. The diff shows:
+            #   [+] = Resources to be added
+            #   [~] = Resources to be modified
+            #   [-] = Resources to be removed
+            # -------------------------------------------------------------------
             echo "Running cdk diff..."
             DIFF_OUTPUT=$(npx cdk diff "$STACK" --no-color 2>&1) || true
             
-            # Check if stack exists
+            # Check if stack exists (new stacks show "does not exist" message)
             STACK_EXISTS="true"
             if echo "$DIFF_OUTPUT" | grep -q "does not exist\|has not been deployed"; then
               STACK_EXISTS="false"
             fi
             
-            # Count changes - look for resource-level changes (AWS:: type)
-            # Use grep -E and handle exit codes properly (grep returns 1 when no matches)
+            # -------------------------------------------------------------------
+            # 3.7.4 Count Resource Changes
+            # -------------------------------------------------------------------
+            # Parse the diff output to count different types of changes.
+            # We look for AWS:: prefixed lines to count actual resource changes.
+            # -------------------------------------------------------------------
             ADDS=$(echo "$DIFF_OUTPUT" | grep -E '\[\+\] AWS::' | wc -l | tr -d ' ')
             UPDATES=$(echo "$DIFF_OUTPUT" | grep -E '\[~\] AWS::' | wc -l | tr -d ' ')
             DESTROYS=$(echo "$DIFF_OUTPUT" | grep -E '\[-\] AWS::' | wc -l | tr -d ' ')
             REPLACES=$(echo "$DIFF_OUTPUT" | grep -i 'replace' | wc -l | tr -d ' ')
             
-            # Ensure numbers are valid
+            # Ensure numbers are valid (default to 0 if parsing failed)
             ADDS=${ADDS:-0}
             UPDATES=${UPDATES:-0}
             DESTROYS=${DESTROYS:-0}
@@ -222,15 +392,29 @@ jobs:
             
             echo "Change counts: adds=$ADDS, updates=$UPDATES, destroys=$DESTROYS, replaces=$REPLACES"
             
-            # Drift detection
+            # -------------------------------------------------------------------
+            # 3.7.5 Drift Detection
+            # -------------------------------------------------------------------
+            # If enabled, detect configuration drift between the CloudFormation
+            # template and actual deployed resources. This helps identify manual
+            # changes made outside of CDK/CloudFormation.
+            #
+            # Drift statuses:
+            #   - IN_SYNC: No drift detected
+            #   - DRIFTED: Resources have drifted from template
+            #   - NOT_SUPPORTED: Some resources don't support drift detection
+            # -------------------------------------------------------------------
             DRIFT_STATUS="⏭️ Skipped"
             DRIFT_DETAILS=""
             
             if [ "$ENABLE_DRIFT" = "true" ]; then
+              # Check if stack is deployed before running drift detection
               if aws cloudformation describe-stacks --stack-name "$CF_STACK_NAME" >/dev/null 2>&1; then
+                # Initiate drift detection
                 DRIFT_ID=$(aws cloudformation detect-stack-drift --stack-name "$CF_STACK_NAME" --query 'StackDriftDetectionId' --output text 2>/dev/null) || true
                 
                 if [ -n "$DRIFT_ID" ] && [ "$DRIFT_ID" != "None" ]; then
+                  # Poll for drift detection completion (max 60 seconds = 12 * 5s)
                   for i in {1..12}; do
                     sleep 5
                     DRIFT_CHECK=$(aws cloudformation describe-stack-drift-detection-status \
@@ -238,6 +422,7 @@ jobs:
                       --query 'DetectionStatus' --output text 2>/dev/null) || echo "FAILED"
                     
                     if [ "$DRIFT_CHECK" = "DETECTION_COMPLETE" ]; then
+                      # Get final drift status
                       DRIFT_RESULT=$(aws cloudformation describe-stack-drift-detection-status \
                         --stack-drift-detection-id "$DRIFT_ID" \
                         --query 'StackDriftStatus' --output text 2>/dev/null) || echo "UNKNOWN"
@@ -246,7 +431,7 @@ jobs:
                         DRIFT_STATUS="✅ In Sync"
                       elif [ "$DRIFT_RESULT" = "DRIFTED" ]; then
                         DRIFT_STATUS="🚨 Drifted"
-                        # Get drifted resources with property differences
+                        # Get detailed drift information for reporting
                         DRIFT_DETAILS=$(aws cloudformation describe-stack-resource-drifts \
                           --stack-name "$CF_STACK_NAME" \
                           --stack-resource-drift-status-filters MODIFIED DELETED \
@@ -269,19 +454,24 @@ jobs:
               fi
             fi
             
+            # Restore original credentials for next iteration
             restore_credentials
             
-            # Clean diff output - remove CDK notices/warnings
+            # -------------------------------------------------------------------
+            # 3.7.6 Clean & Aggregate Results
+            # -------------------------------------------------------------------
+            # Remove CDK notices/warnings from diff output and build JSON result.
+            # -------------------------------------------------------------------
             CLEAN_DIFF=$(echo "$DIFF_OUTPUT" | grep -v "^Notice:" | grep -v "^\*\*\*" | grep -v "newer version" | grep -v "Please upgrade")
             
-            # Handle drift details
+            # Ensure drift details is valid JSON
             if [ -z "$DRIFT_DETAILS" ]; then
               DRIFT_DETAILS_ESCAPED="[]"
             else
               DRIFT_DETAILS_ESCAPED=$(echo "$DRIFT_DETAILS" | jq -c '.' 2>/dev/null || echo "[]")
             fi
             
-            # Build result with diff output
+            # Build JSON result object for this stack
             RESULT=$(jq -n \
               --arg stack "$STACK" \
               --argjson adds "$ADDS" \
@@ -295,13 +485,31 @@ jobs:
               --arg stack_exists "$STACK_EXISTS" \
               '{stack: $stack, adds: $adds, updates: $updates, destroys: $destroys, replaces: $replaces, drift: $drift, drift_details: $drift_details, diff: $diff, account_name: $account_name, stack_exists: $stack_exists}')
             
+            # Append to results array
             RESULTS=$(echo "$RESULTS" | jq --argjson result "$RESULT" '. + [$result]')
           done
           
+          # Output results for next step
           echo "results<<EOF" >> $GITHUB_OUTPUT
           echo "$RESULTS" >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
 
+      # =======================================================================
+      # SECTION 4: PR COMMENT GENERATION
+      # =======================================================================
+      # This JavaScript step formats the diff results into a readable PR comment.
+      #
+      # SUBSECTIONS:
+      #   4.1 parseDiffOutput()  - Parses CDK diff text into structured data
+      #   4.2 Stack Sections     - Generates markdown for each stack
+      #   4.3 Summary Line       - Creates the summary header
+      #   4.4 Comment Posting    - Creates or updates the PR comment
+      #
+      # OUTPUT FORMAT:
+      #   - Each resource change is shown with property-level diffs
+      #   - Drift details are shown in tables
+      #   - Collapsible sections for each stack
+      # =======================================================================
       - name: Post PR Comment
         uses: actions/github-script@v7
         env:
@@ -313,25 +521,49 @@ jobs:
             const results = JSON.parse(process.env.RESULTS || '[]');
             const enableDrift = process.env.ENABLE_DRIFT === 'true';
             
-            // Parse cdk diff output into structured resources with property changes
-            // CDK diff format: [+~-] AWS::Type::Name ConstructPath LogicalId
-            // Parse cdk diff - handles both simple changes and unified diff format
+            // =================================================================
+            // 4.1 DIFF PARSER FUNCTION
+            // =================================================================
+            // Parses CDK diff output into structured resource changes.
+            //
+            // CDK diff format examples:
+            //   [+] AWS::S3::Bucket MyBucket
+            //   [~] AWS::Lambda::Function MyFunction
+            //   [-] AWS::IAM::Role OldRole
+            //
+            // Property changes appear as:
+            //   └── [~] Property
+            //       └── [-] old_value
+            //       └── [+] new_value
+            //
+            // Or unified diff format for complex changes:
+            //   @@ -1,3 +1,4 @@
+            //   [-] removed line
+            //   [+] added line
+            // =================================================================
             function parseDiffOutput(diff) {
               const resources = [];
               if (!diff) return resources;
               
               const lines = diff.split('\n');
-              let currentResource = null;
-              let currentProperty = null;
-              let oldValue = null;
-              let inUnifiedDiff = false;
-              let removedLines = [];
-              let addedLines = [];
+              
+              // State tracking variables
+              let currentResource = null;   // Current resource being parsed
+              let currentProperty = null;   // Current property being parsed
+              let oldValue = null;          // Old value for simple property changes
+              let inUnifiedDiff = false;    // Whether we're in unified diff mode
+              let removedLines = [];        // Lines removed in unified diff
+              let addedLines = [];          // Lines added in unified diff
               
               for (const line of lines) {
-                // Match resource line: [+], [~], or [-] AWS::Type::Name ... LogicalId
+                // ---------------------------------------------------------
+                // 4.1.1 Match Resource Lines
+                // ---------------------------------------------------------
+                // Format: [+~-] AWS::Type::Name ConstructPath LogicalId
+                // ---------------------------------------------------------
                 const resourceMatch = line.match(/\[([+~-])\]\s+(AWS::\S+)\s+(.+)/);
                 if (resourceMatch) {
+                  // Save previous resource if exists
                   if (currentResource) {
                     if (inUnifiedDiff && currentProperty) {
                       currentResource.properties.push({
@@ -345,24 +577,37 @@ jobs:
                     }
                     resources.push(currentResource);
                   }
+                  
+                  // Parse new resource
                   const [, action, type, rest] = resourceMatch;
                   const id = rest.trim().split(/\s+/).pop();
                   currentResource = {
                     action: action === '+' ? 'Add' : action === '-' ? 'Remove' : 'Modify',
                     type: type.replace('AWS::', ''),
-                    id, replace: line.toLowerCase().includes('replace'),
+                    id,
+                    replace: line.toLowerCase().includes('replace'),
                     properties: []
                   };
-                  currentProperty = null; oldValue = null; inUnifiedDiff = false;
-                  removedLines = []; addedLines = [];
+                  
+                  // Reset state for new resource
+                  currentProperty = null;
+                  oldValue = null;
+                  inUnifiedDiff = false;
+                  removedLines = [];
+                  addedLines = [];
                   continue;
                 }
                 
                 if (!currentResource) continue;
                 
-                // Match property line with [~]
+                // ---------------------------------------------------------
+                // 4.1.2 Match Property Lines
+                // ---------------------------------------------------------
+                // Format: └── [~] PropertyName or ├── [~] PropertyName
+                // ---------------------------------------------------------
                 const propMatch = line.match(/[└├]\s*─\s*\[~\]\s+(\S+)/);
                 if (propMatch) {
+                  // Save previous property if exists
                   if (inUnifiedDiff && currentProperty) {
                     currentResource.properties.push({
                       name: currentProperty,
@@ -373,43 +618,64 @@ jobs:
                   } else if (currentProperty && oldValue !== null) {
                     currentResource.properties.push({ name: currentProperty, oldValue, newValue: null });
                   }
-                  currentProperty = propMatch[1]; oldValue = null; inUnifiedDiff = false;
-                  removedLines = []; addedLines = [];
+                  
+                  // Start tracking new property
+                  currentProperty = propMatch[1];
+                  oldValue = null;
+                  inUnifiedDiff = false;
+                  removedLines = [];
+                  addedLines = [];
                   continue;
                 }
                 
-                // Check for unified diff marker @@ -x,y +a,b @@
+                // ---------------------------------------------------------
+                // 4.1.3 Handle Unified Diff Format
+                // ---------------------------------------------------------
+                // Unified diff marker: @@ -x,y +a,b @@
+                // ---------------------------------------------------------
                 if (line.match(/@@ -\d+,\d+ \+\d+,\d+ @@/) && currentProperty) {
-                  inUnifiedDiff = true; removedLines = []; addedLines = [];
+                  inUnifiedDiff = true;
+                  removedLines = [];
+                  addedLines = [];
                   continue;
                 }
                 
-                // Collect unified diff lines
+                // Collect unified diff content
                 if (inUnifiedDiff && currentProperty) {
                   const rm = line.match(/\[-\]\s*(.*)/);
                   if (rm) { removedLines.push(rm[1].trim()); continue; }
                   const add = line.match(/\[\+\]\s*(.*)/);
                   if (add) { addedLines.push(add[1].trim()); continue; }
-                  if (line.match(/\[ \]/)) continue;
+                  if (line.match(/\[ \]/)) continue;  // Context line
                 }
                 
-                // Simple property change: [-] old_value
+                // ---------------------------------------------------------
+                // 4.1.4 Handle Simple Property Changes
+                // ---------------------------------------------------------
+                // Format: [-] old_value followed by [+] new_value
+                // ---------------------------------------------------------
                 const oldMatch = line.match(/\[-\]\s+(.+)/);
                 if (oldMatch && currentProperty && !inUnifiedDiff) {
                   oldValue = oldMatch[1].trim();
                   continue;
                 }
                 
-                // Simple property change: [+] new_value
                 const newMatch = line.match(/\[\+\]\s+(.+)/);
                 if (newMatch && currentProperty && !inUnifiedDiff) {
-                  currentResource.properties.push({ name: currentProperty, oldValue, newValue: newMatch[1].trim() });
-                  currentProperty = null; oldValue = null;
+                  currentResource.properties.push({
+                    name: currentProperty,
+                    oldValue,
+                    newValue: newMatch[1].trim()
+                  });
+                  currentProperty = null;
+                  oldValue = null;
                   continue;
                 }
               }
               
-              // Save last resource
+              // ---------------------------------------------------------
+              // 4.1.5 Save Last Resource
+              // ---------------------------------------------------------
               if (currentResource) {
                 if (inUnifiedDiff && currentProperty) {
                   currentResource.properties.push({
@@ -427,52 +693,71 @@ jobs:
               return resources;
             }
             
-            // Build the comment body
+            // =================================================================
+            // 4.2 GENERATE STACK SECTIONS
+            // =================================================================
+            // Creates markdown for each stack with:
+            //   - Stack header with account info
+            //   - Resource changes with property diffs
+            //   - Drift status and details
+            // =================================================================
             const stackSections = results.map(r => {
               const hasChanges = r.adds + r.updates + r.destroys + r.replaces > 0;
               
-              // Stack header with summary
+              // ---------------------------------------------------------------
+              // 4.2.1 Stack Header
+              // ---------------------------------------------------------------
               let header = `### 📦 ${r.stack}`;
               header += ` _(${r.account_name})_`;
               
               let content = '';
               
-              // Check if this is a new stack
+              // ---------------------------------------------------------------
+              // 4.2.2 Stack Content Based on State
+              // ---------------------------------------------------------------
               if (r.stack_exists === 'false') {
+                // New stack - not yet deployed
                 content = `\n\n🆕 **New Stack** - ${r.adds} resources will be created\n`;
               } else if (!hasChanges) {
+                // No changes detected
                 content = '\n\n✅ No changes\n';
               } else {
-                // Parse diff output into structured resources
+                // Has changes - parse and display them
                 const resources = parseDiffOutput(r.diff);
                 
                 if (resources.length > 0) {
+                  // -------------------------------------------------------------
+                  // 4.2.3 Format Each Resource Change
+                  // -------------------------------------------------------------
                   for (const res of resources) {
-                    // Determine icon
+                    // Determine icon based on action type
                     let icon;
                     if (res.replace) {
-                      icon = '🟠';
+                      icon = '🟠';  // Replace (destroy + create)
                     } else if (res.action === 'Add') {
-                      icon = '🟢';
+                      icon = '🟢';  // Add
                     } else if (res.action === 'Modify') {
-                      icon = '🟡';
+                      icon = '🟡';  // Modify/Update
                     } else {
-                      icon = '🔴';
+                      icon = '🔴';  // Remove/Destroy
                     }
                     
                     const actionText = res.replace ? 'Replace' : res.action === 'Modify' ? 'Update' : res.action;
                     content += `\n\n**\`${res.id}\`** (\`${res.type}\`) ${icon} ${actionText}\n`;
                     
-                    // Show property changes table
+                    // -------------------------------------------------------------
+                    // 4.2.4 Property Changes Table
+                    // -------------------------------------------------------------
                     if (res.properties.length > 0) {
                       content += '| Property | Current | New |\n|----------|---------|-----|\n';
                       for (const prop of res.properties) {
                         let oldVal, newVal;
                         if (prop.isUnifiedDiff) {
-                          // Show full unified diff values
+                          // Unified diff: show full values
                           oldVal = prop.oldValue ? `\`${prop.oldValue.replace(/\n/g, ' ')}\`` : '_(none)_';
                           newVal = prop.newValue ? `\`${prop.newValue.replace(/\n/g, ' ')}\`` : '_(removed)_';
                         } else {
+                          // Simple change
                           oldVal = prop.oldValue != null ? `\`${prop.oldValue}\`` : '_(not set)_';
                           newVal = prop.newValue != null ? `\`${prop.newValue}\`` : '_(removed)_';
                         }
@@ -481,21 +766,29 @@ jobs:
                     }
                   }
                 } else if (hasChanges) {
-                  // Fallback: show raw diff in collapsible
+                  // -------------------------------------------------------------
+                  // 4.2.5 Fallback: Raw Diff Display
+                  // -------------------------------------------------------------
+                  // If parsing failed but changes exist, show raw diff
                   content += '\n\n<details><summary>View raw diff</summary>\n\n```\n';
                   content += r.diff || 'No diff output';
                   content += '\n```\n</details>\n';
                 }
               }
               
-              // Drift section
+              // ---------------------------------------------------------------
+              // 4.2.6 Drift Section
+              // ---------------------------------------------------------------
               if (enableDrift) {
                 content += `\n**Drift:** ${r.drift}`;
                 
+                // Show drift details if resources have drifted
                 if (r.drift.includes('Drifted') && r.drift_details && r.drift_details.length > 0) {
-                  for (const d of r.drift_details.slice(0, 15)) {
+                  for (const d of r.drift_details.slice(0, 15)) {  // Limit to 15 resources
                     content += `\n\n**\`${d.Id}\`** (\`${d.Type.replace('AWS::', '')}\`)\n`;
+                    
                     if (d.Props && d.Props.length > 0) {
+                      // Show property differences table
                       content += '| Property | Expected | Actual |\n|----------|----------|--------|\n';
                       for (const p of d.Props) {
                         const path = p.PropertyPath || 'unknown';
@@ -510,10 +803,15 @@ jobs:
                 }
               }
               
+              // Wrap in collapsible details element
               return `<details open>\n<summary>${header}</summary>\n${content}\n</details>`;
             }).join('\n\n');
             
-            // Calculate totals from actual parsed resources (more accurate than grep counts)
+            // =================================================================
+            // 4.3 CALCULATE TOTALS & BUILD SUMMARY
+            // =================================================================
+            // Recalculate totals from parsed resources (more accurate than grep)
+            // =================================================================
             let totalAdds = 0, totalUpdates = 0, totalDestroys = 0;
             for (const r of results) {
               const resources = parseDiffOutput(r.diff);
@@ -526,15 +824,20 @@ jobs:
             
             const totalChanges = totalAdds + totalUpdates + totalDestroys;
             
+            // Build summary line
             let summaryLine = totalChanges === 0 
               ? '✅ **No infrastructure changes**'
               : `**${totalChanges} resource changes:** 🟢 ${totalAdds} add | 🟡 ${totalUpdates} update | 🔴 ${totalDestroys} destroy`;
             
+            // Add drift warning if detected
             const hasDrift = results.some(r => r.drift.includes('Drifted'));
             if (enableDrift && hasDrift) {
               summaryLine += ' | 🚨 **Drift detected**';
             }
             
+            // =================================================================
+            // 4.4 BUILD FINAL COMMENT BODY
+            // =================================================================
             const body = [
               '## 🏗️ CDK Diff',
               '',
@@ -546,6 +849,11 @@ jobs:
               `<sub>Generated at ${new Date().toISOString()} from commit <code>${context.sha.substring(0, 7)}</code></sub>`
             ].join('\n');
 
+            // =================================================================
+            // 4.5 POST OR UPDATE PR COMMENT
+            // =================================================================
+            // Finds existing CDK Diff comment and updates it, or creates new one.
+            // =================================================================
             try {
               // Get PR number from env (passed from caller) or context
               const envPrNumber = parseInt(process.env.PR_NUMBER, 10);
@@ -560,14 +868,21 @@ jobs:
               
               console.log(`Posting comment to PR #${prNumber}`);
               
+              // ---------------------------------------------------------------
+              // 4.5.1 Find Existing Comment
+              // ---------------------------------------------------------------
               const { data: comments } = await github.rest.issues.listComments({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 issue_number: prNumber,
               });
               
+              // Look for our marker to find existing CDK Diff comment
               const botComment = comments.find(c => c.body && c.body.includes('## 🏗️ CDK Diff'));
               
+              // ---------------------------------------------------------------
+              // 4.5.2 Create or Update Comment
+              // ---------------------------------------------------------------
               if (botComment) {
                 console.log(`Updating existing comment ${botComment.id}`);
                 await github.rest.issues.updateComment({
