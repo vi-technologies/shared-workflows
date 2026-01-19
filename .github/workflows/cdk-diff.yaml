@@ -966,6 +966,7 @@ jobs:
           DIFF_RESULTS: ${{ steps.diff.outputs.results }}
           PR_NUMBER: ${{ inputs.pr-number }}
           STACKS: ${{ inputs.stacks }}
+          ACCOUNT_NAMES: ${{ inputs.account-names }}
         uses: actions/github-script@v7
         with:
           script: |
@@ -1010,138 +1011,200 @@ jobs:
             const prTitle = pr.title;
             const prUrl = pr.html_url;
             const stacks = process.env.STACKS || '';
+            const accountNames = JSON.parse(process.env.ACCOUNT_NAMES || '{}');
             
-            // Count changes across all stacks
+            // Count changes across all stacks and build stack details
             let totalAdds = 0, totalUpdates = 0, totalDestroys = 0;
-            let changeDetails = [];
+            const stackData = {}; // { stackName: { account, region, resources: [{type, name, icon, properties}] } }
             
             for (const result of results) {
-              if (result.diff && result.diff.includes('[+]')) {
-                totalAdds += (result.diff.match(/\[\+\]\s*AWS::/g) || []).length;
-              }
-              if (result.diff && result.diff.includes('[~]')) {
-                totalUpdates += (result.diff.match(/\[~\]\s*AWS::/g) || []).length;
-              }
-              if (result.diff && result.diff.includes('[-]')) {
-                totalDestroys += (result.diff.match(/\[-\]\s*AWS::/g) || []).length;
+              const stackName = result.stack;
+              if (!stackData[stackName]) {
+                // Extract account from result if available
+                const accountMatch = result.diff?.match(/Account:\s*(\d+)/);
+                const regionMatch = result.diff?.match(/Region:\s*([\w-]+)/);
+                stackData[stackName] = {
+                  account: result.account || (accountMatch ? accountMatch[1] : null),
+                  region: result.region || (regionMatch ? regionMatch[1] : 'us-east-1'),
+                  resources: []
+                };
               }
               
-              // Extract resource changes with property details
               if (result.diff) {
+                // Count changes
+                const adds = (result.diff.match(/\[\+\]\s*AWS::/g) || []).length;
+                const updates = (result.diff.match(/\[~\]\s*AWS::/g) || []).length;
+                const destroys = (result.diff.match(/\[-\]\s*AWS::/g) || []).length;
+                totalAdds += adds;
+                totalUpdates += updates;
+                totalDestroys += destroys;
+                
+                // Parse resource changes with properties
                 const lines = result.diff.split('\n');
                 let currentResource = null;
                 
                 for (const line of lines) {
-                  // Match resource lines: [+], [~], [-] AWS::Type::Name
+                  // Match resource lines: [+], [~], [-] AWS::Type::Name resourceId
                   const resourceMatch = line.match(/^\s*\[([+~-])\]\s*(AWS::\S+)\s+(.+)/);
                   if (resourceMatch) {
-                    const icon = resourceMatch[1] === '+' ? '🟢' : resourceMatch[1] === '~' ? '🟡' : '🔴';
-                    currentResource = `${icon} ${resourceMatch[2]} ${resourceMatch[3]}`;
-                    changeDetails.push({ stack: result.stack, resource: currentResource, properties: [] });
+                    const changeType = resourceMatch[1];
+                    const icon = changeType === '+' ? '🟢' : changeType === '~' ? '🟡' : '🔴';
+                    currentResource = {
+                      icon,
+                      type: resourceMatch[2],
+                      name: resourceMatch[3].trim(),
+                      properties: []
+                    };
+                    stackData[stackName].resources.push(currentResource);
                   }
-                  // Match property changes: └── or ├── with property name
-                  const propMatch = line.match(/^\s*[└├]──\s*(.+)/);
-                  if (propMatch && changeDetails.length > 0) {
-                    changeDetails[changeDetails.length - 1].properties.push(propMatch[1]);
+                  
+                  // Match property changes (various formats)
+                  const propMatch = line.match(/^\s*[└├─│\s]*([←→↔]|Tags:|[\w]+:)\s*(.+)?/);
+                  if (propMatch && currentResource && !line.match(/^\s*\[/)) {
+                    const propText = line.trim();
+                    if (propText && !propText.startsWith('AWS::')) {
+                      currentResource.properties.push(propText);
+                    }
                   }
                 }
               }
             }
             
             const totalChanges = totalAdds + totalUpdates + totalDestroys;
+            const totalStacks = Object.keys(stackData).length;
             
             // =================================================================
-            // 5.3 Build Slack message blocks
+            // 5.3 Build Slack message with blocks and attachments
             // =================================================================
-            let diffText = '';
-            if (totalChanges === 0) {
-              diffText = '✅ No infrastructure changes detected';
-            } else {
-              diffText = `📊 *${totalChanges} changes:* 🟢 ${totalAdds} add | 🟡 ${totalUpdates} update | 🔴 ${totalDestroys} destroy\n\n`;
-              
-              // Group by stack
-              const stackGroups = {};
-              for (const detail of changeDetails) {
-                if (!stackGroups[detail.stack]) stackGroups[detail.stack] = [];
-                stackGroups[detail.stack].push(detail);
+            
+            // Main blocks (header, context, stats, buttons)
+            const blocks = [
+              {
+                type: 'header',
+                text: { type: 'plain_text', text: '🔍 CDK Diff Preview', emoji: true }
+              },
+              {
+                type: 'context',
+                elements: [
+                  { type: 'image', image_url: `https://github.com/${actor}.png`, alt_text: actor },
+                  { type: 'mrkdwn', text: `*${actor}* opened <${prUrl}|PR #${prNumber}> in \`${repo}\`` }
+                ]
+              },
+              { type: 'divider' },
+              {
+                type: 'section',
+                fields: [
+                  { type: 'mrkdwn', text: `*🟢 Additions*\n${totalAdds} resources` },
+                  { type: 'mrkdwn', text: `*🟡 Updates*\n${totalUpdates} resources` },
+                  { type: 'mrkdwn', text: `*🔴 Deletions*\n${totalDestroys} resources` },
+                  { type: 'mrkdwn', text: `*📦 Stacks*\n${totalStacks} affected` }
+                ]
+              },
+              {
+                type: 'actions',
+                elements: [
+                  {
+                    type: 'button',
+                    text: { type: 'plain_text', text: '📝 View PR', emoji: true },
+                    url: prUrl,
+                    style: 'primary'
+                  },
+                  {
+                    type: 'button',
+                    text: { type: 'plain_text', text: '⚙️ View Workflow', emoji: true },
+                    url: `${context.payload.repository.html_url}/actions/runs/${context.runId}`
+                  }
+                ]
               }
+            ];
+            
+            // Build attachments for each stack
+            const attachments = [];
+            
+            for (const [stackName, data] of Object.entries(stackData)) {
+              // Determine environment from account name or stack name
+              const accountId = data.account;
+              const envName = accountNames[accountId] || 
+                (stackName.toLowerCase().includes('prod') ? 'production' :
+                 stackName.toLowerCase().includes('staging') ? 'staging' :
+                 stackName.toLowerCase().includes('test') ? 'test' : 'unknown');
               
-              for (const [stack, details] of Object.entries(stackGroups)) {
-                diffText += `📦 *Stack ${stack}*\n`;
-                for (const d of details.slice(0, 10)) { // Limit to 10 per stack
-                  diffText += `${d.resource}\n`;
-                  for (const prop of d.properties.slice(0, 3)) { // Limit properties
-                    diffText += `   └── ${prop}\n`;
+              // Color based on changes: green if adds only, yellow if updates, red if deletes
+              const hasDeletes = data.resources.some(r => r.icon === '🔴');
+              const hasUpdates = data.resources.some(r => r.icon === '🟡');
+              const color = hasDeletes ? '#dc3545' : hasUpdates ? '#ffc107' : '#2eb886';
+              
+              const stackBlocks = [
+                {
+                  type: 'section',
+                  text: { type: 'mrkdwn', text: `*📦 ${stackName}*` },
+                  accessory: {
+                    type: 'button',
+                    text: { type: 'plain_text', text: envName, emoji: true },
+                    style: 'primary'
                   }
                 }
-                if (details.length > 10) {
-                  diffText += `   ... and ${details.length - 10} more resources\n`;
-                }
-              }
-            }
-            
-            // Format stacks list
-            const stacksList = stacks.split(' ').filter(s => s).map(s => `• ${s}`).join('\n');
-            
-            // Build payload
-            const payload = {
-              blocks: [
-                {
-                  type: 'header',
-                  text: {
-                    type: 'plain_text',
-                    text: '🔍 CDK Diff Preview (PR)',
-                    emoji: true
-                  }
-                },
-                {
-                  type: 'section',
-                  fields: [
-                    {
-                      type: 'mrkdwn',
-                      text: `*Repository:*\n\`${repo}\``
-                    },
-                    {
-                      type: 'mrkdwn',
-                      text: `*Author:*\n${actor}`
-                    }
-                  ]
-                },
-                {
-                  type: 'section',
-                  text: {
-                    type: 'mrkdwn',
-                    text: `*PR:* <${prUrl}|#${prNumber} ${prTitle}>`
-                  }
-                },
-                {
-                  type: 'section',
-                  text: {
-                    type: 'mrkdwn',
-                    text: `*Stacks:*\n${stacksList}`
-                  }
-                },
-                {
-                  type: 'divider'
-                },
-                {
-                  type: 'section',
-                  text: {
-                    type: 'mrkdwn',
-                    text: diffText.substring(0, 2900) // Slack limit
-                  }
-                },
-                {
+              ];
+              
+              // Add account/region context if available
+              if (accountId) {
+                stackBlocks.push({
                   type: 'context',
                   elements: [
-                    {
-                      type: 'mrkdwn',
-                      text: `<${context.payload.repository.html_url}/actions/runs/${context.runId}|View workflow run>`
-                    }
+                    { type: 'mrkdwn', text: `Account: \`${accountId}\` • Region: \`${data.region || 'us-east-1'}\`` }
                   ]
+                });
+              }
+              
+              stackBlocks.push({ type: 'divider' });
+              
+              // Add resource changes (limit to 8 per stack to avoid Slack limits)
+              const resourcesToShow = data.resources.slice(0, 8);
+              for (const resource of resourcesToShow) {
+                let resourceText = `${resource.icon} \`${resource.type}\` *${resource.name}*`;
+                
+                // Add property changes (limit to 2 per resource)
+                const propsToShow = resource.properties.slice(0, 2);
+                for (const prop of propsToShow) {
+                  resourceText += `\n      └─ ${prop}`;
                 }
-              ]
-            };
+                if (resource.properties.length > 2) {
+                  resourceText += `\n      └─ _...and ${resource.properties.length - 2} more changes_`;
+                }
+                
+                stackBlocks.push({
+                  type: 'section',
+                  text: { type: 'mrkdwn', text: resourceText }
+                });
+              }
+              
+              // Show if there are more resources
+              if (data.resources.length > 8) {
+                stackBlocks.push({
+                  type: 'context',
+                  elements: [
+                    { type: 'mrkdwn', text: `_...and ${data.resources.length - 8} more resources_` }
+                  ]
+                });
+              }
+              
+              attachments.push({ color, blocks: stackBlocks });
+            }
+            
+            // If no changes, add a simple message
+            if (totalChanges === 0) {
+              attachments.push({
+                color: '#2eb886',
+                blocks: [
+                  {
+                    type: 'section',
+                    text: { type: 'mrkdwn', text: '✅ No infrastructure changes detected' }
+                  }
+                ]
+              });
+            }
+            
+            const payload = { blocks, attachments };
             
             // =================================================================
             // 5.4 Send to Slack
