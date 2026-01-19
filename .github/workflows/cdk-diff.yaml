@@ -99,6 +99,26 @@ on:
         type: number
         default: 0
 
+      # -----------------------------------------------------------------------
+      # Slack Notification Configuration
+      # -----------------------------------------------------------------------
+      slack-notify-label:
+        description: 'PR label that triggers Slack notification (e.g., "slack-notify" or "deploy-preview")'
+        required: false
+        type: string
+        default: 'slack-notify'
+
+      slack-channel-name:
+        description: 'Slack channel name (for display purposes)'
+        required: false
+        type: string
+        default: 'devops'
+
+    secrets:
+      slack-webhook-url:
+        description: 'Slack webhook URL for notifications (required if using slack-notify label)'
+        required: false
+
 jobs:
   diff:
     name: CDK Diff
@@ -931,3 +951,225 @@ jobs:
               console.error('Stack:', error.stack);
               throw error;
             }
+
+      # =======================================================================
+      # SECTION 5: SLACK NOTIFICATION (LABEL-TRIGGERED)
+      # =======================================================================
+      # Sends a Slack notification when the PR has the configured label.
+      # This allows teams to get deployment-like visibility for important PRs.
+      # =======================================================================
+      - name: Check for Slack notify label and send notification
+        if: ${{ secrets.slack-webhook-url != '' }}
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.slack-webhook-url }}
+          SLACK_LABEL: ${{ inputs.slack-notify-label }}
+          SLACK_CHANNEL: ${{ inputs.slack-channel-name }}
+          DIFF_RESULTS: ${{ steps.diff.outputs.results }}
+          PR_NUMBER: ${{ inputs.pr-number }}
+          STACKS: ${{ inputs.stacks }}
+        uses: actions/github-script@v7
+        with:
+          script: |
+            // =================================================================
+            // 5.1 Check if PR has the Slack notify label
+            // =================================================================
+            const envPrNumber = parseInt(process.env.PR_NUMBER, 10);
+            const prNumber = envPrNumber > 0 ? envPrNumber : (context.payload.pull_request?.number || context.issue?.number);
+            
+            if (!prNumber) {
+              console.log('No PR number found, skipping Slack notification');
+              return;
+            }
+            
+            const { data: pr } = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: prNumber,
+            });
+            
+            const slackLabel = process.env.SLACK_LABEL || 'slack-notify';
+            const hasLabel = pr.labels.some(label => label.name === slackLabel);
+            
+            if (!hasLabel) {
+              console.log(`PR #${prNumber} does not have "${slackLabel}" label, skipping Slack notification`);
+              return;
+            }
+            
+            console.log(`PR #${prNumber} has "${slackLabel}" label, sending Slack notification`);
+            
+            // =================================================================
+            // 5.2 Parse diff results and build Slack message
+            // =================================================================
+            const results = JSON.parse(process.env.DIFF_RESULTS || '[]');
+            const repo = context.repo.repo;
+            const actor = context.actor;
+            const prTitle = pr.title;
+            const prUrl = pr.html_url;
+            const stacks = process.env.STACKS || '';
+            
+            // Count changes across all stacks
+            let totalAdds = 0, totalUpdates = 0, totalDestroys = 0;
+            let changeDetails = [];
+            
+            for (const result of results) {
+              if (result.diff && result.diff.includes('[+]')) {
+                totalAdds += (result.diff.match(/\[\+\]\s*AWS::/g) || []).length;
+              }
+              if (result.diff && result.diff.includes('[~]')) {
+                totalUpdates += (result.diff.match(/\[~\]\s*AWS::/g) || []).length;
+              }
+              if (result.diff && result.diff.includes('[-]')) {
+                totalDestroys += (result.diff.match(/\[-\]\s*AWS::/g) || []).length;
+              }
+              
+              // Extract resource changes with property details
+              if (result.diff) {
+                const lines = result.diff.split('\n');
+                let currentResource = null;
+                
+                for (const line of lines) {
+                  // Match resource lines: [+], [~], [-] AWS::Type::Name
+                  const resourceMatch = line.match(/^\s*\[([+~-])\]\s*(AWS::\S+)\s+(.+)/);
+                  if (resourceMatch) {
+                    const icon = resourceMatch[1] === '+' ? '🟢' : resourceMatch[1] === '~' ? '🟡' : '🔴';
+                    currentResource = `${icon} ${resourceMatch[2]} ${resourceMatch[3]}`;
+                    changeDetails.push({ stack: result.stack, resource: currentResource, properties: [] });
+                  }
+                  // Match property changes: └── or ├── with property name
+                  const propMatch = line.match(/^\s*[└├]──\s*(.+)/);
+                  if (propMatch && changeDetails.length > 0) {
+                    changeDetails[changeDetails.length - 1].properties.push(propMatch[1]);
+                  }
+                }
+              }
+            }
+            
+            const totalChanges = totalAdds + totalUpdates + totalDestroys;
+            
+            // =================================================================
+            // 5.3 Build Slack message blocks
+            // =================================================================
+            let diffText = '';
+            if (totalChanges === 0) {
+              diffText = '✅ No infrastructure changes detected';
+            } else {
+              diffText = `📊 *${totalChanges} changes:* 🟢 ${totalAdds} add | 🟡 ${totalUpdates} update | 🔴 ${totalDestroys} destroy\n\n`;
+              
+              // Group by stack
+              const stackGroups = {};
+              for (const detail of changeDetails) {
+                if (!stackGroups[detail.stack]) stackGroups[detail.stack] = [];
+                stackGroups[detail.stack].push(detail);
+              }
+              
+              for (const [stack, details] of Object.entries(stackGroups)) {
+                diffText += `📦 *Stack ${stack}*\n`;
+                for (const d of details.slice(0, 10)) { // Limit to 10 per stack
+                  diffText += `${d.resource}\n`;
+                  for (const prop of d.properties.slice(0, 3)) { // Limit properties
+                    diffText += `   └── ${prop}\n`;
+                  }
+                }
+                if (details.length > 10) {
+                  diffText += `   ... and ${details.length - 10} more resources\n`;
+                }
+              }
+            }
+            
+            // Format stacks list
+            const stacksList = stacks.split(' ').filter(s => s).map(s => `• ${s}`).join('\n');
+            
+            // Build payload
+            const payload = {
+              blocks: [
+                {
+                  type: 'header',
+                  text: {
+                    type: 'plain_text',
+                    text: '🔍 CDK Diff Preview (PR)',
+                    emoji: true
+                  }
+                },
+                {
+                  type: 'section',
+                  fields: [
+                    {
+                      type: 'mrkdwn',
+                      text: `*Repository:*\n\`${repo}\``
+                    },
+                    {
+                      type: 'mrkdwn',
+                      text: `*Author:*\n${actor}`
+                    }
+                  ]
+                },
+                {
+                  type: 'section',
+                  text: {
+                    type: 'mrkdwn',
+                    text: `*PR:* <${prUrl}|#${prNumber} ${prTitle}>`
+                  }
+                },
+                {
+                  type: 'section',
+                  text: {
+                    type: 'mrkdwn',
+                    text: `*Stacks:*\n${stacksList}`
+                  }
+                },
+                {
+                  type: 'divider'
+                },
+                {
+                  type: 'section',
+                  text: {
+                    type: 'mrkdwn',
+                    text: diffText.substring(0, 2900) // Slack limit
+                  }
+                },
+                {
+                  type: 'context',
+                  elements: [
+                    {
+                      type: 'mrkdwn',
+                      text: `<${context.payload.repository.html_url}/actions/runs/${context.runId}|View workflow run>`
+                    }
+                  ]
+                }
+              ]
+            };
+            
+            // =================================================================
+            // 5.4 Send to Slack
+            // =================================================================
+            const https = require('https');
+            const url = new URL(process.env.SLACK_WEBHOOK_URL);
+            
+            const options = {
+              hostname: url.hostname,
+              path: url.pathname,
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json'
+              }
+            };
+            
+            await new Promise((resolve, reject) => {
+              const req = https.request(options, (res) => {
+                let data = '';
+                res.on('data', (chunk) => data += chunk);
+                res.on('end', () => {
+                  console.log(`Slack response: ${res.statusCode} - ${data}`);
+                  if (res.statusCode === 200) {
+                    resolve();
+                  } else {
+                    reject(new Error(`Slack API returned ${res.statusCode}: ${data}`));
+                  }
+                });
+              });
+              req.on('error', reject);
+              req.write(JSON.stringify(payload));
+              req.end();
+            });
+            
+            console.log('Slack notification sent successfully');
