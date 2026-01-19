@@ -337,6 +337,16 @@ jobs:
             echo "  Image:      $IMAGE_URI"
             echo ""
             
+            # Create ECR repository if it doesn't exist
+            if ! aws ecr describe-repositories --repository-names "$IMAGE_NAME" --region "$AWS_REGION" 2>/dev/null; then
+              echo "Creating ECR repository: $IMAGE_NAME"
+              aws ecr create-repository \
+                --repository-name "$IMAGE_NAME" \
+                --region "$AWS_REGION" \
+                --image-scanning-configuration scanOnPush=true \
+                --encryption-configuration encryptionType=AES256
+            fi
+            
             # Build and push
             docker build -f "$DOCKERFILE" -t "$IMAGE_URI" .
             docker push "$IMAGE_URI"
