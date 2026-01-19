@@ -554,14 +554,39 @@ jobs:
               let removedLines = [];        // Lines removed (accumulated)
               let addedLines = [];          // Lines added (accumulated)
               
+              // Helper to format multi-line values intelligently
+              function formatValue(lines) {
+                if (lines.length === 0) return null;
+                if (lines.length === 1) return lines[0];
+                
+                // For complex multi-line values (like Tags JSON), try to reconstruct
+                // by joining without separator if it looks like JSON fragments
+                const joined = lines.join(' ');
+                const looksLikeJson = joined.includes('{') || joined.includes('[');
+                
+                if (looksLikeJson) {
+                  // Clean up and format JSON-like content
+                  try {
+                    // Try to parse as JSON to validate and pretty-print
+                    const cleaned = joined.replace(/,\s*,/g, ',').replace(/\s+/g, ' ');
+                    return cleaned.length > 100 ? `${lines.length} values` : cleaned;
+                  } catch {
+                    return `${lines.length} values`;
+                  }
+                }
+                
+                // For other multi-line content, join with comma
+                return lines.length <= 3 ? lines.join(', ') : `${lines.length} values`;
+              }
+              
               // Helper to save current property to current resource
               function saveCurrentProperty() {
                 if (!currentResource || !currentProperty) return;
                 if (removedLines.length > 0 || addedLines.length > 0) {
                   currentResource.properties.push({
                     name: currentProperty,
-                    oldValue: removedLines.length > 0 ? removedLines.join(', ') : null,
-                    newValue: addedLines.length > 0 ? addedLines.join(', ') : null,
+                    oldValue: formatValue(removedLines),
+                    newValue: formatValue(addedLines),
                     isUnifiedDiff: inUnifiedDiff
                   });
                 }
