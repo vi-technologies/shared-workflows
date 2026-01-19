@@ -1,0 +1,301 @@
+# =============================================================================
+# CDK DEPLOY WORKFLOW
+# =============================================================================
+# This reusable workflow performs CDK deploy operations and sends nicely
+# formatted Slack notifications with change summaries.
+#
+# FEATURES:
+#   - Runs `cdk deploy` on specified stacks
+#   - Parses diff output to show clean change summaries
+#   - Sends formatted Slack notifications (success/failure)
+#   - Supports dry-run mode for testing
+# =============================================================================
+
+name: CDK Deploy
+
+on:
+  workflow_call:
+    inputs:
+      # -----------------------------------------------------------------------
+      # Build Environment Configuration
+      # -----------------------------------------------------------------------
+      working-directory:
+        description: 'Working directory for CDK commands'
+        required: false
+        type: string
+        default: '.'
+
+      python-version:
+        description: 'Python version (for Python CDK apps)'
+        required: false
+        type: string
+        default: ''
+
+      node-version:
+        description: 'Node.js version'
+        required: false
+        type: string
+        default: '20'
+
+      install-command:
+        description: 'Command to install dependencies'
+        required: false
+        type: string
+        default: 'npm ci'
+
+      # -----------------------------------------------------------------------
+      # AWS Configuration
+      # -----------------------------------------------------------------------
+      aws-region:
+        description: 'AWS region'
+        required: false
+        type: string
+        default: 'us-east-1'
+
+      aws-role-arn:
+        description: 'AWS IAM role ARN to assume'
+        required: true
+        type: string
+
+      # -----------------------------------------------------------------------
+      # CDK Deploy Configuration
+      # -----------------------------------------------------------------------
+      stacks:
+        description: 'Space-separated list of stack names to deploy'
+        required: true
+        type: string
+
+      require-approval:
+        description: 'CDK approval level (never, any-change, broadening)'
+        required: false
+        type: string
+        default: 'never'
+
+      dry-run:
+        description: 'If true, only run diff without deploying'
+        required: false
+        type: boolean
+        default: false
+
+      # -----------------------------------------------------------------------
+      # Slack Configuration
+      # -----------------------------------------------------------------------
+      slack-channel-name:
+        description: 'Slack channel name (for display purposes)'
+        required: false
+        type: string
+        default: 'devops'
+
+    secrets:
+      slack-webhook-url:
+        description: 'Slack webhook URL for notifications'
+        required: false
+
+jobs:
+  deploy:
+    name: CDK Deploy
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+
+    steps:
+      # =======================================================================
+      # SETUP
+      # =======================================================================
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        if: inputs.python-version != ''
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python-version }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+
+      - name: Install dependencies
+        run: ${{ inputs.install-command }}
+
+      - name: Install AWS CDK CLI
+        run: npm install -g aws-cdk
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ inputs.aws-role-arn }}
+          role-duration-seconds: 3600
+          aws-region: ${{ inputs.aws-region }}
+
+      # =======================================================================
+      # CDK DIFF
+      # =======================================================================
+      - name: Run CDK diff
+        id: diff
+        env:
+          STACKS: ${{ inputs.stacks }}
+        run: |
+          echo "Running CDK diff for: $STACKS"
+          
+          # Capture diff output
+          DIFF_OUTPUT=$(npx cdk diff $STACKS --no-color 2>&1 || true)
+          
+          # Save raw output for debugging
+          echo "$DIFF_OUTPUT" > diff_raw.txt
+          
+          # Parse diff to extract meaningful changes (filter out warnings and noise)
+          ADDS=$(echo "$DIFF_OUTPUT" | grep -cE '^\s*\[\+\]\s*AWS::' || echo "0")
+          UPDATES=$(echo "$DIFF_OUTPUT" | grep -cE '^\s*\[~\]\s*AWS::' || echo "0")
+          DESTROYS=$(echo "$DIFF_OUTPUT" | grep -cE '^\s*\[-\]\s*AWS::' || echo "0")
+          
+          # Extract resource changes (clean format)
+          CHANGES=$(echo "$DIFF_OUTPUT" | grep -E '^\s*\[[+~-]\]\s*AWS::' | head -15 | \
+            sed 's/\s*\[+\]/🟢/g; s/\s*\[~\]/🟡/g; s/\s*\[-\]/🔴/g' | \
+            sed 's/AWS::/  /g' || echo "")
+          
+          # Build summary
+          TOTAL=$((ADDS + UPDATES + DESTROYS))
+          if [ "$TOTAL" -eq 0 ]; then
+            SUMMARY="✅ No infrastructure changes"
+          else
+            SUMMARY="📊 *${TOTAL} changes:* 🟢 ${ADDS} add | 🟡 ${UPDATES} update | 🔴 ${DESTROYS} destroy"
+          fi
+          
+          # Save formatted output
+          echo "$SUMMARY" > diff_summary.txt
+          if [ -n "$CHANGES" ]; then
+            echo "" >> diff_summary.txt
+            echo "$CHANGES" >> diff_summary.txt
+          fi
+          
+          # Output for subsequent steps
+          echo "total_changes=$TOTAL" >> $GITHUB_OUTPUT
+          echo "adds=$ADDS" >> $GITHUB_OUTPUT
+          echo "updates=$UPDATES" >> $GITHUB_OUTPUT
+          echo "destroys=$DESTROYS" >> $GITHUB_OUTPUT
+
+      # =======================================================================
+      # CDK DEPLOY
+      # =======================================================================
+      - name: Deploy stacks
+        id: deploy
+        if: inputs.dry-run != true
+        env:
+          STACKS: ${{ inputs.stacks }}
+        run: |
+          echo "=== Deploying stacks ==="
+          echo "$STACKS"
+          echo ""
+          npx cdk deploy $STACKS --require-approval ${{ inputs.require-approval }}
+
+      - name: Skip deploy (dry run)
+        if: inputs.dry-run == true
+        run: |
+          echo "🔍 DRY RUN MODE - Skipping actual deployment"
+          echo "Would have deployed: ${{ inputs.stacks }}"
+
+      # =======================================================================
+      # SLACK NOTIFICATION
+      # =======================================================================
+      - name: Send Slack notification
+        if: always() && secrets.slack-webhook-url != ''
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.slack-webhook-url }}
+          STACKS: ${{ inputs.stacks }}
+          JOB_STATUS: ${{ job.status }}
+          DRY_RUN: ${{ inputs.dry-run }}
+          REPO: ${{ github.repository }}
+          ACTOR: ${{ github.actor }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          # Read formatted diff summary
+          if [ -f diff_summary.txt ]; then
+            DIFF_CONTENT=$(cat diff_summary.txt | jq -Rs .)
+          else
+            DIFF_CONTENT='"No changes detected"'
+          fi
+          
+          # Format stacks as bullet list
+          STACKS_LIST=$(echo "$STACKS" | tr ' ' '\n' | sed '/^$/d' | sed 's/^/• /')
+          STACKS_ESCAPED=$(echo "$STACKS_LIST" | jq -Rs .)
+          
+          # Set status emoji and header
+          if [ "$JOB_STATUS" == "success" ]; then
+            if [ "$DRY_RUN" == "true" ]; then
+              HEADER="🔍 CDK Diff Complete (Dry Run)"
+            else
+              HEADER="✅ CDK Deploy Succeeded"
+            fi
+          else
+            HEADER="❌ CDK Deploy Failed"
+          fi
+          
+          # Build JSON payload
+          PAYLOAD=$(jq -n \
+            --arg header "$HEADER" \
+            --arg repo "$REPO" \
+            --arg actor "$ACTOR" \
+            --argjson stacks "$STACKS_ESCAPED" \
+            --arg status "$JOB_STATUS" \
+            --argjson diff "$DIFF_CONTENT" \
+            --arg run_url "$RUN_URL" \
+            '{
+              "blocks": [
+                {
+                  "type": "header",
+                  "text": {
+                    "type": "plain_text",
+                    "text": $header,
+                    "emoji": true
+                  }
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    {
+                      "type": "mrkdwn",
+                      "text": ("*Repository:*\n`" + $repo + "`")
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": ("*Triggered by:*\n" + $actor)
+                    }
+                  ]
+                },
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": ("*Stacks:*\n" + $stacks)
+                  }
+                },
+                {
+                  "type": "divider"
+                },
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": $diff
+                  }
+                },
+                {
+                  "type": "context",
+                  "elements": [
+                    {
+                      "type": "mrkdwn",
+                      "text": ("<" + $run_url + "|View workflow run>")
+                    }
+                  ]
+                }
+              ]
+            }')
+          
+          # Send to Slack
+          curl -X POST -H 'Content-type: application/json' --data "$PAYLOAD" "$SLACK_WEBHOOK_URL"
