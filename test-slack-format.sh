@@ -153,9 +153,8 @@ if [ "$ACTION" == "send" ]; then
   fi
   
   echo -e "${BLUE}Sending format $FORMAT to Slack...${NC}"
-  RESPONSE=$(curl -s -w "\n%{http_code}" -X POST -H 'Content-type: application/json' --data "$PAYLOAD" "$SLACK_WEBHOOK_URL")
-  HTTP_CODE=$(echo "$RESPONSE" | tail -1)
-  BODY=$(echo "$RESPONSE" | head -n -1)
+  HTTP_CODE=$(curl -s -o /tmp/slack_response.txt -w "%{http_code}" -X POST -H 'Content-type: application/json' --data "$PAYLOAD" "$SLACK_WEBHOOK_URL")
+  BODY=$(cat /tmp/slack_response.txt)
   
   if [ "$HTTP_CODE" == "200" ]; then
     echo -e "${GREEN}✅ Message sent successfully!${NC}"
