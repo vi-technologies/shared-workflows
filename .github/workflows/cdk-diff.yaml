@@ -719,6 +719,7 @@ jobs:
                   // -------------------------------------------------------------
                   // 4.2.3 Format Each Resource Change
                   // -------------------------------------------------------------
+                  let hasAnyProperties = false;
                   for (const res of resources) {
                     // Determine icon based on action type
                     let icon;
@@ -739,6 +740,7 @@ jobs:
                     // 4.2.4 Property Changes Table
                     // -------------------------------------------------------------
                     if (res.properties.length > 0) {
+                      hasAnyProperties = true;
                       content += '| Property | Current | New |\n|----------|---------|-----|\n';
                       for (const prop of res.properties) {
                         let oldVal, newVal;
@@ -754,6 +756,13 @@ jobs:
                         content += `| \`${prop.name}\` | ${oldVal} | ${newVal} |\n`;
                       }
                     }
+                  }
+                  
+                  // If resources were found but no properties parsed, show raw diff
+                  if (!hasAnyProperties && r.diff) {
+                    content += '\n<details><summary>View raw diff</summary>\n\n```\n';
+                    content += r.diff;
+                    content += '\n```\n</details>\n';
                   }
                 } else if (hasChanges) {
                   // -------------------------------------------------------------
