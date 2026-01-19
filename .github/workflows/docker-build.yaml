@@ -8,6 +8,7 @@
 #   - Each subfolder is a microservice with its own Dockerfile
 #   - Image naming: {environment}_{repo_name}_{folder_name}
 #   - Auto-detects changed folders and only builds what changed
+#   - Tags images with both :latest and :$COMMIT_SHA
 #
 # USAGE:
 #   jobs:
@@ -80,6 +81,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       services: ${{ steps.detect.outputs.services }}
+      services_json: ${{ steps.detect.outputs.services_json }}
       has_changes: ${{ steps.detect.outputs.has_changes }}
       changed_files: ${{ steps.detect.outputs.changed_files }}
     steps:
@@ -154,6 +156,14 @@ jobs:
           # Set outputs
           echo "services=$SERVICES" >> $GITHUB_OUTPUT
           
+          # Create JSON array for matrix
+          if [ -n "$SERVICES" ]; then
+            SERVICES_JSON=$(echo "$SERVICES" | tr ' ' '\n' | jq -R -s -c 'split("\n") | map(select(length > 0))')
+          else
+            SERVICES_JSON="[]"
+          fi
+          echo "services_json=$SERVICES_JSON" >> $GITHUB_OUTPUT
+          
           echo "changed_files<<EOF" >> $GITHUB_OUTPUT
           echo "$CHANGED_FILES" >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
@@ -184,12 +194,14 @@ jobs:
           CHANGED_FILES: ${{ needs.detect.outputs.changed_files }}
           SERVICES_FOLDER: ${{ inputs.services-folder }}
           REPO_NAME: ${{ github.event.repository.name }}
+          COMMIT_SHA: ${{ github.event.pull_request.head.sha }}
         with:
           script: |
             const services = (process.env.SERVICES || '').trim();
             const changedFiles = (process.env.CHANGED_FILES || '').trim();
             const servicesFolder = process.env.SERVICES_FOLDER;
             const repoName = process.env.REPO_NAME;
+            const commitSha = process.env.COMMIT_SHA.substring(0, 7);
             
             const lines = [];
             lines.push('## 🐳 Docker Build Preview');
@@ -201,11 +213,11 @@ jobs:
               const serviceList = services.split(/\s+/);
               lines.push(`**${serviceList.length} service(s) will be built on merge:**`);
               lines.push('');
-              lines.push('| Service | Image Name (staging) |');
-              lines.push('|---------|---------------------|');
+              lines.push('| Service | Image Tags |');
+              lines.push('|---------|------------|');
               for (const svc of serviceList) {
                 const imageName = `staging_${repoName.replace(/-/g, '_')}_${svc}`;
-                lines.push(`| \`${svc}\` | \`${imageName}:latest\` |`);
+                lines.push(`| \`${svc}\` | \`:latest\`, \`:${commitSha}\` |`);
               }
               lines.push('');
             }
@@ -233,7 +245,7 @@ jobs:
           message: ${{ steps.comment.outputs.body }}
 
   # ===========================================================================
-  # JOB 3: BUILD AND PUSH IMAGES
+  # JOB 3: BUILD AND PUSH IMAGES (using docker/build-push-action)
   # ===========================================================================
   build:
     name: Build & Push
@@ -244,7 +256,11 @@ jobs:
       id-token: write
       contents: read
     outputs:
-      services_built: ${{ steps.build.outputs.services_built }}
+      services_built: ${{ steps.summary.outputs.services_built }}
+    strategy:
+      fail-fast: false
+      matrix:
+        service: ${{ fromJson(needs.detect.outputs.services_json) }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -278,6 +294,35 @@ jobs:
           
           echo "Environment: $TARGET_ENV"
 
+      - name: Generate image name
+        id: image
+        env:
+          SERVICE: ${{ matrix.service }}
+          TARGET_ENV: ${{ steps.env.outputs.TARGET_ENV }}
+          AWS_ACCOUNT_ID: ${{ steps.env.outputs.AWS_ACCOUNT_ID }}
+          AWS_REGION: ${{ inputs.aws-region }}
+          IMAGE_PATTERN: ${{ inputs.image-name-pattern }}
+          REPO_NAME: ${{ github.event.repository.name }}
+        run: |
+          # Sanitize repo name (replace dashes with underscores)
+          REPO_NAME_SAFE=$(echo "$REPO_NAME" | tr '-' '_')
+          
+          # Generate image name from pattern
+          IMAGE_NAME=$(echo "$IMAGE_PATTERN" | sed \
+            -e "s/{env}/$TARGET_ENV/g" \
+            -e "s/{repo}/$REPO_NAME_SAFE/g" \
+            -e "s/{service}/$SERVICE/g")
+          
+          ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+          FULL_IMAGE="${ECR_REGISTRY}/${IMAGE_NAME}"
+          
+          echo "IMAGE_NAME=$IMAGE_NAME" >> $GITHUB_OUTPUT
+          echo "ECR_REGISTRY=$ECR_REGISTRY" >> $GITHUB_OUTPUT
+          echo "FULL_IMAGE=$FULL_IMAGE" >> $GITHUB_OUTPUT
+          
+          echo "Image name: $IMAGE_NAME"
+          echo "Full image: $FULL_IMAGE"
+
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -285,83 +330,52 @@ jobs:
           aws-region: ${{ inputs.aws-region }}
           audience: sts.amazonaws.com
 
-      - name: Login to Amazon ECR
-        run: |
-          aws ecr get-login-password --region "${{ inputs.aws-region }}" \
-            | docker login --username AWS --password-stdin "${{ steps.env.outputs.AWS_ACCOUNT_ID }}.dkr.ecr.${{ inputs.aws-region }}.amazonaws.com"
-
-      - name: Build and push images
-        id: build
+      - name: Create ECR repository if not exists
         env:
-          SERVICES: ${{ needs.detect.outputs.services }}
-          SERVICES_FOLDER: ${{ inputs.services-folder }}
-          TARGET_ENV: ${{ steps.env.outputs.TARGET_ENV }}
-          AWS_ACCOUNT_ID: ${{ steps.env.outputs.AWS_ACCOUNT_ID }}
+          IMAGE_NAME: ${{ steps.image.outputs.IMAGE_NAME }}
           AWS_REGION: ${{ inputs.aws-region }}
-          IMAGE_PATTERN: ${{ inputs.image-name-pattern }}
-          REPO_NAME: ${{ github.event.repository.name }}
         run: |
-          set -euo pipefail
-          
-          # Sanitize repo name (replace dashes with underscores)
-          REPO_NAME_SAFE=$(echo "$REPO_NAME" | tr '-' '_')
-          
-          echo "============================================================"
-          echo "Docker Build Configuration"
-          echo "============================================================"
-          echo "Environment:     $TARGET_ENV"
-          echo "AWS Account:     $AWS_ACCOUNT_ID"
-          echo "AWS Region:      $AWS_REGION"
-          echo "Services folder: $SERVICES_FOLDER"
-          echo "Services:        $SERVICES"
-          echo "Image pattern:   $IMAGE_PATTERN"
-          echo "============================================================"
-          echo ""
-          
-          BUILT_SERVICES=""
-          
-          for service in $SERVICES; do
-            # Generate image name from pattern
-            IMAGE_NAME=$(echo "$IMAGE_PATTERN" | sed \
-              -e "s/{env}/$TARGET_ENV/g" \
-              -e "s/{repo}/$REPO_NAME_SAFE/g" \
-              -e "s/{service}/$service/g")
-            
-            IMAGE_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${IMAGE_NAME}:latest"
-            DOCKERFILE="${SERVICES_FOLDER}/${service}/Dockerfile"
-            
-            echo ""
-            echo "============================================================"
-            echo "Building: $service"
-            echo "============================================================"
-            echo "  Dockerfile: $DOCKERFILE"
-            echo "  Image:      $IMAGE_URI"
-            echo ""
-            
-            # Create ECR repository if it doesn't exist
-            if ! aws ecr describe-repositories --repository-names "$IMAGE_NAME" --region "$AWS_REGION" 2>/dev/null; then
-              echo "Creating ECR repository: $IMAGE_NAME"
-              aws ecr create-repository \
-                --repository-name "$IMAGE_NAME" \
-                --region "$AWS_REGION" \
-                --image-scanning-configuration scanOnPush=true \
-                --encryption-configuration encryptionType=AES256
-            fi
-            
-            # Build and push
-            docker build -f "$DOCKERFILE" -t "$IMAGE_URI" .
-            docker push "$IMAGE_URI"
-            
-            echo "✅ Successfully pushed: $IMAGE_URI"
-            BUILT_SERVICES="$BUILT_SERVICES $service"
-          done
-          
-          BUILT_SERVICES=$(echo "$BUILT_SERVICES" | xargs)
-          echo "services_built=$BUILT_SERVICES" >> $GITHUB_OUTPUT
-          
-          echo ""
-          echo "============================================================"
-          echo "Build Summary"
-          echo "============================================================"
-          echo "Services built: $BUILT_SERVICES"
-          echo "============================================================"
+          if ! aws ecr describe-repositories --repository-names "$IMAGE_NAME" --region "$AWS_REGION" 2>/dev/null; then
+            echo "Creating ECR repository: $IMAGE_NAME"
+            aws ecr create-repository \
+              --repository-name "$IMAGE_NAME" \
+              --region "$AWS_REGION" \
+              --image-scanning-configuration scanOnPush=true \
+              --encryption-configuration encryptionType=AES256
+          else
+            echo "ECR repository already exists: $IMAGE_NAME"
+          fi
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Extract metadata for Docker
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.image.outputs.FULL_IMAGE }}
+          tags: |
+            type=raw,value=latest
+            type=sha,prefix=,format=short
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ inputs.services-folder }}/${{ matrix.service }}/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
+
+      - name: Output built service
+        id: summary
+        run: |
+          echo "✅ Successfully pushed: ${{ steps.image.outputs.FULL_IMAGE }}"
+          echo "   Tags: ${{ steps.meta.outputs.tags }}"
+          echo "services_built=${{ matrix.service }}" >> $GITHUB_OUTPUT
