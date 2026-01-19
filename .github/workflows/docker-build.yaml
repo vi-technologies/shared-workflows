@@ -10,6 +10,8 @@
 #   - Auto-detects changed folders and only builds what changed
 #   - Tags images with both :latest and :$COMMIT_SHA
 #
+# TEST: This comment added to verify Slack notification format for Docker changes
+#
 # USAGE:
 #   jobs:
 #     build:
