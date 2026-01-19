@@ -158,10 +158,31 @@ jobs:
           DESTROYS=$(echo "$DIFF_OUTPUT" | grep -cE '^\s*\[-\]\s*AWS::' || true)
           DESTROYS=${DESTROYS:-0}
           
-          # Extract resource changes (clean format)
-          CHANGES=$(echo "$DIFF_OUTPUT" | grep -E '^\s*\[[+~-]\]\s*AWS::' | head -15 | \
-            sed 's/\s*\[+\]/🟢/g; s/\s*\[~\]/🟡/g; s/\s*\[-\]/🔴/g' | \
-            sed 's/AWS::/  /g' || echo "")
+          # Extract resource changes WITH property details
+          # This captures both the resource line and the property changes below it
+          CHANGES=$(echo "$DIFF_OUTPUT" | awk '
+            /^\s*\[[+~-]\]\s*AWS::/ {
+              # Resource line - print it and set flag to capture property changes
+              gsub(/\s*\[\+\]/, "🟢"); gsub(/\s*\[~\]/, "🟡"); gsub(/\s*\[-\]/, "🔴");
+              gsub(/AWS::/, "");
+              print; 
+              in_resource=1; 
+              next
+            }
+            in_resource && /^\s*[└├│]/ {
+              # Property change lines (indented with tree characters)
+              gsub(/\[\+\]/, "→"); gsub(/\[-\]/, "←"); gsub(/\[~\]/, "↔");
+              print "  " $0
+            }
+            in_resource && /^[^ ]/ && !/^\s*[└├│]/ {
+              # Non-indented line that is not a tree char - end of this resource
+              in_resource=0
+            }
+            /^Stack / {
+              # Stack header
+              print ""; print "📦 " $0
+            }
+          ' | head -60 || echo "")
           
           # Build summary
           TOTAL=$((ADDS + UPDATES + DESTROYS))
