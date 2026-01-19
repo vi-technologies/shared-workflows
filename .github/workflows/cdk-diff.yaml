@@ -620,18 +620,30 @@ jobs:
                 // ---------------------------------------------------------
                 // 4.1.2 Match Property Lines
                 // ---------------------------------------------------------
-                // Format: └── [~] PropertyName or ├── [~] PropertyName
+                // CDK diff formats for property changes:
+                //   └── [~] PropertyName    (modification)
+                //   └── [+] PropertyName    (addition - new property)
+                //   └── [-] PropertyName    (removal)
+                //
+                // Property names are alphanumeric identifiers (e.g., Tags, 
+                // BucketName, etc). They don't start with {, [, or ".
+                // This distinguishes them from value lines.
                 // ---------------------------------------------------------
-                const propMatch = line.match(/[└├]\s*─\s*\[~\]\s+(\S+)/);
+                const propMatch = line.match(/[└├]\s*─\s*\[([+~-])\]\s+([A-Za-z][A-Za-z0-9_]*)/);
                 if (propMatch) {
                   // Save previous property if exists
                   saveCurrentProperty();
                   
                   // Start tracking new property
-                  currentProperty = propMatch[1];
+                  const propAction = propMatch[1];
+                  currentProperty = propMatch[2];
                   inUnifiedDiff = false;
                   removedLines = [];
                   addedLines = [];
+                  
+                  // For added properties [+], we expect only added values
+                  // For removed properties [-], we expect only removed values
+                  // For modified properties [~], we expect both
                   continue;
                 }
                 
@@ -650,9 +662,13 @@ jobs:
                 // ---------------------------------------------------------
                 // 4.1.4 Handle Property Value Changes
                 // ---------------------------------------------------------
-                // Accumulate all [-] and [+] lines for the current property.
-                // This handles both simple changes and multi-value properties
-                // like Tags which have multiple [+] lines.
+                // CDK diff value formats:
+                //   └── [-] old_value       (explicit removal marker)
+                //   └── [+] new_value       (explicit addition marker)
+                //   └── [value]             (implicit value, typically for adds)
+                //
+                // The implicit format is used when the value itself contains
+                // the JSON, like: └── [{"Key":"Name","Value":"test"}]
                 // ---------------------------------------------------------
                 if (currentProperty) {
                   const rmMatch = line.match(/\[-\]\s+(.+)/);
@@ -664,6 +680,16 @@ jobs:
                   const addMatch = line.match(/\[\+\]\s+(.+)/);
                   if (addMatch) {
                     addedLines.push(addMatch[1].trim());
+                    continue;
+                  }
+                  
+                  // Handle implicit value lines (tree characters followed by value)
+                  // Format: └── [{"Key":"Name","Value":"test"}]
+                  // This happens when the value is shown directly without [+]/[-]
+                  const implicitValueMatch = line.match(/^\s*[└├│\s]*─?\s*(\[.+\]|\{.+\}|".+"|\d+|true|false|null)\s*$/);
+                  if (implicitValueMatch) {
+                    // Treat implicit values as additions (new values being set)
+                    addedLines.push(implicitValueMatch[1].trim());
                     continue;
                   }
                   
