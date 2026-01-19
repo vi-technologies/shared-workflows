@@ -1020,12 +1020,9 @@ jobs:
             for (const result of results) {
               const stackName = result.stack;
               if (!stackData[stackName]) {
-                // Extract account from result if available
-                const accountMatch = result.diff?.match(/Account:\s*(\d+)/);
-                const regionMatch = result.diff?.match(/Region:\s*([\w-]+)/);
+                // Use account_name from diff results (set by the diff step)
                 stackData[stackName] = {
-                  account: result.account || (accountMatch ? accountMatch[1] : null),
-                  region: result.region || (regionMatch ? regionMatch[1] : 'us-east-1'),
+                  accountName: result.account_name || null,
                   resources: []
                 };
               }
@@ -1122,12 +1119,13 @@ jobs:
             const attachments = [];
             
             for (const [stackName, data] of Object.entries(stackData)) {
-              // Determine environment from account name or stack name
-              const accountId = data.account;
-              const envName = accountNames[accountId] || 
+              // Use account name from diff results, or infer from stack name
+              const envName = data.accountName || 
                 (stackName.toLowerCase().includes('prod') ? 'production' :
                  stackName.toLowerCase().includes('staging') ? 'staging' :
-                 stackName.toLowerCase().includes('test') ? 'test' : 'unknown');
+                 stackName.toLowerCase().includes('test') ? 'test' :
+                 stackName.toLowerCase().includes('datavault') || stackName.toLowerCase().includes('data-vault') ? 'data-vault' :
+                 stackName.toLowerCase().includes('shared') ? 'shared-services' : 'unknown');
               
               // Color based on changes: green if adds only, yellow if updates, red if deletes
               const hasDeletes = data.resources.some(r => r.icon === '🔴');
@@ -1146,12 +1144,12 @@ jobs:
                 }
               ];
               
-              // Add account/region context if available
-              if (accountId) {
+              // Add environment context if it's different from the badge
+              if (data.accountName && data.accountName !== envName) {
                 stackBlocks.push({
                   type: 'context',
                   elements: [
-                    { type: 'mrkdwn', text: `Account: \`${accountId}\` • Region: \`${data.region || 'us-east-1'}\`` }
+                    { type: 'mrkdwn', text: `Environment: \`${data.accountName}\`` }
                   ]
                 });
               }
