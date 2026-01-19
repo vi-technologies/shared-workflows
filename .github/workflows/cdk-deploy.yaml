@@ -150,9 +150,13 @@ jobs:
           echo "$DIFF_OUTPUT" > diff_raw.txt
           
           # Parse diff to extract meaningful changes (filter out warnings and noise)
-          ADDS=$(echo "$DIFF_OUTPUT" | grep -cE '^\s*\[\+\]\s*AWS::' || echo "0")
-          UPDATES=$(echo "$DIFF_OUTPUT" | grep -cE '^\s*\[~\]\s*AWS::' || echo "0")
-          DESTROYS=$(echo "$DIFF_OUTPUT" | grep -cE '^\s*\[-\]\s*AWS::' || echo "0")
+          # Note: grep -c outputs "0" but exits with code 1 when no matches, so we use || true and default to 0
+          ADDS=$(echo "$DIFF_OUTPUT" | grep -cE '^\s*\[\+\]\s*AWS::' || true)
+          ADDS=${ADDS:-0}
+          UPDATES=$(echo "$DIFF_OUTPUT" | grep -cE '^\s*\[~\]\s*AWS::' || true)
+          UPDATES=${UPDATES:-0}
+          DESTROYS=$(echo "$DIFF_OUTPUT" | grep -cE '^\s*\[-\]\s*AWS::' || true)
+          DESTROYS=${DESTROYS:-0}
           
           # Extract resource changes (clean format)
           CHANGES=$(echo "$DIFF_OUTPUT" | grep -E '^\s*\[[+~-]\]\s*AWS::' | head -15 | \
