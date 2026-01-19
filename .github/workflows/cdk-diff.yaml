@@ -550,10 +550,22 @@ jobs:
               // State tracking variables
               let currentResource = null;   // Current resource being parsed
               let currentProperty = null;   // Current property being parsed
-              let oldValue = null;          // Old value for simple property changes
               let inUnifiedDiff = false;    // Whether we're in unified diff mode
-              let removedLines = [];        // Lines removed in unified diff
-              let addedLines = [];          // Lines added in unified diff
+              let removedLines = [];        // Lines removed (accumulated)
+              let addedLines = [];          // Lines added (accumulated)
+              
+              // Helper to save current property to current resource
+              function saveCurrentProperty() {
+                if (!currentResource || !currentProperty) return;
+                if (removedLines.length > 0 || addedLines.length > 0) {
+                  currentResource.properties.push({
+                    name: currentProperty,
+                    oldValue: removedLines.length > 0 ? removedLines.join(', ') : null,
+                    newValue: addedLines.length > 0 ? addedLines.join(', ') : null,
+                    isUnifiedDiff: inUnifiedDiff
+                  });
+                }
+              }
               
               for (const line of lines) {
                 // ---------------------------------------------------------
@@ -563,18 +575,9 @@ jobs:
                 // ---------------------------------------------------------
                 const resourceMatch = line.match(/\[([+~-])\]\s+(AWS::\S+)\s+(.+)/);
                 if (resourceMatch) {
-                  // Save previous resource if exists
+                  // Save previous property and resource if exists
+                  saveCurrentProperty();
                   if (currentResource) {
-                    if (inUnifiedDiff && currentProperty) {
-                      currentResource.properties.push({
-                        name: currentProperty,
-                        oldValue: removedLines.length > 0 ? removedLines.join('\n') : null,
-                        newValue: addedLines.length > 0 ? addedLines.join('\n') : null,
-                        isUnifiedDiff: true
-                      });
-                    } else if (currentProperty && oldValue !== null) {
-                      currentResource.properties.push({ name: currentProperty, oldValue, newValue: null });
-                    }
                     resources.push(currentResource);
                   }
                   
@@ -591,7 +594,6 @@ jobs:
                   
                   // Reset state for new resource
                   currentProperty = null;
-                  oldValue = null;
                   inUnifiedDiff = false;
                   removedLines = [];
                   addedLines = [];
@@ -608,20 +610,10 @@ jobs:
                 const propMatch = line.match(/[└├]\s*─\s*\[~\]\s+(\S+)/);
                 if (propMatch) {
                   // Save previous property if exists
-                  if (inUnifiedDiff && currentProperty) {
-                    currentResource.properties.push({
-                      name: currentProperty,
-                      oldValue: removedLines.length > 0 ? removedLines.join('\n') : null,
-                      newValue: addedLines.length > 0 ? addedLines.join('\n') : null,
-                      isUnifiedDiff: true
-                    });
-                  } else if (currentProperty && oldValue !== null) {
-                    currentResource.properties.push({ name: currentProperty, oldValue, newValue: null });
-                  }
+                  saveCurrentProperty();
                   
                   // Start tracking new property
                   currentProperty = propMatch[1];
-                  oldValue = null;
                   inUnifiedDiff = false;
                   removedLines = [];
                   addedLines = [];
@@ -640,53 +632,36 @@ jobs:
                   continue;
                 }
                 
-                // Collect unified diff content
-                if (inUnifiedDiff && currentProperty) {
-                  const rm = line.match(/\[-\]\s*(.*)/);
-                  if (rm) { removedLines.push(rm[1].trim()); continue; }
-                  const add = line.match(/\[\+\]\s*(.*)/);
-                  if (add) { addedLines.push(add[1].trim()); continue; }
-                  if (line.match(/\[ \]/)) continue;  // Context line
-                }
-                
                 // ---------------------------------------------------------
-                // 4.1.4 Handle Simple Property Changes
+                // 4.1.4 Handle Property Value Changes
                 // ---------------------------------------------------------
-                // Format: [-] old_value followed by [+] new_value
+                // Accumulate all [-] and [+] lines for the current property.
+                // This handles both simple changes and multi-value properties
+                // like Tags which have multiple [+] lines.
                 // ---------------------------------------------------------
-                const oldMatch = line.match(/\[-\]\s+(.+)/);
-                if (oldMatch && currentProperty && !inUnifiedDiff) {
-                  oldValue = oldMatch[1].trim();
-                  continue;
-                }
-                
-                const newMatch = line.match(/\[\+\]\s+(.+)/);
-                if (newMatch && currentProperty && !inUnifiedDiff) {
-                  currentResource.properties.push({
-                    name: currentProperty,
-                    oldValue,
-                    newValue: newMatch[1].trim()
-                  });
-                  currentProperty = null;
-                  oldValue = null;
-                  continue;
+                if (currentProperty) {
+                  const rmMatch = line.match(/\[-\]\s+(.+)/);
+                  if (rmMatch) {
+                    removedLines.push(rmMatch[1].trim());
+                    continue;
+                  }
+                  
+                  const addMatch = line.match(/\[\+\]\s+(.+)/);
+                  if (addMatch) {
+                    addedLines.push(addMatch[1].trim());
+                    continue;
+                  }
+                  
+                  // Context line in unified diff
+                  if (inUnifiedDiff && line.match(/\[ \]/)) continue;
                 }
               }
               
               // ---------------------------------------------------------
               // 4.1.5 Save Last Resource
               // ---------------------------------------------------------
+              saveCurrentProperty();
               if (currentResource) {
-                if (inUnifiedDiff && currentProperty) {
-                  currentResource.properties.push({
-                    name: currentProperty,
-                    oldValue: removedLines.length > 0 ? removedLines.join('\n') : null,
-                    newValue: addedLines.length > 0 ? addedLines.join('\n') : null,
-                    isUnifiedDiff: true
-                  });
-                } else if (currentProperty && oldValue !== null) {
-                  currentResource.properties.push({ name: currentProperty, oldValue, newValue: null });
-                }
                 resources.push(currentResource);
               }
               
