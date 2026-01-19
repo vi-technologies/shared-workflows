@@ -554,13 +554,19 @@ jobs:
               let removedLines = [];        // Lines removed (accumulated)
               let addedLines = [];          // Lines added (accumulated)
               
-              // Helper to format multi-line values intelligently
+              // Helper to format multi-line values - filter out JSON structure noise
               function formatValue(lines) {
                 if (lines.length === 0) return null;
                 if (lines.length === 1) return lines[0];
                 
-                // Join lines with space and normalize whitespace
-                return lines.join(' ').replace(/\s+/g, ' ').trim();
+                // Filter out pure JSON structure characters (braces, brackets, commas only)
+                const meaningful = lines.filter(l => {
+                  const cleaned = l.replace(/[{}\[\],]/g, '').trim();
+                  return cleaned.length > 0;
+                });
+                
+                const toJoin = meaningful.length > 0 ? meaningful : lines;
+                return toJoin.join(' ').replace(/\s+/g, ' ').trim();
               }
               
               // Helper to save current property to current resource
