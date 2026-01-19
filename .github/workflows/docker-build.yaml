@@ -111,11 +111,11 @@ jobs:
           
           echo "Using diff range: $DIFF_RANGE"
           
-          # Find all service folders (directories with Dockerfiles)
+          # Find all service folders (directories with non-empty Dockerfiles)
           ALL_SERVICES=""
           if [ -d "$SERVICES_FOLDER" ]; then
             for dir in "$SERVICES_FOLDER"/*/; do
-              if [ -f "${dir}Dockerfile" ]; then
+              if [ -f "${dir}Dockerfile" ] && [ -s "${dir}Dockerfile" ]; then
                 SERVICE_NAME=$(basename "$dir")
                 ALL_SERVICES="$ALL_SERVICES $SERVICE_NAME"
               fi
@@ -141,7 +141,8 @@ jobs:
             for file in $CHANGED_FILES; do
               # Extract the service folder name (second component after services folder)
               SERVICE_NAME=$(echo "$file" | sed -n "s|^${SERVICES_FOLDER}/\([^/]*\)/.*|\1|p")
-              if [ -n "$SERVICE_NAME" ] && [ -f "${SERVICES_FOLDER}/${SERVICE_NAME}/Dockerfile" ]; then
+              # Only include if Dockerfile exists and is non-empty
+              if [ -n "$SERVICE_NAME" ] && [ -f "${SERVICES_FOLDER}/${SERVICE_NAME}/Dockerfile" ] && [ -s "${SERVICES_FOLDER}/${SERVICE_NAME}/Dockerfile" ]; then
                 SERVICES="$SERVICES $SERVICE_NAME"
               fi
             done
