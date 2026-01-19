@@ -959,7 +959,6 @@ jobs:
       # This allows teams to get deployment-like visibility for important PRs.
       # =======================================================================
       - name: Check for Slack notify label and send notification
-        if: ${{ secrets.slack-webhook-url != '' }}
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.slack-webhook-url }}
           SLACK_LABEL: ${{ inputs.slack-notify-label }}
@@ -971,8 +970,13 @@ jobs:
         with:
           script: |
             // =================================================================
-            // 5.1 Check if PR has the Slack notify label
+            // 5.1 Check prerequisites
             // =================================================================
+            if (!process.env.SLACK_WEBHOOK_URL) {
+              console.log('No Slack webhook URL configured, skipping notification');
+              return;
+            }
+            
             const envPrNumber = parseInt(process.env.PR_NUMBER, 10);
             const prNumber = envPrNumber > 0 ? envPrNumber : (context.payload.pull_request?.number || context.issue?.number);
             
