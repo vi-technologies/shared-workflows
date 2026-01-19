@@ -204,7 +204,7 @@ jobs:
       # SLACK NOTIFICATION
       # =======================================================================
       - name: Send Slack notification
-        if: always() && secrets.slack-webhook-url != ''
+        if: always()
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.slack-webhook-url }}
           STACKS: ${{ inputs.stacks }}
@@ -214,6 +214,12 @@ jobs:
           ACTOR: ${{ github.actor }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
+          # Skip if no webhook URL provided
+          if [ -z "$SLACK_WEBHOOK_URL" ]; then
+            echo "No Slack webhook URL provided, skipping notification"
+            exit 0
+          fi
+          
           # Read formatted diff summary
           if [ -f diff_summary.txt ]; then
             DIFF_CONTENT=$(cat diff_summary.txt | jq -Rs .)
