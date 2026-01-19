@@ -1,0 +1,356 @@
+# =============================================================================
+# SHARED DOCKER BUILD & PUSH WORKFLOW
+# =============================================================================
+# This reusable workflow builds and pushes Docker images for microservices.
+#
+# CONVENTION:
+#   - A top-level folder (default: "jobs") contains subfolders
+#   - Each subfolder is a microservice with its own Dockerfile
+#   - Image naming: {environment}_{repo_name}_{folder_name}
+#   - Auto-detects changed folders and only builds what changed
+#
+# USAGE:
+#   jobs:
+#     build:
+#       uses: vi-technologies/shared-workflows/.github/workflows/docker-build.yaml@main
+#       with:
+#         services-folder: jobs
+#         aws-region: us-east-1
+#       secrets:
+#         aws-account-id-staging: ${{ secrets.AWS_ACCOUNTID_STAGING }}
+#         aws-account-id-prod: ${{ secrets.AWS_ACCOUNTID_PROD }}
+# =============================================================================
+
+name: Docker Build & Push
+
+on:
+  workflow_call:
+    inputs:
+      services-folder:
+        description: 'Top-level folder containing microservice subfolders (each with a Dockerfile)'
+        required: false
+        type: string
+        default: 'jobs'
+      aws-region:
+        description: 'AWS region for ECR'
+        required: false
+        type: string
+        default: 'us-east-1'
+      environment:
+        description: 'Target environment (staging/prod). If not set, auto-detects from trigger.'
+        required: false
+        type: string
+        default: ''
+      image-name-pattern:
+        description: 'Pattern for image names. Use {env}, {repo}, {service} placeholders. Default: {env}_{repo}_{service}'
+        required: false
+        type: string
+        default: '{env}_{repo}_{service}'
+      pr-number:
+        description: 'PR number for commenting (required for PR events)'
+        required: false
+        type: string
+        default: ''
+      build-all:
+        description: 'Build all services regardless of changes'
+        required: false
+        type: boolean
+        default: false
+    secrets:
+      aws-account-id-staging:
+        description: 'AWS Account ID for staging environment'
+        required: false
+      aws-account-id-prod:
+        description: 'AWS Account ID for production environment'
+        required: false
+    outputs:
+      services-built:
+        description: 'Space-separated list of services that were built'
+        value: ${{ jobs.build.outputs.services_built }}
+      has-changes:
+        description: 'Whether any services had changes'
+        value: ${{ jobs.detect.outputs.has_changes }}
+
+jobs:
+  # ===========================================================================
+  # JOB 1: DETECT CHANGED SERVICES
+  # ===========================================================================
+  detect:
+    name: Detect Changes
+    runs-on: ubuntu-latest
+    outputs:
+      services: ${{ steps.detect.outputs.services }}
+      has_changes: ${{ steps.detect.outputs.has_changes }}
+      changed_files: ${{ steps.detect.outputs.changed_files }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect changed service folders
+        id: detect
+        env:
+          SERVICES_FOLDER: ${{ inputs.services-folder }}
+          BUILD_ALL: ${{ inputs.build-all }}
+        run: |
+          set -euo pipefail
+          
+          # Determine diff range based on event type
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE_SHA="${{ github.event.pull_request.base.sha }}"
+            HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+            DIFF_RANGE="${BASE_SHA}...${HEAD_SHA}"
+          elif [ "${{ github.event_name }}" = "push" ]; then
+            DIFF_RANGE="${{ github.event.before }}...${{ github.sha }}"
+          else
+            # workflow_dispatch or other - compare to main
+            git fetch origin main --depth=1 || true
+            DIFF_RANGE="origin/main...HEAD"
+          fi
+          
+          echo "Using diff range: $DIFF_RANGE"
+          
+          # Find all service folders (directories with Dockerfiles)
+          ALL_SERVICES=""
+          if [ -d "$SERVICES_FOLDER" ]; then
+            for dir in "$SERVICES_FOLDER"/*/; do
+              if [ -f "${dir}Dockerfile" ]; then
+                SERVICE_NAME=$(basename "$dir")
+                ALL_SERVICES="$ALL_SERVICES $SERVICE_NAME"
+              fi
+            done
+          fi
+          ALL_SERVICES=$(echo "$ALL_SERVICES" | xargs)
+          echo "All available services: $ALL_SERVICES"
+          
+          # If build-all is true, build everything
+          if [ "$BUILD_ALL" = "true" ]; then
+            echo "Build all requested - building all services"
+            SERVICES="$ALL_SERVICES"
+            CHANGED_FILES="(build-all requested)"
+          else
+            # Get changed files in the services folder
+            CHANGED_FILES=$(git diff --name-only "$DIFF_RANGE" -- "${SERVICES_FOLDER}/**" 2>/dev/null || true)
+            
+            echo "Changed files:"
+            echo "$CHANGED_FILES"
+            
+            # Extract unique service names from changed files
+            SERVICES=""
+            for file in $CHANGED_FILES; do
+              # Extract the service folder name (second component after services folder)
+              SERVICE_NAME=$(echo "$file" | sed -n "s|^${SERVICES_FOLDER}/\([^/]*\)/.*|\1|p")
+              if [ -n "$SERVICE_NAME" ] && [ -f "${SERVICES_FOLDER}/${SERVICE_NAME}/Dockerfile" ]; then
+                SERVICES="$SERVICES $SERVICE_NAME"
+              fi
+            done
+            SERVICES=$(echo "$SERVICES" | tr ' ' '\n' | sort -u | tr '\n' ' ' | xargs || true)
+          fi
+          
+          echo "Services to build: $SERVICES"
+          
+          # Set outputs
+          echo "services=$SERVICES" >> $GITHUB_OUTPUT
+          
+          echo "changed_files<<EOF" >> $GITHUB_OUTPUT
+          echo "$CHANGED_FILES" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          
+          if [ -z "$SERVICES" ]; then
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+          else
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+          fi
+
+  # ===========================================================================
+  # JOB 2: POST PR COMMENT (for pull_request events)
+  # ===========================================================================
+  pr-comment:
+    name: PR Comment
+    needs: detect
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Build PR comment
+        id: comment
+        uses: actions/github-script@v7
+        env:
+          SERVICES: ${{ needs.detect.outputs.services }}
+          CHANGED_FILES: ${{ needs.detect.outputs.changed_files }}
+          SERVICES_FOLDER: ${{ inputs.services-folder }}
+          REPO_NAME: ${{ github.event.repository.name }}
+        with:
+          script: |
+            const services = (process.env.SERVICES || '').trim();
+            const changedFiles = (process.env.CHANGED_FILES || '').trim();
+            const servicesFolder = process.env.SERVICES_FOLDER;
+            const repoName = process.env.REPO_NAME;
+            
+            const lines = [];
+            lines.push('## 🐳 Docker Build Preview');
+            lines.push('');
+            
+            if (!services) {
+              lines.push(`✅ No changes detected in \`${servicesFolder}/\` - no images will be built.`);
+            } else {
+              const serviceList = services.split(/\s+/);
+              lines.push(`**${serviceList.length} service(s) will be built on merge:**`);
+              lines.push('');
+              lines.push('| Service | Image Name (staging) |');
+              lines.push('|---------|---------------------|');
+              for (const svc of serviceList) {
+                const imageName = `staging_${repoName.replace(/-/g, '_')}_${svc}`;
+                lines.push(`| \`${svc}\` | \`${imageName}:latest\` |`);
+              }
+              lines.push('');
+            }
+            
+            if (changedFiles && changedFiles !== '(build-all requested)') {
+              lines.push('<details>');
+              lines.push('<summary>Changed files</summary>');
+              lines.push('');
+              lines.push('```');
+              lines.push(changedFiles);
+              lines.push('```');
+              lines.push('</details>');
+            }
+            
+            lines.push('');
+            lines.push('---');
+            lines.push(`<sub>Services folder: \`${servicesFolder}/\`</sub>`);
+            
+            core.setOutput('body', lines.join('\n'));
+
+      - name: Post sticky comment
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: docker-build-preview
+          message: ${{ steps.comment.outputs.body }}
+
+  # ===========================================================================
+  # JOB 3: BUILD AND PUSH IMAGES
+  # ===========================================================================
+  build:
+    name: Build & Push
+    needs: detect
+    if: needs.detect.outputs.has_changes == 'true' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    outputs:
+      services_built: ${{ steps.build.outputs.services_built }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Determine environment and account
+        id: env
+        env:
+          INPUT_ENV: ${{ inputs.environment }}
+          AWS_ACCOUNT_STAGING: ${{ secrets.aws-account-id-staging }}
+          AWS_ACCOUNT_PROD: ${{ secrets.aws-account-id-prod }}
+        run: |
+          # Determine environment
+          if [ -n "$INPUT_ENV" ]; then
+            TARGET_ENV="$INPUT_ENV"
+          elif [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TARGET_ENV="staging"
+          elif [ "${{ github.ref }}" = "refs/heads/main" ]; then
+            TARGET_ENV="prod"
+          else
+            TARGET_ENV="staging"
+          fi
+          
+          echo "TARGET_ENV=$TARGET_ENV" >> $GITHUB_OUTPUT
+          
+          # Select AWS account
+          if [ "$TARGET_ENV" = "prod" ]; then
+            echo "AWS_ACCOUNT_ID=$AWS_ACCOUNT_PROD" >> $GITHUB_OUTPUT
+          else
+            echo "AWS_ACCOUNT_ID=$AWS_ACCOUNT_STAGING" >> $GITHUB_OUTPUT
+          fi
+          
+          echo "Environment: $TARGET_ENV"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ steps.env.outputs.AWS_ACCOUNT_ID }}:role/GithubActionsAppRole
+          aws-region: ${{ inputs.aws-region }}
+          audience: sts.amazonaws.com
+
+      - name: Login to Amazon ECR
+        run: |
+          aws ecr get-login-password --region "${{ inputs.aws-region }}" \
+            | docker login --username AWS --password-stdin "${{ steps.env.outputs.AWS_ACCOUNT_ID }}.dkr.ecr.${{ inputs.aws-region }}.amazonaws.com"
+
+      - name: Build and push images
+        id: build
+        env:
+          SERVICES: ${{ needs.detect.outputs.services }}
+          SERVICES_FOLDER: ${{ inputs.services-folder }}
+          TARGET_ENV: ${{ steps.env.outputs.TARGET_ENV }}
+          AWS_ACCOUNT_ID: ${{ steps.env.outputs.AWS_ACCOUNT_ID }}
+          AWS_REGION: ${{ inputs.aws-region }}
+          IMAGE_PATTERN: ${{ inputs.image-name-pattern }}
+          REPO_NAME: ${{ github.event.repository.name }}
+        run: |
+          set -euo pipefail
+          
+          # Sanitize repo name (replace dashes with underscores)
+          REPO_NAME_SAFE=$(echo "$REPO_NAME" | tr '-' '_')
+          
+          echo "============================================================"
+          echo "Docker Build Configuration"
+          echo "============================================================"
+          echo "Environment:     $TARGET_ENV"
+          echo "AWS Account:     $AWS_ACCOUNT_ID"
+          echo "AWS Region:      $AWS_REGION"
+          echo "Services folder: $SERVICES_FOLDER"
+          echo "Services:        $SERVICES"
+          echo "Image pattern:   $IMAGE_PATTERN"
+          echo "============================================================"
+          echo ""
+          
+          BUILT_SERVICES=""
+          
+          for service in $SERVICES; do
+            # Generate image name from pattern
+            IMAGE_NAME=$(echo "$IMAGE_PATTERN" | sed \
+              -e "s/{env}/$TARGET_ENV/g" \
+              -e "s/{repo}/$REPO_NAME_SAFE/g" \
+              -e "s/{service}/$service/g")
+            
+            IMAGE_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${IMAGE_NAME}:latest"
+            DOCKERFILE="${SERVICES_FOLDER}/${service}/Dockerfile"
+            
+            echo ""
+            echo "============================================================"
+            echo "Building: $service"
+            echo "============================================================"
+            echo "  Dockerfile: $DOCKERFILE"
+            echo "  Image:      $IMAGE_URI"
+            echo ""
+            
+            # Build and push
+            docker build -f "$DOCKERFILE" -t "$IMAGE_URI" .
+            docker push "$IMAGE_URI"
+            
+            echo "✅ Successfully pushed: $IMAGE_URI"
+            BUILT_SERVICES="$BUILT_SERVICES $service"
+          done
+          
+          BUILT_SERVICES=$(echo "$BUILT_SERVICES" | xargs)
+          echo "services_built=$BUILT_SERVICES" >> $GITHUB_OUTPUT
+          
+          echo ""
+          echo "============================================================"
+          echo "Build Summary"
+          echo "============================================================"
+          echo "Services built: $BUILT_SERVICES"
+          echo "============================================================"
