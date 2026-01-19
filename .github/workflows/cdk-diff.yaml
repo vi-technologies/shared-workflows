@@ -559,23 +559,8 @@ jobs:
                 if (lines.length === 0) return null;
                 if (lines.length === 1) return lines[0];
                 
-                // For complex multi-line values (like Tags), show a summary
-                // CDK outputs JSON fragments across multiple lines which don't
-                // reconstruct cleanly, so just show the count
-                const joined = lines.join(' ');
-                const looksLikeJsonFragments = joined.includes('{') || joined.includes('[') || joined.includes('"Key"');
-                
-                if (looksLikeJsonFragments || lines.length > 3) {
-                  // Count actual objects (Tags) by counting opening braces or "Key" occurrences
-                  const objectCount = (joined.match(/"Key"/g) || []).length;
-                  if (objectCount > 0) {
-                    return `${objectCount} tag${objectCount > 1 ? 's' : ''} added`;
-                  }
-                  return `${lines.length} lines changed`;
-                }
-                
-                // For simple multi-line content (2-3 lines), join with comma
-                return lines.join(', ');
+                // Join lines with space and normalize whitespace
+                return lines.join(' ').replace(/\s+/g, ' ').trim();
               }
               
               // Helper to save current property to current resource
