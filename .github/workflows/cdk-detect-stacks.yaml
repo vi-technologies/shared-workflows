@@ -1,0 +1,200 @@
+# =============================================================================
+# CDK DETECT STACKS WORKFLOW
+# =============================================================================
+# This reusable workflow detects which CDK stacks are affected by file changes.
+# It uses a configuration-based approach to map file patterns to stack names.
+#
+# USAGE:
+#   jobs:
+#     detect:
+#       uses: vi-technologies/shared-workflows/.github/workflows/cdk-detect-stacks.yaml@main
+#       with:
+#         stack-mappings: |
+#           {
+#             "iac/dbs/": ["GlueDatabaseStack"],
+#             "iac/s3buckets/": ["BucketsStack"],
+#             "iac/container_registry/": ["ContainerRegistryStack"]
+#           }
+#         all-stacks: "GlueDatabaseStack BucketsStack ContainerRegistryStack"
+#         entry-files: "app.py iac/app.py"
+#         environment: "Production"
+# =============================================================================
+
+name: CDK Detect Stacks
+
+on:
+  workflow_call:
+    inputs:
+      # -----------------------------------------------------------------------
+      # Stack Configuration
+      # -----------------------------------------------------------------------
+      stack-mappings:
+        description: |
+          JSON object mapping file path patterns to stack name prefixes.
+          Example: {"iac/dbs/": ["GlueDatabaseStackBronze", "GlueDatabaseStackSilver"]}
+        required: true
+        type: string
+
+      all-stacks:
+        description: |
+          Space-separated list of all stack name prefixes to deploy when entry files change.
+          The environment suffix will be appended automatically.
+        required: true
+        type: string
+
+      entry-files:
+        description: |
+          Space-separated list of entry point files that affect all stacks.
+          Example: "app.py iac/app.py bin/iac-aws.ts"
+        required: false
+        type: string
+        default: 'app.py'
+
+      environment:
+        description: |
+          Environment suffix to append to stack names (e.g., "Production", "Staging").
+          Set to empty string if stacks don't have environment suffixes.
+        required: false
+        type: string
+        default: ''
+
+      infra-paths:
+        description: |
+          Regex pattern to filter infrastructure files from changed files.
+          Example: "^(lib/|bin/).*\\.ts$" for TypeScript or "^iac/" for Python
+        required: false
+        type: string
+        default: '^iac/'
+
+      working-directory:
+        description: 'Working directory for git operations'
+        required: false
+        type: string
+        default: '.'
+
+    outputs:
+      has_changes:
+        description: 'Whether any stacks are affected by the changes'
+        value: ${{ jobs.detect.outputs.has_changes }}
+      stacks:
+        description: 'Space-separated list of affected stack names'
+        value: ${{ jobs.detect.outputs.stacks }}
+      stacks_json:
+        description: 'JSON array of affected stack names'
+        value: ${{ jobs.detect.outputs.stacks_json }}
+
+jobs:
+  detect:
+    name: Detect Changed Stacks
+    runs-on: ubuntu-latest
+    outputs:
+      has_changes: ${{ steps.detect.outputs.has_changes }}
+      stacks: ${{ steps.detect.outputs.stacks }}
+      stacks_json: ${{ steps.detect.outputs.stacks_json }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2  # Need previous commit to compare
+
+      - name: Detect affected stacks
+        id: detect
+        env:
+          STACK_MAPPINGS: ${{ inputs.stack-mappings }}
+          ALL_STACKS: ${{ inputs.all-stacks }}
+          ENTRY_FILES: ${{ inputs.entry-files }}
+          ENVIRONMENT: ${{ inputs.environment }}
+          INFRA_PATTERN: ${{ inputs.infra-paths }}
+          WORKING_DIR: ${{ inputs.working-directory }}
+        run: |
+          cd "$WORKING_DIR"
+          
+          # Get files changed in this commit (comparing with parent)
+          CHANGED_FILES=$(git diff --name-only HEAD~1 HEAD)
+          
+          echo "=== Changed files in merge ==="
+          echo "$CHANGED_FILES"
+          echo ""
+          
+          # Filter to infrastructure files only
+          INFRA_FILES=$(echo "$CHANGED_FILES" | grep -E "$INFRA_PATTERN" || true)
+          
+          if [ -z "$INFRA_FILES" ]; then
+            echo "No infrastructure files changed"
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+            echo "stacks=" >> $GITHUB_OUTPUT
+            echo "stacks_json=[]" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          echo "=== Infrastructure files changed ==="
+          echo "$INFRA_FILES"
+          echo ""
+          
+          AFFECTED_STACKS=""
+          
+          # Check if any entry files changed (affects all stacks)
+          for entry_file in $ENTRY_FILES; do
+            if echo "$INFRA_FILES" | grep -qE "(^|/)${entry_file}$"; then
+              echo "Entry file '$entry_file' changed - all stacks affected"
+              AFFECTED_STACKS="$ALL_STACKS"
+              break
+            fi
+          done
+          
+          # If no entry file changed, check mappings
+          if [ -z "$AFFECTED_STACKS" ]; then
+            echo "Checking stack mappings..."
+            
+            # Parse the JSON mappings and check each pattern
+            for file in $INFRA_FILES; do
+              echo "  Analyzing: $file"
+              
+              # Use jq to find matching patterns
+              MATCHING_STACKS=$(echo "$STACK_MAPPINGS" | jq -r --arg file "$file" '
+                to_entries[] | 
+                select($file | startswith(.key)) | 
+                .value[] 
+              ' 2>/dev/null || true)
+              
+              if [ -n "$MATCHING_STACKS" ]; then
+                echo "    -> Matches: $MATCHING_STACKS"
+                AFFECTED_STACKS="$AFFECTED_STACKS $MATCHING_STACKS"
+              fi
+            done
+          fi
+          
+          # Append environment suffix if specified
+          if [ -n "$ENVIRONMENT" ] && [ -n "$AFFECTED_STACKS" ]; then
+            STACKS_WITH_ENV=""
+            for stack in $AFFECTED_STACKS; do
+              # Only append if not already suffixed
+              if ! echo "$stack" | grep -qE "(Production|Staging|Dev)$"; then
+                STACKS_WITH_ENV="$STACKS_WITH_ENV ${stack}${ENVIRONMENT}"
+              else
+                STACKS_WITH_ENV="$STACKS_WITH_ENV $stack"
+              fi
+            done
+            AFFECTED_STACKS="$STACKS_WITH_ENV"
+          fi
+          
+          # Remove duplicates and empty entries
+          AFFECTED_STACKS=$(echo "$AFFECTED_STACKS" | tr ' ' '\n' | sort -u | grep -v '^$' | tr '\n' ' ' | xargs)
+          
+          echo ""
+          echo "=== Affected stacks ==="
+          echo "$AFFECTED_STACKS"
+          echo ""
+          
+          if [ -z "$AFFECTED_STACKS" ]; then
+            echo "No stacks affected by the changes"
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+            echo "stacks=" >> $GITHUB_OUTPUT
+            echo "stacks_json=[]" >> $GITHUB_OUTPUT
+          else
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+            echo "stacks=$AFFECTED_STACKS" >> $GITHUB_OUTPUT
+            # Create JSON array
+            STACKS_JSON=$(echo "$AFFECTED_STACKS" | tr ' ' '\n' | jq -R . | jq -s .)
+            echo "stacks_json=$STACKS_JSON" >> $GITHUB_OUTPUT
+          fi
