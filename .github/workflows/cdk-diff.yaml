@@ -385,7 +385,7 @@ jobs:
                   md += '**➕ Create**\n';
                   for (const r of byAction.ADD) {
                     md += `- \`${shortType(r.type)}\` **${cleanId(r.logicalId)}**\n`;
-                    for (const p of r.properties) if (p.newValue) md += `  - \`${p.name}\`:\n\`\`\`\n${p.newValue}\n\`\`\`\n`;
+                    for (const p of r.properties) if (p.newValue) md += `  - \`${p.name}\`:\n\n\`\`\`\n${p.newValue}\n\`\`\`\n\n`;
                   }
                   md += '\n';
                 }
@@ -395,8 +395,8 @@ jobs:
                     md += `- \`${shortType(r.type)}\` **${cleanId(r.logicalId)}**${r.properties.some(p => p.impact === 'WILL_REPLACE') ? ' ⚠️' : ''}\n`;
                     for (const p of r.properties) {
                       md += `  - \`${p.name}\`${p.impact === 'WILL_REPLACE' ? ' ⚠️replace' : ''}\n`;
-                      md += `    **OLD:**\n\`\`\`\n${p.oldValue || '(none)'}\n\`\`\`\n`;
-                      md += `    **NEW:**\n\`\`\`\n${p.newValue || '(removed)'}\n\`\`\`\n`;
+                      md += `    - **OLD:**\n\n\`\`\`\n${p.oldValue || '(none)'}\n\`\`\`\n\n`;
+                      md += `    - **NEW:**\n\n\`\`\`\n${p.newValue || '(removed)'}\n\`\`\`\n\n`;
                     }
                   }
                   md += '\n';
