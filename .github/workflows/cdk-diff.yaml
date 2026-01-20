@@ -142,34 +142,31 @@ jobs:
           # Synth
           npx cdk synth --quiet --output cdk.out
           
-          # Create and run inline TypeScript diff script
-          cat > /tmp/cdk-diff.mts << 'SCRIPT'
+          # Create temp project for toolkit
+          mkdir -p /tmp/cdk-diff-runner
+          cd /tmp/cdk-diff-runner
+          
+          cat > package.json << 'PKG'
+          {"type":"module","dependencies":{"@aws-cdk/toolkit-lib":"*"}}
+          PKG
+          
+          npm install --silent
+          
+          cat > run.js << 'SCRIPT'
           import { Toolkit, StackSelectionStrategy } from '@aws-cdk/toolkit-lib';
           
-          const stacks = process.env.STACKS?.split(' ').filter(Boolean) || [];
+          const stacks = (process.env.STACKS || '').split(' ').filter(Boolean);
           const enableDrift = process.env.ENABLE_DRIFT === 'true';
-          const assemblyDir = process.env.CDK_OUT || 'cdk.out';
-          
-          interface StackResult {
-            stackName: string;
-            hasDiff: boolean;
-            resources: Array<{
-              logicalId: string;
-              type: string;
-              action: 'ADD' | 'UPDATE' | 'REMOVE';
-              properties: Array<{ name: string; impact: string }>;
-            }>;
-            drift?: { status: string; count: number };
-          }
+          const assemblyDir = process.env.CDK_OUT;
           
           async function main() {
-            const output = { success: false, stacks: [] as StackResult[], error: '' };
+            const output = { success: false, stacks: [], error: '' };
             
             try {
               const toolkit = new Toolkit({
                 ioHost: {
                   notify: async () => {},
-                  requestResponse: async (msg: any) => msg.defaultResponse,
+                  requestResponse: async (msg) => msg.defaultResponse,
                 },
               });
               
@@ -180,14 +177,14 @@ jobs:
               
               const diffResults = await toolkit.diff(cx, { stacks: selector });
               
-              for (const [name, diff] of Object.entries(diffResults as Record<string, any>)) {
-                const result: StackResult = { stackName: name, hasDiff: false, resources: [] };
+              for (const [name, diff] of Object.entries(diffResults)) {
+                const result = { stackName: name, hasDiff: false, resources: [] };
                 
-                for (const [logicalId, resDiff] of Object.entries((diff.resources?.diffs || {}) as Record<string, any>)) {
+                for (const [logicalId, resDiff] of Object.entries(diff.resources?.diffs || {})) {
                   const type = resDiff.resourceTypes?.newType || resDiff.resourceTypes?.oldType || 'Unknown';
                   const action = resDiff.isAddition ? 'ADD' : resDiff.isRemoval ? 'REMOVE' : 'UPDATE';
                   
-                  const properties = Object.entries((resDiff.propertyDiffs || {}) as Record<string, any>)
+                  const properties = Object.entries(resDiff.propertyDiffs || {})
                     .filter(([_, p]) => p.isDifferent)
                     .map(([propName, p]) => ({ name: propName, impact: p.changeImpact || 'UNKNOWN' }));
                   
@@ -202,7 +199,7 @@ jobs:
               if (enableDrift) {
                 try {
                   const driftResults = await toolkit.drift(cx, { stacks: selector });
-                  for (const [name, driftInfo] of Object.entries(driftResults as Record<string, any>)) {
+                  for (const [name, driftInfo] of Object.entries(driftResults)) {
                     const stack = output.stacks.find(s => s.stackName === name);
                     if (stack) {
                       stack.drift = {
@@ -211,14 +208,14 @@ jobs:
                       };
                     }
                   }
-                } catch (e: any) {
-                  console.error('Drift detection failed:', e.message);
+                } catch (e) {
+                  // Drift failed, skip
                 }
               }
               
               output.success = true;
-            } catch (e: any) {
-              output.error = e.message;
+            } catch (e) {
+              output.error = e.message || String(e);
             }
             
             console.log(JSON.stringify(output));
@@ -227,12 +224,14 @@ jobs:
           main();
           SCRIPT
           
-          CDK_OUT="$(pwd)/cdk.out" npx ts-node --esm /tmp/cdk-diff.mts > /tmp/diff-output.json 2>/tmp/diff-stderr.txt || true
+          cd ${{ github.workspace }}/${{ inputs.working-directory }}
+          CDK_OUT="$(pwd)/cdk.out" node /tmp/cdk-diff-runner/run.js > /tmp/diff-output.json 2>/tmp/diff-stderr.txt || true
           
           if [ -s /tmp/diff-output.json ]; then
             RESULT=$(cat /tmp/diff-output.json | tail -1)
           else
-            RESULT='{"success":false,"error":"Script produced no output","stacks":[]}'
+            STDERR=$(cat /tmp/diff-stderr.txt 2>/dev/null || echo "unknown error")
+            RESULT='{"success":false,"error":"'"${STDERR//\"/\\\"}"'","stacks":[]}'
           fi
           
           echo "diff_result<<EOF" >> $GITHUB_OUTPUT
@@ -242,6 +241,60 @@ jobs:
       # =====================================================================
       # MULTI-ACCOUNT MODE  
       # =====================================================================
+      - name: Setup toolkit runner (multi-account)
+        if: inputs.aws-role-arns != '' && inputs.stacks-per-account != ''
+        run: |
+          mkdir -p /tmp/cdk-diff-runner
+          cd /tmp/cdk-diff-runner
+          echo '{"type":"module","dependencies":{"@aws-cdk/toolkit-lib":"*"}}' > package.json
+          npm install --silent
+          
+          cat > run.js << 'SCRIPT'
+          import { Toolkit, StackSelectionStrategy } from '@aws-cdk/toolkit-lib';
+          
+          const stacks = (process.env.STACKS || '').split(' ').filter(Boolean);
+          const enableDrift = process.env.ENABLE_DRIFT === 'true';
+          const assemblyDir = process.env.CDK_OUT;
+          
+          async function main() {
+            const output = { success: false, stacks: [], error: '' };
+            try {
+              const toolkit = new Toolkit({
+                ioHost: { notify: async () => {}, requestResponse: async (msg) => msg.defaultResponse },
+              });
+              const cx = await toolkit.fromAssemblyDirectory(assemblyDir);
+              const selector = stacks.length
+                ? { strategy: StackSelectionStrategy.PATTERN_MUST_MATCH, patterns: stacks }
+                : { strategy: StackSelectionStrategy.ALL_STACKS };
+              const diffResults = await toolkit.diff(cx, { stacks: selector });
+              
+              for (const [name, diff] of Object.entries(diffResults)) {
+                const result = { stackName: name, hasDiff: false, resources: [] };
+                for (const [logicalId, resDiff] of Object.entries(diff.resources?.diffs || {})) {
+                  const type = resDiff.resourceTypes?.newType || resDiff.resourceTypes?.oldType || 'Unknown';
+                  const action = resDiff.isAddition ? 'ADD' : resDiff.isRemoval ? 'REMOVE' : 'UPDATE';
+                  const properties = Object.entries(resDiff.propertyDiffs || {})
+                    .filter(([_, p]) => p.isDifferent)
+                    .map(([propName, p]) => ({ name: propName, impact: p.changeImpact || 'UNKNOWN' }));
+                  result.resources.push({ logicalId, type, action, properties });
+                  result.hasDiff = true;
+                }
+                if (enableDrift) {
+                  try {
+                    const driftResults = await toolkit.drift(cx, { stacks: { strategy: StackSelectionStrategy.PATTERN_MUST_MATCH, patterns: [name] } });
+                    const driftInfo = driftResults[name];
+                    result.drift = { status: (driftInfo?.numResourcesWithDrift || 0) > 0 ? 'DRIFTED' : 'IN_SYNC', count: driftInfo?.numResourcesWithDrift || 0 };
+                  } catch (e) {}
+                }
+                output.stacks.push(result);
+              }
+              output.success = true;
+            } catch (e) { output.error = e.message || String(e); }
+            console.log(JSON.stringify(output));
+          }
+          main();
+          SCRIPT
+
       - name: Run CDK Diff (multi-account)
         if: inputs.aws-role-arns != '' && inputs.stacks-per-account != ''
         id: multi-diff
@@ -273,66 +326,7 @@ jobs:
             rm -rf cdk.out
             npx cdk synth --quiet --output cdk.out
             
-            # Create diff script
-            cat > /tmp/cdk-diff.mts << 'SCRIPT'
-          import { Toolkit, StackSelectionStrategy } from '@aws-cdk/toolkit-lib';
-          
-          const stacks = process.env.STACKS?.split(' ').filter(Boolean) || [];
-          const enableDrift = process.env.ENABLE_DRIFT === 'true';
-          const assemblyDir = process.env.CDK_OUT || 'cdk.out';
-          
-          async function main() {
-            const output = { success: false, stacks: [] as any[], error: '' };
-            
-            try {
-              const toolkit = new Toolkit({
-                ioHost: { notify: async () => {}, requestResponse: async (msg: any) => msg.defaultResponse },
-              });
-              
-              const cx = await toolkit.fromAssemblyDirectory(assemblyDir);
-              const selector = stacks.length
-                ? { strategy: StackSelectionStrategy.PATTERN_MUST_MATCH, patterns: stacks }
-                : { strategy: StackSelectionStrategy.ALL_STACKS };
-              
-              const diffResults = await toolkit.diff(cx, { stacks: selector });
-              
-              for (const [name, diff] of Object.entries(diffResults as Record<string, any>)) {
-                const result: any = { stackName: name, hasDiff: false, resources: [] };
-                
-                for (const [logicalId, resDiff] of Object.entries((diff.resources?.diffs || {}) as Record<string, any>)) {
-                  const type = resDiff.resourceTypes?.newType || resDiff.resourceTypes?.oldType || 'Unknown';
-                  const action = resDiff.isAddition ? 'ADD' : resDiff.isRemoval ? 'REMOVE' : 'UPDATE';
-                  const properties = Object.entries((resDiff.propertyDiffs || {}) as Record<string, any>)
-                    .filter(([_, p]) => p.isDifferent)
-                    .map(([propName, p]) => ({ name: propName, impact: p.changeImpact || 'UNKNOWN' }));
-                  
-                  result.resources.push({ logicalId, type, action, properties });
-                  result.hasDiff = true;
-                }
-                
-                if (enableDrift) {
-                  try {
-                    const driftResults = await toolkit.drift(cx, { stacks: { strategy: StackSelectionStrategy.PATTERN_MUST_MATCH, patterns: [name] } });
-                    const driftInfo = (driftResults as any)[name];
-                    result.drift = { status: (driftInfo?.numResourcesWithDrift || 0) > 0 ? 'DRIFTED' : 'IN_SYNC', count: driftInfo?.numResourcesWithDrift || 0 };
-                  } catch (e) {}
-                }
-                
-                output.stacks.push(result);
-              }
-              
-              output.success = true;
-            } catch (e: any) {
-              output.error = e.message;
-            }
-            
-            console.log(JSON.stringify(output));
-          }
-          
-          main();
-          SCRIPT
-            
-            STACKS="$STACKS" CDK_OUT="$(pwd)/cdk.out" npx ts-node --esm /tmp/cdk-diff.mts > /tmp/account-diff.json 2>/tmp/diff-stderr.txt || true
+            STACKS="$STACKS" CDK_OUT="$(pwd)/cdk.out" node /tmp/cdk-diff-runner/run.js > /tmp/account-diff.json 2>/tmp/diff-stderr.txt || true
             
             if [ -s /tmp/account-diff.json ]; then
               ACCOUNT_RESULT=$(cat /tmp/account-diff.json | tail -1)
