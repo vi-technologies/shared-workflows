@@ -497,30 +497,83 @@ jobs:
             
             core.setOutput('comment', md);
             
-            // Generate Slack message (mrkdwn format)
-            let slack = '';
-            if (changed.length === 0) {
-              slack = '✅ No infrastructure changes';
-              } else {
-              const parts = [];
-              if (adds) parts.push(`🟢 ${adds} to add`);
-              if (updates) parts.push(`🟡 ${updates} to update`);
-              if (removes) parts.push(`🔴 ${removes} to destroy`);
-              slack = `*${parts.join(' · ')}*\n\n`;
+            // Generate Slack Block Kit JSON
+            const prUrl = '${{ github.event.pull_request.html_url || format('https://github.com/{0}/pull/{1}', github.repository, inputs.pr-number) }}';
+            const prNum = '${{ inputs.pr-number || github.event.pull_request.number }}';
+            const repo = '${{ github.repository }}';
+            const runUrl = '${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}';
+            
+            const blocks = [
+              { type: 'header', text: { type: 'plain_text', text: '🔍 CDK Diff Preview', emoji: true } },
+              { type: 'context', elements: [{ type: 'mrkdwn', text: `👤 opened <${prUrl}|PR #${prNum}> in \`${repo}\`` }] },
+              { type: 'divider' }
+            ];
+            
+            // Summary section
+            blocks.push({
+              type: 'section',
+              fields: [
+                { type: 'mrkdwn', text: `🟢 *Additions*\n${adds} resources` },
+                { type: 'mrkdwn', text: `🟡 *Updates*\n${updates} resources` },
+                { type: 'mrkdwn', text: `🔴 *Deletions*\n${removes} resources` },
+                { type: 'mrkdwn', text: `📦 *Stacks*\n${changed.length} affected` }
+              ]
+            });
+            
+            // Action buttons
+            blocks.push({
+              type: 'actions',
+              elements: [
+                { type: 'button', text: { type: 'plain_text', text: '📄 View PR', emoji: true }, url: prUrl },
+                { type: 'button', text: { type: 'plain_text', text: '⚙️ View Workflow', emoji: true }, url: runUrl }
+              ]
+            });
+            
+            // Stack details (limit to avoid message too long)
+            const maxStacks = 5;
+            const stacksToShow = changed.slice(0, maxStacks);
+            
+            for (const stack of stacksToShow) {
+              blocks.push({ type: 'divider' });
+              blocks.push({
+                type: 'section',
+                text: { type: 'mrkdwn', text: `📦 *${stack.stackName}*` },
+                accessory: { type: 'button', text: { type: 'plain_text', text: getEnv(stack.stackName) }, style: 'primary', action_id: `stack_${stack.stackName}` }
+              });
               
-              for (const stack of changed) {
-                slack += `*${stack.stackName}* _(${getEnv(stack.stackName)})_\n`;
+              // Resources for this stack (limit)
+              const maxResources = 6;
+              const resourcesToShow = stack.resources.slice(0, maxResources);
+              
+              for (const res of resourcesToShow) {
+                const icon = res.action === 'ADD' ? '🟢' : res.action === 'REMOVE' ? '🔴' : '🟡';
+                const action = res.action === 'ADD' ? 'Add' : res.action === 'REMOVE' ? 'Remove' : 'Update';
+                let text = `${icon} \`${res.type}\` *${cleanId(res.logicalId)}*`;
                 
-                for (const res of stack.resources) {
-                  const icon = res.action === 'ADD' ? '🟢' : res.action === 'REMOVE' ? '🔴' : '🟡';
-                  const props = res.properties.length ? ` → ${res.properties.map(p => p.name).join(', ')}` : '';
-                  slack += `${icon} \`${shortType(res.type)}\` ${cleanId(res.logicalId)}${props}\n`;
+                // Add property changes for updates
+                if (res.action === 'UPDATE' && res.properties.length > 0) {
+                  const propDetails = res.properties.slice(0, 3).map(p => {
+                    if (p.oldValue && p.newValue) return `\`${p.name}\`: ${p.oldValue} → ${p.newValue}`;
+                    if (p.newValue) return `\`${p.name}\`: → ${p.newValue}`;
+                    return `\`${p.name}\``;
+                  }).join('\n');
+                  text += `\n${propDetails}`;
+                  if (res.properties.length > 3) text += `\n_...and ${res.properties.length - 3} more_`;
                 }
-                slack += '\n';
+                
+                blocks.push({ type: 'section', text: { type: 'mrkdwn', text } });
+              }
+              
+              if (stack.resources.length > maxResources) {
+                blocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: `_...and ${stack.resources.length - maxResources} more resources_` }] });
               }
             }
             
-            core.setOutput('slack_message', slack);
+            if (changed.length > maxStacks) {
+              blocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: `_...and ${changed.length - maxStacks} more stacks_` }] });
+            }
+            
+            core.setOutput('slack_blocks', JSON.stringify(blocks));
 
       - name: Post PR Comment
         uses: marocchino/sticky-pull-request-comment@v2
@@ -551,13 +604,6 @@ jobs:
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.slack-webhook-url }}
           SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
-          SLACK_MSG: ${{ steps.comment.outputs.slack_message }}
         with:
           payload: |
-            {
-              "blocks": [
-                {"type": "header", "text": {"type": "plain_text", "text": "🔍 CDK Diff", "emoji": true}},
-                {"type": "context", "elements": [{"type": "mrkdwn", "text": "<${{ github.event.pull_request.html_url || format('https://github.com/{0}/pull/{1}', github.repository, inputs.pr-number) }}|${{ github.repository }}#${{ inputs.pr-number || github.event.pull_request.number }}>"}]},
-                {"type": "section", "text": {"type": "mrkdwn", "text": ${{ toJSON(steps.comment.outputs.slack_message) }} }}
-              ]
-            }
+            {"blocks": ${{ steps.comment.outputs.slack_blocks }} }
