@@ -461,14 +461,16 @@ jobs:
                     // Show property changes
                     for (const p of r.properties) {
                       const replaceWarn = p.impact === 'WILL_REPLACE' ? ' ⚠️replace' : '';
-                      if (p.oldValue && p.newValue) {
-                        md += `  - \`${p.name}\`: ${p.oldValue} → ${p.newValue}${replaceWarn}\n`;
-                      } else if (p.newValue) {
-                        md += `  - \`${p.name}\`: _(none)_ → ${p.newValue}${replaceWarn}\n`;
-                      } else if (p.oldValue) {
-                        md += `  - \`${p.name}\`: ${p.oldValue} → _(removed)_${replaceWarn}\n`;
+                      md += `  - \`${p.name}\`${replaceWarn}\n`;
+                      if (p.oldValue) {
+                        md += `    **OLD:** ${p.oldValue}\n`;
                       } else {
-                        md += `  - \`${p.name}\`${replaceWarn}\n`;
+                        md += `    **OLD:** _(none)_\n`;
+                      }
+                      if (p.newValue) {
+                        md += `    **NEW:** ${p.newValue}\n`;
+                      } else {
+                        md += `    **NEW:** _(removed)_\n`;
                       }
                     }
                   }
@@ -557,12 +559,9 @@ jobs:
                 blocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: '🟡 *Updates*' }] });
                 for (const res of byAction.UPDATE) {
                   const propFields = res.properties.map(p => {
-                    let val;
-                    if (p.oldValue && p.newValue) val = `${p.oldValue} → ${p.newValue}`;
-                    else if (p.newValue) val = `→ ${p.newValue}`;
-                    else if (p.oldValue) val = `${p.oldValue} → _(removed)_`;
-                    else val = '_(changed)_';
-                    return { type: 'mrkdwn', text: `*${p.name}*\n${val}` };
+                    const oldVal = p.oldValue || '_(none)_';
+                    const newVal = p.newValue || '_(removed)_';
+                    return { type: 'mrkdwn', text: `*${p.name}*\n*OLD:* ${oldVal}\n*NEW:* ${newVal}` };
                   });
                   
                   blocks.push({
