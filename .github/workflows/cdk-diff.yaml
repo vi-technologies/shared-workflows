@@ -184,11 +184,10 @@ jobs:
                   const type = resDiff.resourceTypes?.newType || resDiff.resourceTypes?.oldType || 'Unknown';
                   const action = resDiff.isAddition ? 'ADD' : resDiff.isRemoval ? 'REMOVE' : 'UPDATE';
                   
-                  // Format value for display (truncate long values)
+                  // Format value for display
                   const fmtVal = (v) => {
                     if (v === undefined || v === null) return null;
-                    const s = typeof v === 'object' ? JSON.stringify(v) : String(v);
-                    return s.length > 80 ? s.slice(0, 77) + '...' : s;
+                    return typeof v === 'object' ? JSON.stringify(v) : String(v);
                   };
                   
                   const properties = Object.entries(resDiff.propertyDiffs || {})
@@ -282,8 +281,7 @@ jobs:
               
               const fmtVal = (v) => {
                 if (v === undefined || v === null) return null;
-                const s = typeof v === 'object' ? JSON.stringify(v) : String(v);
-                return s.length > 80 ? s.slice(0, 77) + '...' : s;
+                return typeof v === 'object' ? JSON.stringify(v) : String(v);
               };
               for (const [name, diff] of Object.entries(diffResults)) {
                 const result = { stackName: name, hasDiff: false, resources: [] };
@@ -529,11 +527,8 @@ jobs:
               ]
             });
             
-            // Stack details (limit to avoid message too long)
-            const maxStacks = 5;
-            const stacksToShow = changed.slice(0, maxStacks);
-            
-            for (const stack of stacksToShow) {
+            // Stack details
+            for (const stack of changed) {
               blocks.push({ type: 'divider' });
               blocks.push({
                 type: 'section',
@@ -541,36 +536,23 @@ jobs:
                 accessory: { type: 'button', text: { type: 'plain_text', text: getEnv(stack.stackName) }, style: 'primary', action_id: `stack_${stack.stackName}` }
               });
               
-              // Resources for this stack (limit)
-              const maxResources = 6;
-              const resourcesToShow = stack.resources.slice(0, maxResources);
-              
-              for (const res of resourcesToShow) {
+              for (const res of stack.resources) {
                 const icon = res.action === 'ADD' ? '🟢' : res.action === 'REMOVE' ? '🔴' : '🟡';
-                const action = res.action === 'ADD' ? 'Add' : res.action === 'REMOVE' ? 'Remove' : 'Update';
                 let text = `${icon} \`${res.type}\` *${cleanId(res.logicalId)}*`;
                 
-                // Add property changes for updates
-                if (res.action === 'UPDATE' && res.properties.length > 0) {
-                  const propDetails = res.properties.slice(0, 3).map(p => {
+                // Add property changes
+                if (res.properties.length > 0) {
+                  const propDetails = res.properties.map(p => {
                     if (p.oldValue && p.newValue) return `\`${p.name}\`: ${p.oldValue} → ${p.newValue}`;
                     if (p.newValue) return `\`${p.name}\`: → ${p.newValue}`;
+                    if (p.oldValue) return `\`${p.name}\`: ${p.oldValue} → _(removed)_`;
                     return `\`${p.name}\``;
                   }).join('\n');
                   text += `\n${propDetails}`;
-                  if (res.properties.length > 3) text += `\n_...and ${res.properties.length - 3} more_`;
                 }
                 
                 blocks.push({ type: 'section', text: { type: 'mrkdwn', text } });
               }
-              
-              if (stack.resources.length > maxResources) {
-                blocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: `_...and ${stack.resources.length - maxResources} more resources_` }] });
-              }
-            }
-            
-            if (changed.length > maxStacks) {
-              blocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: `_...and ${changed.length - maxStacks} more stacks_` }] });
             }
             
             core.setOutput('slack_blocks', JSON.stringify(blocks));
