@@ -467,6 +467,31 @@ jobs:
             }
             
             core.setOutput('comment', md);
+            
+            // Generate Slack message (mrkdwn format)
+            let slack = '';
+            if (changed.length === 0) {
+              slack = '✅ No infrastructure changes';
+            } else {
+              const parts = [];
+              if (adds) parts.push(`🟢 ${adds} to add`);
+              if (updates) parts.push(`🟡 ${updates} to update`);
+              if (removes) parts.push(`🔴 ${removes} to destroy`);
+              slack = `*${parts.join(' · ')}*\n\n`;
+              
+              for (const stack of changed) {
+                slack += `*${stack.stackName}* _(${getEnv(stack.stackName)})_\n`;
+                
+                for (const res of stack.resources) {
+                  const icon = res.action === 'ADD' ? '🟢' : res.action === 'REMOVE' ? '🔴' : '🟡';
+                  const props = res.properties.length ? ` → ${res.properties.map(p => p.name).join(', ')}` : '';
+                  slack += `${icon} \`${shortType(res.type)}\` ${cleanId(res.logicalId)}${props}\n`;
+                }
+                slack += '\n';
+              }
+            }
+            
+            core.setOutput('slack_message', slack);
 
       - name: Post PR Comment
         uses: marocchino/sticky-pull-request-comment@v2
@@ -497,6 +522,13 @@ jobs:
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.slack-webhook-url }}
           SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+          SLACK_MSG: ${{ steps.comment.outputs.slack_message }}
         with:
           payload: |
-            {"blocks":[{"type":"header","text":{"type":"plain_text","text":"🔍 CDK Diff Results"}},{"type":"section","fields":[{"type":"mrkdwn","text":"*Repo:* ${{ github.repository }}"},{"type":"mrkdwn","text":"*PR:* <${{ github.event.pull_request.html_url || format('https://github.com/{0}/pull/{1}', github.repository, inputs.pr-number) }}|#${{ inputs.pr-number || github.event.pull_request.number }}>"}]},{"type":"section","text":{"type":"mrkdwn","text":"See PR comment for details."}}]}
+            {
+              "blocks": [
+                {"type": "header", "text": {"type": "plain_text", "text": "🔍 CDK Diff", "emoji": true}},
+                {"type": "context", "elements": [{"type": "mrkdwn", "text": "<${{ github.event.pull_request.html_url || format('https://github.com/{0}/pull/{1}', github.repository, inputs.pr-number) }}|${{ github.repository }}#${{ inputs.pr-number || github.event.pull_request.number }}>"}]},
+                {"type": "section", "text": {"type": "mrkdwn", "text": ${{ toJSON(steps.comment.outputs.slack_message) }} }}
+              ]
+            }
