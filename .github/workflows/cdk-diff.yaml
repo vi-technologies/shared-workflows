@@ -497,81 +497,27 @@ jobs:
             
             core.setOutput('comment', md);
             
-            // Generate Slack Block Kit JSON
+            // Generate simple Slack message
             const prUrl = '${{ github.event.pull_request.html_url || format('https://github.com/{0}/pull/{1}', github.repository, inputs.pr-number) }}';
             const prNum = '${{ inputs.pr-number || github.event.pull_request.number }}';
             const repo = '${{ github.repository }}';
-            const runUrl = '${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}';
+            
+            // Build a clean, simple stack list
+            const stackList = changed.map(s => `• *${s.stackName}* _(${getEnv(s.stackName)})_`).join('\n');
             
             const blocks = [
-              { type: 'header', text: { type: 'plain_text', text: '🔍 CDK Diff Preview', emoji: true } },
-              { type: 'context', elements: [{ type: 'mrkdwn', text: `👤 opened <${prUrl}|PR #${prNum}> in \`${repo}\`` }] },
-              { type: 'divider' }
+              { type: 'header', text: { type: 'plain_text', text: '🔍 CDK Diff', emoji: true } },
+              { type: 'section', text: { type: 'mrkdwn', text: `<${prUrl}|*${repo} #${prNum}*>` } },
+              { type: 'section', fields: [
+                { type: 'mrkdwn', text: `*🟢 Add*\n${adds}` },
+                { type: 'mrkdwn', text: `*🟡 Update*\n${updates}` },
+                { type: 'mrkdwn', text: `*🔴 Remove*\n${removes}` },
+                { type: 'mrkdwn', text: `*📦 Stacks*\n${changed.length}` }
+              ]},
+              { type: 'divider' },
+              { type: 'section', text: { type: 'mrkdwn', text: stackList || '_No changes_' } },
+              { type: 'context', elements: [{ type: 'mrkdwn', text: '_See PR comment for full details_' }] }
             ];
-            
-            // Summary section
-            blocks.push({
-              type: 'section',
-              fields: [
-                { type: 'mrkdwn', text: `🟢 *Additions*\n${adds} resources` },
-                { type: 'mrkdwn', text: `🟡 *Updates*\n${updates} resources` },
-                { type: 'mrkdwn', text: `🔴 *Deletions*\n${removes} resources` },
-                { type: 'mrkdwn', text: `📦 *Stacks*\n${changed.length} affected` }
-              ]
-            });
-            
-            // Action buttons
-            blocks.push({
-              type: 'actions',
-              elements: [
-                { type: 'button', text: { type: 'plain_text', text: '📄 View PR', emoji: true }, url: prUrl },
-                { type: 'button', text: { type: 'plain_text', text: '⚙️ View Workflow', emoji: true }, url: runUrl }
-              ]
-            });
-            
-            // Stack details (Slack has a 50 block limit, so we need to be concise)
-            const maxBlocks = 45; // Leave room for header/summary
-            let truncated = false;
-            
-            for (const stack of changed) {
-              if (blocks.length >= maxBlocks) {
-                truncated = true;
-                break;
-              }
-              
-              blocks.push({ type: 'divider' });
-              blocks.push({
-                type: 'section',
-                text: { type: 'mrkdwn', text: `📦 *${stack.stackName}*` },
-                accessory: { type: 'button', text: { type: 'plain_text', text: getEnv(stack.stackName) }, style: 'primary', action_id: `stack_${stack.stackName}` }
-              });
-              
-              // Group resources by action
-              const byAction = { ADD: [], UPDATE: [], REMOVE: [] };
-              for (const res of stack.resources) {
-                byAction[res.action].push(res);
-              }
-              
-              // Compact summary for Slack - just show resource names grouped by action
-              const parts = [];
-              if (byAction.ADD.length > 0) {
-                parts.push(`🟢 ${byAction.ADD.map(r => cleanId(r.logicalId)).join(', ')}`);
-              }
-              if (byAction.UPDATE.length > 0) {
-                parts.push(`🟡 ${byAction.UPDATE.map(r => cleanId(r.logicalId)).join(', ')}`);
-              }
-              if (byAction.REMOVE.length > 0) {
-                parts.push(`🔴 ${byAction.REMOVE.map(r => cleanId(r.logicalId)).join(', ')}`);
-              }
-              
-              if (parts.length > 0 && blocks.length < maxBlocks) {
-                blocks.push({ type: 'section', text: { type: 'mrkdwn', text: parts.join('\n') } });
-              }
-            }
-            
-            if (truncated) {
-              blocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: `_...and more stacks. See PR for full details._` }] });
-            }
             
             core.setOutput('slack_blocks', JSON.stringify(blocks));
 
