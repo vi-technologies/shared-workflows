@@ -184,9 +184,21 @@ jobs:
                   const type = resDiff.resourceTypes?.newType || resDiff.resourceTypes?.oldType || 'Unknown';
                   const action = resDiff.isAddition ? 'ADD' : resDiff.isRemoval ? 'REMOVE' : 'UPDATE';
                   
+                  // Format value for display (truncate long values)
+                  const fmtVal = (v) => {
+                    if (v === undefined || v === null) return null;
+                    const s = typeof v === 'object' ? JSON.stringify(v) : String(v);
+                    return s.length > 80 ? s.slice(0, 77) + '...' : s;
+                  };
+                  
                   const properties = Object.entries(resDiff.propertyDiffs || {})
                     .filter(([_, p]) => p.isDifferent)
-                    .map(([propName, p]) => ({ name: propName, impact: p.changeImpact || 'UNKNOWN' }));
+                    .map(([propName, p]) => ({
+                      name: propName,
+                      impact: p.changeImpact || 'UNKNOWN',
+                      oldValue: fmtVal(p.oldValue),
+                      newValue: fmtVal(p.newValue)
+                    }));
                   
                   result.resources.push({ logicalId, type, action, properties });
                   result.hasDiff = true;
@@ -268,6 +280,11 @@ jobs:
                 : { strategy: StackSelectionStrategy.ALL_STACKS };
               const diffResults = await toolkit.diff(cx, { stacks: selector });
               
+              const fmtVal = (v) => {
+                if (v === undefined || v === null) return null;
+                const s = typeof v === 'object' ? JSON.stringify(v) : String(v);
+                return s.length > 80 ? s.slice(0, 77) + '...' : s;
+              };
               for (const [name, diff] of Object.entries(diffResults)) {
                 const result = { stackName: name, hasDiff: false, resources: [] };
                 for (const [logicalId, resDiff] of Object.entries(diff.resources?.diffs || {})) {
@@ -275,7 +292,7 @@ jobs:
                   const action = resDiff.isAddition ? 'ADD' : resDiff.isRemoval ? 'REMOVE' : 'UPDATE';
                   const properties = Object.entries(resDiff.propertyDiffs || {})
                     .filter(([_, p]) => p.isDifferent)
-                    .map(([propName, p]) => ({ name: propName, impact: p.changeImpact || 'UNKNOWN' }));
+                    .map(([propName, p]) => ({ name: propName, impact: p.changeImpact || 'UNKNOWN', oldValue: fmtVal(p.oldValue), newValue: fmtVal(p.newValue) }));
                   result.resources.push({ logicalId, type, action, properties });
                   result.hasDiff = true;
                 }
@@ -428,7 +445,11 @@ jobs:
                 if (byAction.ADD.length) {
                   md += '**➕ Create**\n';
                   for (const r of byAction.ADD) {
-                    md += `- \`${shortType(r.type)}\` ${cleanId(r.logicalId)}\n`;
+                    md += `- \`${shortType(r.type)}\` **${cleanId(r.logicalId)}**\n`;
+                    // Show new properties for added resources
+                    for (const p of r.properties) {
+                      if (p.newValue) md += `  - \`${p.name}\`: ${p.newValue}\n`;
+                    }
                   }
                   md += '\n';
                 }
@@ -437,13 +458,21 @@ jobs:
                 if (byAction.UPDATE.length) {
                   md += '**✏️ Update**\n';
                   for (const r of byAction.UPDATE) {
-                    const props = r.properties.map(p => {
-                      const warn = p.impact === 'WILL_REPLACE' ? ' ⚠️replace' : '';
-                      return `\`${p.name}\`${warn}`;
-                    }).join(', ');
-                    md += `- \`${shortType(r.type)}\` ${cleanId(r.logicalId)}`;
-                    if (props) md += ` → ${props}`;
-                    md += '\n';
+                    const warn = r.properties.some(p => p.impact === 'WILL_REPLACE') ? ' ⚠️' : '';
+                    md += `- \`${shortType(r.type)}\` **${cleanId(r.logicalId)}**${warn}\n`;
+                    // Show property changes
+                    for (const p of r.properties) {
+                      const replaceWarn = p.impact === 'WILL_REPLACE' ? ' ⚠️replace' : '';
+                      if (p.oldValue && p.newValue) {
+                        md += `  - \`${p.name}\`: ${p.oldValue} → ${p.newValue}${replaceWarn}\n`;
+                      } else if (p.newValue) {
+                        md += `  - \`${p.name}\`: _(none)_ → ${p.newValue}${replaceWarn}\n`;
+                      } else if (p.oldValue) {
+                        md += `  - \`${p.name}\`: ${p.oldValue} → _(removed)_${replaceWarn}\n`;
+                      } else {
+                        md += `  - \`${p.name}\`${replaceWarn}\n`;
+                      }
+                    }
                   }
                   md += '\n';
                 }
@@ -452,7 +481,7 @@ jobs:
                 if (byAction.REMOVE.length) {
                   md += '**🗑️ Destroy**\n';
                   for (const r of byAction.REMOVE) {
-                    md += `- \`${shortType(r.type)}\` ${cleanId(r.logicalId)}\n`;
+                    md += `- \`${shortType(r.type)}\` **${cleanId(r.logicalId)}**\n`;
                   }
                   md += '\n';
                 }
@@ -472,7 +501,7 @@ jobs:
             let slack = '';
             if (changed.length === 0) {
               slack = '✅ No infrastructure changes';
-            } else {
+              } else {
               const parts = [];
               if (adds) parts.push(`🟢 ${adds} to add`);
               if (updates) parts.push(`🟡 ${updates} to update`);
