@@ -1,17 +1,7 @@
 # =============================================================================
 # CDK DIFF WORKFLOW (using @aws-cdk/toolkit-lib)
 # =============================================================================
-# This reusable workflow performs CDK diff operations on AWS CDK stacks and
-# optionally runs CloudFormation drift detection. Results are posted as a
-# formatted comment on the pull request.
-#
-# FEATURES:
-#   - Uses @aws-cdk/toolkit-lib for structured, reliable diff output
-#   - Runs `cdk diff` against specified stacks (single or multi-account)
-#   - Detects CloudFormation drift (optional)
-#   - Posts detailed, formatted results to the PR
-#   - Supports Slack notifications
-#
+# Uses the CDK Toolkit Library for structured, reliable diff output.
 # =============================================================================
 
 name: CDK Diff
@@ -19,108 +9,79 @@ name: CDK Diff
 on:
   workflow_call:
     inputs:
-      # -----------------------------------------------------------------------
-      # Build Environment Configuration
-      # -----------------------------------------------------------------------
       working-directory:
         description: 'Working directory for CDK commands'
         required: false
         type: string
         default: '.'
-
       python-version:
         description: 'Python version (for Python CDK apps)'
         required: false
         type: string
         default: ''
-
       node-version:
-        description: 'Node.js version (18+ required for toolkit-lib)'
+        description: 'Node.js version (18+ required)'
         required: false
         type: string
         default: '20'
-
       install-command:
         description: 'Command to install dependencies'
         required: false
         type: string
         default: 'npm ci'
-
-      # -----------------------------------------------------------------------
-      # AWS Configuration
-      # -----------------------------------------------------------------------
       aws-region:
         description: 'AWS region'
         required: false
         type: string
         default: 'us-east-1'
-
       aws-role-arn:
-        description: 'AWS IAM role ARN to assume (for single account mode)'
+        description: 'AWS IAM role ARN (single account mode)'
         required: false
         type: string
         default: ''
-
       aws-role-arns:
-        description: 'JSON map of account IDs to role ARNs for multi-account diff'
+        description: 'JSON map of account IDs to role ARNs (multi-account)'
         required: false
         type: string
         default: ''
-
-      # -----------------------------------------------------------------------
-      # CDK Diff Configuration
-      # -----------------------------------------------------------------------
       stacks:
-        description: 'Space-separated list of stack names to diff (single account mode)'
+        description: 'Space-separated stack names (single account)'
         required: false
         type: string
         default: ''
-
       stacks-per-account:
-        description: 'JSON map of account IDs to stack lists for multi-account mode'
+        description: 'JSON map of account IDs to stack lists (multi-account)'
         required: false
         type: string
         default: ''
-
       enable-drift-detection:
-        description: 'Whether to run drift detection'
+        description: 'Run drift detection'
         required: false
         type: boolean
         default: true
-
-      # -----------------------------------------------------------------------
-      # Display Configuration
-      # -----------------------------------------------------------------------
       account-names:
         description: 'JSON map of account IDs to friendly names'
         required: false
         type: string
         default: '{}'
-
       pr-number:
         description: 'Pull request number'
         required: false
         type: number
         default: 0
-
-      # -----------------------------------------------------------------------
-      # Slack Notification Configuration
-      # -----------------------------------------------------------------------
       slack-notify-label:
         description: 'PR label that triggers Slack notification'
         required: false
         type: string
         default: 'slack-notify'
-
       slack-channel-name:
-        description: 'Slack channel name (for display purposes)'
+        description: 'Slack channel name'
         required: false
         type: string
         default: 'devops'
-
     secrets:
       slack-webhook-url:
-        description: 'Slack webhook URL for notifications'
+        description: 'Slack webhook URL'
         required: false
 
 jobs:
@@ -136,9 +97,6 @@ jobs:
         working-directory: ${{ inputs.working-directory }}
 
     steps:
-      # =====================================================================
-      # SETUP
-      # =====================================================================
       - name: Checkout
         uses: actions/checkout@v4
         with:
@@ -158,8 +116,10 @@ jobs:
       - name: Install dependencies
         run: ${{ inputs.install-command }}
 
-      - name: Install CDK Toolkit Library
-        run: npm install -g aws-cdk @aws-cdk/toolkit-lib typescript ts-node
+      - name: Install CDK tools
+        run: |
+          npm install -g aws-cdk
+          npm install -g @aws-cdk/toolkit-lib typescript ts-node @types/node
 
       # =====================================================================
       # SINGLE ACCOUNT MODE
@@ -172,166 +132,117 @@ jobs:
           role-duration-seconds: 3600
           aws-region: ${{ inputs.aws-region }}
 
-      - name: Synth and Diff (single account)
+      - name: Run CDK Diff (single account)
         if: inputs.aws-role-arn != '' && inputs.aws-role-arns == ''
         id: single-diff
+        env:
+          STACKS: ${{ inputs.stacks }}
+          ENABLE_DRIFT: ${{ inputs.enable-drift-detection }}
         run: |
-          # Synthesize
+          # Synth
           npx cdk synth --quiet --output cdk.out
           
-          # Create config for diff script
-          STACKS_JSON='[]'
-          if [ -n "${{ inputs.stacks }}" ]; then
-            STACKS_JSON=$(echo '${{ inputs.stacks }}' | tr ' ' '\n' | jq -R . | jq -s .)
-          fi
+          # Create and run inline TypeScript diff script
+          cat > /tmp/cdk-diff.mts << 'SCRIPT'
+          import { Toolkit, StackSelectionStrategy } from '@aws-cdk/toolkit-lib';
           
-          cat > /tmp/cdk-diff-config.json << EOF
-          {
-            "assemblyDir": "$(pwd)/cdk.out",
-            "stacks": $STACKS_JSON,
-            "enableDrift": ${{ inputs.enable-drift-detection }}
-          }
-          EOF
+          const stacks = process.env.STACKS?.split(' ').filter(Boolean) || [];
+          const enableDrift = process.env.ENABLE_DRIFT === 'true';
+          const assemblyDir = process.env.CDK_OUT || 'cdk.out';
           
-          # Run diff using toolkit-lib
-          cat > /tmp/run-diff.ts << 'SCRIPT'
-          import { Toolkit, StackSelectionStrategy, BaseCredentials } from '@aws-cdk/toolkit-lib';
-          import * as fs from 'fs';
-          
-          interface Config {
-            assemblyDir: string;
-            stacks?: string[];
-            enableDrift?: boolean;
+          interface StackResult {
+            stackName: string;
+            hasDiff: boolean;
+            resources: Array<{
+              logicalId: string;
+              type: string;
+              action: 'ADD' | 'UPDATE' | 'REMOVE';
+              properties: Array<{ name: string; impact: string }>;
+            }>;
+            drift?: { status: string; count: number };
           }
           
           async function main() {
-            const config: Config = JSON.parse(fs.readFileSync('/tmp/cdk-diff-config.json', 'utf-8'));
-            const output: any = { success: false, timestamp: new Date().toISOString(), stacks: [] };
+            const output = { success: false, stacks: [] as StackResult[], error: '' };
             
             try {
               const toolkit = new Toolkit({
                 ioHost: {
-                  notify: async (msg) => {
-                    if (msg.level === 'info') console.error(`[INFO] ${msg.message}`);
-                  },
-                  requestResponse: async (msg) => msg.defaultResponse,
+                  notify: async () => {},
+                  requestResponse: async (msg: any) => msg.defaultResponse,
                 },
               });
               
-              const cx = await toolkit.fromAssemblyDirectory(config.assemblyDir);
+              const cx = await toolkit.fromAssemblyDirectory(assemblyDir);
+              const selector = stacks.length
+                ? { strategy: StackSelectionStrategy.PATTERN_MUST_MATCH, patterns: stacks }
+                : { strategy: StackSelectionStrategy.ALL_STACKS };
               
-              const stackSelector = config.stacks?.length
-                ? { strategy: StackSelectionStrategy.PATTERN_MUST_MATCH as const, patterns: config.stacks }
-                : { strategy: StackSelectionStrategy.ALL_STACKS as const };
+              const diffResults = await toolkit.diff(cx, { stacks: selector });
               
-              const diffResults = await toolkit.diff(cx, { stacks: stackSelector });
-              
-              for (const [stackName, diff] of Object.entries(diffResults as Record<string, any>)) {
-                const stackResult: any = {
-                  stackName,
-                  hasDifferences: false,
-                  summary: { additions: 0, updates: 0, removals: 0, replacements: 0 },
-                  resources: [],
-                  iamChanges: [],
-                  securityGroupChanges: [],
-                };
+              for (const [name, diff] of Object.entries(diffResults as Record<string, any>)) {
+                const result: StackResult = { stackName: name, hasDiff: false, resources: [] };
                 
-                const resourceDiffs = diff.resources?.diffs || {};
-                for (const [logicalId, resDiff] of Object.entries(resourceDiffs as Record<string, any>)) {
-                  const resourceType = resDiff.resourceTypes?.newType || resDiff.resourceTypes?.oldType || 'Unknown';
-                  let action: string;
+                for (const [logicalId, resDiff] of Object.entries((diff.resources?.diffs || {}) as Record<string, any>)) {
+                  const type = resDiff.resourceTypes?.newType || resDiff.resourceTypes?.oldType || 'Unknown';
+                  const action = resDiff.isAddition ? 'ADD' : resDiff.isRemoval ? 'REMOVE' : 'UPDATE';
                   
-                  if (resDiff.isAddition) {
-                    action = 'ADD';
-                    stackResult.summary.additions++;
-                  } else if (resDiff.isRemoval) {
-                    action = 'REMOVE';
-                    stackResult.summary.removals++;
-                  } else {
-                    action = 'UPDATE';
-                    stackResult.summary.updates++;
-                  }
+                  const properties = Object.entries((resDiff.propertyDiffs || {}) as Record<string, any>)
+                    .filter(([_, p]) => p.isDifferent)
+                    .map(([propName, p]) => ({ name: propName, impact: p.changeImpact || 'UNKNOWN' }));
                   
-                  const willReplace = Object.values(resDiff.propertyDiffs || {}).some((p: any) => p.changeImpact === 'WILL_REPLACE');
-                  if (willReplace) stackResult.summary.replacements++;
-                  
-                  const properties: any[] = [];
-                  for (const [propName, propDiff] of Object.entries(resDiff.propertyDiffs || {} as Record<string, any>)) {
-                    if (propDiff.isDifferent) {
-                      properties.push({
-                        name: propName,
-                        changeImpact: propDiff.changeImpact || 'UNKNOWN',
-                        oldValue: propDiff.oldValue,
-                        newValue: propDiff.newValue,
-                      });
-                    }
-                  }
-                  
-                  stackResult.resources.push({ logicalId, resourceType, action, properties, willReplace });
+                  result.resources.push({ logicalId, type, action, properties });
+                  result.hasDiff = true;
                 }
                 
-                // IAM changes
-                const iamStatements = diff.iamChanges?.statements || {};
-                for (const stmt of iamStatements.additions || []) {
-                  stackResult.iamChanges.push({ type: 'ADD', effect: stmt.effect || 'Allow', actions: stmt.actions || [], resources: stmt.resources || [] });
-                }
-                for (const stmt of iamStatements.removals || []) {
-                  stackResult.iamChanges.push({ type: 'REMOVE', effect: stmt.effect || 'Allow', actions: stmt.actions || [], resources: stmt.resources || [] });
-                }
-                
-                // Security Group changes
-                for (const rule of diff.securityGroupChanges?.ingress?.additions || []) {
-                  stackResult.securityGroupChanges.push({ type: 'ADD', direction: 'INGRESS', protocol: rule.protocol, ports: `${rule.fromPort}-${rule.toPort}` });
-                }
-                for (const rule of diff.securityGroupChanges?.ingress?.removals || []) {
-                  stackResult.securityGroupChanges.push({ type: 'REMOVE', direction: 'INGRESS', protocol: rule.protocol, ports: `${rule.fromPort}-${rule.toPort}` });
-                }
-                
-                stackResult.hasDifferences = stackResult.summary.additions > 0 || stackResult.summary.updates > 0 || stackResult.summary.removals > 0;
-                output.stacks.push(stackResult);
+                output.stacks.push(result);
               }
               
               // Drift detection
-              if (config.enableDrift) {
-                output.drift = [];
+              if (enableDrift) {
                 try {
-                  const driftResults = await toolkit.drift(cx, { stacks: stackSelector });
-                  for (const [stackName, driftInfo] of Object.entries(driftResults as Record<string, any>)) {
-                    output.drift.push({
-                      stackName,
-                      hasDrift: (driftInfo.numResourcesWithDrift || 0) > 0,
-                      summary: { drifted: driftInfo.numResourcesWithDrift || 0, unchecked: driftInfo.numResourcesUnchecked || 0 },
-                    });
+                  const driftResults = await toolkit.drift(cx, { stacks: selector });
+                  for (const [name, driftInfo] of Object.entries(driftResults as Record<string, any>)) {
+                    const stack = output.stacks.find(s => s.stackName === name);
+                    if (stack) {
+                      stack.drift = {
+                        status: (driftInfo.numResourcesWithDrift || 0) > 0 ? 'DRIFTED' : 'IN_SYNC',
+                        count: driftInfo.numResourcesWithDrift || 0
+                      };
+                    }
                   }
                 } catch (e: any) {
-                  console.error('[WARN] Drift detection failed:', e.message);
+                  console.error('Drift detection failed:', e.message);
                 }
               }
               
               output.success = true;
-            } catch (error: any) {
-              output.error = error.message;
+            } catch (e: any) {
+              output.error = e.message;
             }
             
             console.log(JSON.stringify(output));
           }
           
-          main().catch(e => {
-            console.log(JSON.stringify({ success: false, error: e.message }));
-            process.exit(1);
-          });
+          main();
           SCRIPT
           
-          # Run the script
-          DIFF_OUTPUT=$(npx ts-node /tmp/run-diff.ts 2>&1 | tail -1)
+          CDK_OUT="$(pwd)/cdk.out" npx ts-node --esm /tmp/cdk-diff.mts > /tmp/diff-output.json 2>/tmp/diff-stderr.txt || true
+          
+          if [ -s /tmp/diff-output.json ]; then
+            RESULT=$(cat /tmp/diff-output.json | tail -1)
+          else
+            RESULT='{"success":false,"error":"Script produced no output","stacks":[]}'
+          fi
+          
           echo "diff_result<<EOF" >> $GITHUB_OUTPUT
-          echo "$DIFF_OUTPUT" >> $GITHUB_OUTPUT
+          echo "$RESULT" >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
 
       # =====================================================================
-      # MULTI-ACCOUNT MODE
+      # MULTI-ACCOUNT MODE  
       # =====================================================================
-      - name: Multi-Account Diff
+      - name: Run CDK Diff (multi-account)
         if: inputs.aws-role-arns != '' && inputs.stacks-per-account != ''
         id: multi-diff
         env:
@@ -340,302 +251,186 @@ jobs:
           AWS_REGION: ${{ inputs.aws-region }}
           ENABLE_DRIFT: ${{ inputs.enable-drift-detection }}
         run: |
-          ALL_RESULTS='{"success":true,"timestamp":"'$(date -u +"%Y-%m-%dT%H:%M:%SZ")'","stacks":[],"drift":[]}'
+          ALL_STACKS='[]'
           
-          # Process each account
           for ACCOUNT_ID in $(echo "$AWS_ROLE_ARNS" | jq -r 'keys[]'); do
             ROLE_ARN=$(echo "$AWS_ROLE_ARNS" | jq -r --arg acc "$ACCOUNT_ID" '.[$acc]')
             STACKS=$(echo "$STACKS_PER_ACCOUNT" | jq -r --arg acc "$ACCOUNT_ID" '.[$acc] // ""')
             
-            if [ -z "$STACKS" ]; then
-              echo "No stacks for account $ACCOUNT_ID, skipping..."
-              continue
-            fi
+            [ -z "$STACKS" ] && continue
             
-            echo "=== Processing account $ACCOUNT_ID ==="
-            echo "Role: $ROLE_ARN"
-            echo "Stacks: $STACKS"
+            echo "=== Account $ACCOUNT_ID ==="
             
-            # Assume role for this account
-            CREDS=$(aws sts assume-role \
-              --role-arn "$ROLE_ARN" \
-              --role-session-name "cdk-diff-$ACCOUNT_ID" \
-              --duration-seconds 3600 \
-              --output json)
-            
+            # Assume role
+            CREDS=$(aws sts assume-role --role-arn "$ROLE_ARN" --role-session-name "cdk-diff" --duration-seconds 3600 --output json)
             export AWS_ACCESS_KEY_ID=$(echo "$CREDS" | jq -r '.Credentials.AccessKeyId')
             export AWS_SECRET_ACCESS_KEY=$(echo "$CREDS" | jq -r '.Credentials.SecretAccessKey')
             export AWS_SESSION_TOKEN=$(echo "$CREDS" | jq -r '.Credentials.SessionToken')
             export CDK_DEFAULT_ACCOUNT="$ACCOUNT_ID"
             export CDK_DEFAULT_REGION="$AWS_REGION"
             
-            # Synth for this account
+            # Synth
             rm -rf cdk.out
             npx cdk synth --quiet --output cdk.out
             
-            # Create config
-            STACKS_JSON=$(echo "$STACKS" | tr ' ' '\n' | jq -R . | jq -s .)
-            cat > /tmp/cdk-diff-config.json << EOF
-          {
-            "assemblyDir": "$(pwd)/cdk.out",
-            "stacks": $STACKS_JSON,
-            "enableDrift": $ENABLE_DRIFT
-          }
-          EOF
-            
-            # Run diff (reuse the same script)
-            cat > /tmp/run-diff.ts << 'SCRIPT'
+            # Create diff script
+            cat > /tmp/cdk-diff.mts << 'SCRIPT'
           import { Toolkit, StackSelectionStrategy } from '@aws-cdk/toolkit-lib';
-          import * as fs from 'fs';
           
-          interface Config { assemblyDir: string; stacks?: string[]; enableDrift?: boolean; }
+          const stacks = process.env.STACKS?.split(' ').filter(Boolean) || [];
+          const enableDrift = process.env.ENABLE_DRIFT === 'true';
+          const assemblyDir = process.env.CDK_OUT || 'cdk.out';
           
           async function main() {
-            const config: Config = JSON.parse(fs.readFileSync('/tmp/cdk-diff-config.json', 'utf-8'));
-            const output: any = { success: false, stacks: [], drift: [] };
+            const output = { success: false, stacks: [] as any[], error: '' };
             
             try {
               const toolkit = new Toolkit({
-                ioHost: {
-                  notify: async (msg) => { if (msg.level === 'info') console.error(`[INFO] ${msg.message}`); },
-                  requestResponse: async (msg) => msg.defaultResponse,
-                },
+                ioHost: { notify: async () => {}, requestResponse: async (msg: any) => msg.defaultResponse },
               });
               
-              const cx = await toolkit.fromAssemblyDirectory(config.assemblyDir);
-              const stackSelector = config.stacks?.length
-                ? { strategy: StackSelectionStrategy.PATTERN_MUST_MATCH as const, patterns: config.stacks }
-                : { strategy: StackSelectionStrategy.ALL_STACKS as const };
+              const cx = await toolkit.fromAssemblyDirectory(assemblyDir);
+              const selector = stacks.length
+                ? { strategy: StackSelectionStrategy.PATTERN_MUST_MATCH, patterns: stacks }
+                : { strategy: StackSelectionStrategy.ALL_STACKS };
               
-              const diffResults = await toolkit.diff(cx, { stacks: stackSelector });
+              const diffResults = await toolkit.diff(cx, { stacks: selector });
               
-              for (const [stackName, diff] of Object.entries(diffResults as Record<string, any>)) {
-                const stackResult: any = {
-                  stackName,
-                  hasDifferences: false,
-                  summary: { additions: 0, updates: 0, removals: 0, replacements: 0 },
-                  resources: [],
-                  iamChanges: [],
-                  securityGroupChanges: [],
-                };
+              for (const [name, diff] of Object.entries(diffResults as Record<string, any>)) {
+                const result: any = { stackName: name, hasDiff: false, resources: [] };
                 
-                const resourceDiffs = diff.resources?.diffs || {};
-                for (const [logicalId, resDiff] of Object.entries(resourceDiffs as Record<string, any>)) {
-                  const resourceType = resDiff.resourceTypes?.newType || resDiff.resourceTypes?.oldType || 'Unknown';
-                  let action: string;
-                  if (resDiff.isAddition) { action = 'ADD'; stackResult.summary.additions++; }
-                  else if (resDiff.isRemoval) { action = 'REMOVE'; stackResult.summary.removals++; }
-                  else { action = 'UPDATE'; stackResult.summary.updates++; }
+                for (const [logicalId, resDiff] of Object.entries((diff.resources?.diffs || {}) as Record<string, any>)) {
+                  const type = resDiff.resourceTypes?.newType || resDiff.resourceTypes?.oldType || 'Unknown';
+                  const action = resDiff.isAddition ? 'ADD' : resDiff.isRemoval ? 'REMOVE' : 'UPDATE';
+                  const properties = Object.entries((resDiff.propertyDiffs || {}) as Record<string, any>)
+                    .filter(([_, p]) => p.isDifferent)
+                    .map(([propName, p]) => ({ name: propName, impact: p.changeImpact || 'UNKNOWN' }));
                   
-                  const willReplace = Object.values(resDiff.propertyDiffs || {}).some((p: any) => p.changeImpact === 'WILL_REPLACE');
-                  if (willReplace) stackResult.summary.replacements++;
-                  
-                  const properties: any[] = [];
-                  for (const [propName, propDiff] of Object.entries(resDiff.propertyDiffs || {} as Record<string, any>)) {
-                    if (propDiff.isDifferent) {
-                      properties.push({ name: propName, changeImpact: propDiff.changeImpact || 'UNKNOWN', oldValue: propDiff.oldValue, newValue: propDiff.newValue });
-                    }
-                  }
-                  stackResult.resources.push({ logicalId, resourceType, action, properties, willReplace });
+                  result.resources.push({ logicalId, type, action, properties });
+                  result.hasDiff = true;
                 }
                 
-                const iamStatements = diff.iamChanges?.statements || {};
-                for (const stmt of iamStatements.additions || []) {
-                  stackResult.iamChanges.push({ type: 'ADD', effect: stmt.effect || 'Allow', actions: stmt.actions || [], resources: stmt.resources || [] });
-                }
-                for (const stmt of iamStatements.removals || []) {
-                  stackResult.iamChanges.push({ type: 'REMOVE', effect: stmt.effect || 'Allow', actions: stmt.actions || [], resources: stmt.resources || [] });
+                if (enableDrift) {
+                  try {
+                    const driftResults = await toolkit.drift(cx, { stacks: { strategy: StackSelectionStrategy.PATTERN_MUST_MATCH, patterns: [name] } });
+                    const driftInfo = (driftResults as any)[name];
+                    result.drift = { status: (driftInfo?.numResourcesWithDrift || 0) > 0 ? 'DRIFTED' : 'IN_SYNC', count: driftInfo?.numResourcesWithDrift || 0 };
+                  } catch (e) {}
                 }
                 
-                stackResult.hasDifferences = stackResult.summary.additions > 0 || stackResult.summary.updates > 0 || stackResult.summary.removals > 0;
-                output.stacks.push(stackResult);
-              }
-              
-              if (config.enableDrift) {
-                try {
-                  const driftResults = await toolkit.drift(cx, { stacks: stackSelector });
-                  for (const [stackName, driftInfo] of Object.entries(driftResults as Record<string, any>)) {
-                    output.drift.push({
-                      stackName,
-                      hasDrift: (driftInfo.numResourcesWithDrift || 0) > 0,
-                      summary: { drifted: driftInfo.numResourcesWithDrift || 0, unchecked: driftInfo.numResourcesUnchecked || 0 },
-                    });
-                  }
-                } catch (e: any) { console.error('[WARN] Drift failed:', e.message); }
+                output.stacks.push(result);
               }
               
               output.success = true;
-            } catch (error: any) {
-              output.error = error.message;
+            } catch (e: any) {
+              output.error = e.message;
             }
+            
             console.log(JSON.stringify(output));
           }
-          main().catch(e => { console.log(JSON.stringify({ success: false, error: e.message })); process.exit(1); });
+          
+          main();
           SCRIPT
             
-            ACCOUNT_RESULT=$(npx ts-node /tmp/run-diff.ts 2>&1 | tail -1)
+            STACKS="$STACKS" CDK_OUT="$(pwd)/cdk.out" npx ts-node --esm /tmp/cdk-diff.mts > /tmp/account-diff.json 2>/tmp/diff-stderr.txt || true
             
-            # Merge results
-            ALL_RESULTS=$(echo "$ALL_RESULTS" | jq --argjson new "$ACCOUNT_RESULT" '
-              .stacks += $new.stacks |
-              .drift += ($new.drift // []) |
-              if $new.success == false then .success = false | .error = ($new.error // "Unknown error") else . end
-            ')
+            if [ -s /tmp/account-diff.json ]; then
+              ACCOUNT_RESULT=$(cat /tmp/account-diff.json | tail -1)
+              ALL_STACKS=$(echo "$ALL_STACKS" | jq --argjson new "$(echo "$ACCOUNT_RESULT" | jq '.stacks')" '. + $new')
+            fi
             
-            # Clear credentials
             unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
           done
           
+          FINAL='{"success":true,"stacks":'$ALL_STACKS'}'
+          
           echo "diff_result<<EOF" >> $GITHUB_OUTPUT
-          echo "$ALL_RESULTS" >> $GITHUB_OUTPUT
+          echo "$FINAL" >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
 
       # =====================================================================
-      # GENERATE PR COMMENT
+      # GENERATE AND POST PR COMMENT
       # =====================================================================
       - name: Generate PR Comment
         id: comment
         uses: actions/github-script@v7
         env:
-          SINGLE_DIFF: ${{ steps.single-diff.outputs.diff_result }}
-          MULTI_DIFF: ${{ steps.multi-diff.outputs.diff_result }}
+          DIFF_RESULT: ${{ steps.single-diff.outputs.diff_result || steps.multi-diff.outputs.diff_result }}
           ACCOUNT_NAMES: ${{ inputs.account-names }}
         with:
           script: |
-            const diffResult = process.env.SINGLE_DIFF || process.env.MULTI_DIFF;
-            if (!diffResult) {
-              core.setOutput('comment', '## 🔍 CDK Diff\n\n⚠️ No diff results available');
+            const raw = process.env.DIFF_RESULT;
+            if (!raw) {
+              core.setOutput('comment', '## 🔍 CDK Diff\n\n⚠️ No diff results');
               return;
             }
             
             let data;
             try {
-              data = JSON.parse(diffResult);
+              data = JSON.parse(raw);
             } catch (e) {
-              core.setOutput('comment', `## 🔍 CDK Diff\n\n❌ Error parsing diff results: ${e.message}\n\n\`\`\`\n${diffResult.slice(0, 500)}\n\`\`\``);
+              core.setOutput('comment', `## 🔍 CDK Diff\n\n❌ Parse error: ${e.message}\n\n\`\`\`\n${raw.slice(0, 500)}\n\`\`\``);
               return;
             }
             
             const accountNames = JSON.parse(process.env.ACCOUNT_NAMES || '{}');
+            const getEnv = (name) => name.toLowerCase().includes('prod') ? 'production' : name.toLowerCase().includes('staging') ? 'staging' : 'dev';
             
-            // Helper to get account name from stack name
-            const getEnvFromStack = (stackName) => {
-              if (stackName.toLowerCase().includes('prod')) return 'production';
-              if (stackName.toLowerCase().includes('staging')) return 'staging';
-              return 'unknown';
-            };
-            
-            let comment = '## 🔍 CDK Diff Results\n\n';
+            let md = '## 🔍 CDK Diff Results\n\n';
             
             if (!data.success) {
-              comment += `❌ **Error:** ${data.error || 'Unknown error'}\n\n`;
+              md += `❌ **Error:** ${data.error}\n\n`;
             }
             
-            // Group stacks by presence of changes
-            const changedStacks = data.stacks.filter(s => s.hasDifferences);
-            const unchangedStacks = data.stacks.filter(s => !s.hasDifferences);
+            const changed = data.stacks.filter(s => s.hasDiff);
+            const unchanged = data.stacks.filter(s => !s.hasDiff);
             
             // Summary
-            const totalAdd = data.stacks.reduce((sum, s) => sum + s.summary.additions, 0);
-            const totalUpdate = data.stacks.reduce((sum, s) => sum + s.summary.updates, 0);
-            const totalRemove = data.stacks.reduce((sum, s) => sum + s.summary.removals, 0);
-            const totalReplace = data.stacks.reduce((sum, s) => sum + s.summary.replacements, 0);
+            const adds = data.stacks.reduce((n, s) => n + s.resources.filter(r => r.action === 'ADD').length, 0);
+            const updates = data.stacks.reduce((n, s) => n + s.resources.filter(r => r.action === 'UPDATE').length, 0);
+            const removes = data.stacks.reduce((n, s) => n + s.resources.filter(r => r.action === 'REMOVE').length, 0);
             
-            if (changedStacks.length === 0) {
-              comment += '✅ **No infrastructure changes detected**\n\n';
+            if (changed.length === 0) {
+              md += '✅ **No infrastructure changes**\n\n';
             } else {
-              comment += `📊 **Summary:** `;
               const parts = [];
-              if (totalAdd > 0) parts.push(`➕ ${totalAdd} add`);
-              if (totalUpdate > 0) parts.push(`🔄 ${totalUpdate} update`);
-              if (totalRemove > 0) parts.push(`➖ ${totalRemove} remove`);
-              if (totalReplace > 0) parts.push(`⚠️ ${totalReplace} replace`);
-              comment += parts.join(' | ') + '\n\n';
+              if (adds) parts.push(`➕ ${adds} add`);
+              if (updates) parts.push(`🔄 ${updates} update`);
+              if (removes) parts.push(`➖ ${removes} remove`);
+              md += `📊 **Summary:** ${parts.join(' | ')}\n\n`;
             }
             
-            // Detail each changed stack
-            for (const stack of changedStacks) {
-              const env = getEnvFromStack(stack.stackName);
-              comment += `### 📦 ${stack.stackName} _(${env})_\n\n`;
+            // Changed stacks
+            for (const stack of changed) {
+              md += `### 📦 ${stack.stackName} _(${getEnv(stack.stackName)})_\n\n`;
+              md += '| Resource | Type | Action | Properties |\n|----------|------|--------|------------|\n';
               
-              // Resource table
-              if (stack.resources.length > 0) {
-                comment += '| Resource | Type | Change | Properties |\n';
-                comment += '|----------|------|--------|------------|\n';
+              for (const res of stack.resources) {
+                const icon = res.action === 'ADD' ? '🟢' : res.action === 'REMOVE' ? '🔴' : '🟡';
+                const props = res.properties.length 
+                  ? res.properties.map(p => `\`${p.name}\`${p.impact === 'WILL_REPLACE' ? ' ⚠️' : ''}`).join(', ')
+                  : res.action === 'ADD' ? '_(new)_' : res.action === 'REMOVE' ? '_(deleted)_' : '-';
                 
-                for (const res of stack.resources) {
-                  const icon = res.action === 'ADD' ? '🟢' : res.action === 'REMOVE' ? '🔴' : '🟡';
-                  const action = res.willReplace ? `${res.action} ⚠️ REPLACE` : res.action;
-                  
-                  // Format property changes
-                  let propChanges = '';
-                  if (res.properties.length > 0) {
-                    propChanges = res.properties.map(p => {
-                      let detail = `\`${p.name}\``;
-                      if (p.changeImpact === 'WILL_REPLACE') detail += ' ⚠️';
-                      return detail;
-                    }).join(', ');
-                  } else {
-                    propChanges = res.action === 'ADD' ? '_(new resource)_' : res.action === 'REMOVE' ? '_(deleted)_' : '-';
-                  }
-                  
-                  comment += `| \`${res.logicalId}\` | ${res.resourceType} | ${icon} ${action} | ${propChanges} |\n`;
-                }
-                comment += '\n';
+                md += `| \`${res.logicalId}\` | ${res.type} | ${icon} ${res.action} | ${props} |\n`;
               }
               
-              // IAM changes
-              if (stack.iamChanges.length > 0) {
-                comment += '<details>\n<summary>🔐 IAM Policy Changes</summary>\n\n';
-                for (const iam of stack.iamChanges) {
-                  const icon = iam.type === 'ADD' ? '➕' : '➖';
-                  comment += `${icon} **${iam.effect}** \`${iam.actions.slice(0, 3).join(', ')}${iam.actions.length > 3 ? '...' : ''}\`\n`;
-                }
-                comment += '\n</details>\n\n';
+              if (stack.drift) {
+                md += `\n**Drift:** ${stack.drift.status === 'DRIFTED' ? `⚠️ ${stack.drift.count} drifted` : '✅ IN_SYNC'}\n`;
               }
-              
-              // Security Group changes
-              if (stack.securityGroupChanges.length > 0) {
-                comment += '<details>\n<summary>🔒 Security Group Changes</summary>\n\n';
-                for (const sg of stack.securityGroupChanges) {
-                  const icon = sg.type === 'ADD' ? '➕' : '➖';
-                  comment += `${icon} ${sg.direction} ${sg.protocol} ${sg.ports}\n`;
-                }
-                comment += '\n</details>\n\n';
-              }
+              md += '\n';
             }
             
-            // Unchanged stacks (collapsed)
-            if (unchangedStacks.length > 0) {
-              comment += '<details>\n<summary>✅ Unchanged Stacks (' + unchangedStacks.length + ')</summary>\n\n';
-              for (const stack of unchangedStacks) {
-                comment += `- ${stack.stackName}\n`;
-              }
-              comment += '\n</details>\n\n';
+            // Unchanged stacks
+            if (unchanged.length > 0) {
+              md += `<details>\n<summary>✅ Unchanged (${unchanged.length})</summary>\n\n`;
+              for (const s of unchanged) md += `- ${s.stackName}\n`;
+              md += '\n</details>\n\n';
             }
             
-            // Drift section
-            if (data.drift && data.drift.length > 0) {
-              const driftedStacks = data.drift.filter(d => d.hasDrift);
-              if (driftedStacks.length > 0) {
-                comment += '### ⚠️ Drift Detected\n\n';
-                for (const drift of driftedStacks) {
-                  comment += `- **${drift.stackName}**: ${drift.summary.drifted} resource(s) drifted\n`;
-                }
-                comment += '\n';
-              } else {
-                comment += '✅ **No drift detected**\n\n';
-              }
-            }
+            md += `---\n_Generated at ${new Date().toISOString()}_`;
             
-            // Footer
-            comment += `---\n_Generated by CDK Diff at ${data.timestamp || new Date().toISOString()}_`;
-            
-            core.setOutput('comment', comment);
+            core.setOutput('comment', md);
 
-      # =====================================================================
-      # POST PR COMMENT
-      # =====================================================================
       - name: Post PR Comment
         uses: marocchino/sticky-pull-request-comment@v2
         with:
@@ -644,73 +439,27 @@ jobs:
           message: ${{ steps.comment.outputs.comment }}
 
       # =====================================================================
-      # SLACK NOTIFICATION (Optional)
+      # SLACK (Optional)
       # =====================================================================
-      - name: Check for Slack notification label
+      - name: Check Slack label
         id: check-label
         env:
           SLACK_WEBHOOK: ${{ secrets.slack-webhook-url }}
         uses: actions/github-script@v7
         with:
           script: |
-            // Check if webhook is configured
-            if (!process.env.SLACK_WEBHOOK) {
-              core.setOutput('should_notify', 'false');
-              return;
-            }
-            
-            const prNumber = ${{ inputs.pr-number || github.event.pull_request.number || 0 }};
-            if (!prNumber) {
-              core.setOutput('should_notify', 'false');
-              return;
-            }
-            
-            const { data: pr } = await github.rest.pulls.get({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              pull_number: prNumber,
-            });
-            
-            const hasLabel = pr.labels.some(l => l.name === '${{ inputs.slack-notify-label }}');
-            core.setOutput('should_notify', hasLabel ? 'true' : 'false');
+            if (!process.env.SLACK_WEBHOOK) { core.setOutput('notify', 'false'); return; }
+            const prNum = ${{ inputs.pr-number || github.event.pull_request.number || 0 }};
+            if (!prNum) { core.setOutput('notify', 'false'); return; }
+            const { data: pr } = await github.rest.pulls.get({ owner: context.repo.owner, repo: context.repo.repo, pull_number: prNum });
+            core.setOutput('notify', pr.labels.some(l => l.name === '${{ inputs.slack-notify-label }}') ? 'true' : 'false');
 
-      - name: Send Slack notification
-        if: steps.check-label.outputs.should_notify == 'true'
+      - name: Send Slack
+        if: steps.check-label.outputs.notify == 'true'
         uses: slackapi/slack-github-action@v1.25.0
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.slack-webhook-url }}
           SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
         with:
           payload: |
-            {
-              "blocks": [
-                {
-                  "type": "header",
-                  "text": {
-                    "type": "plain_text",
-                    "text": "🔍 CDK Diff Results",
-                    "emoji": true
-                  }
-                },
-                {
-                  "type": "section",
-                  "fields": [
-                    {
-                      "type": "mrkdwn",
-                      "text": "*Repository:*\n${{ github.repository }}"
-                    },
-                    {
-                      "type": "mrkdwn",
-                      "text": "*PR:*\n<${{ github.event.pull_request.html_url || format('https://github.com/{0}/pull/{1}', github.repository, inputs.pr-number) }}|#${{ inputs.pr-number || github.event.pull_request.number }}>"
-                    }
-                  ]
-                },
-                {
-                  "type": "section",
-                  "text": {
-                    "type": "mrkdwn",
-                    "text": "See the PR comment for detailed diff results."
-                  }
-                }
-              ]
-            }
+            {"blocks":[{"type":"header","text":{"type":"plain_text","text":"🔍 CDK Diff Results"}},{"type":"section","fields":[{"type":"mrkdwn","text":"*Repo:* ${{ github.repository }}"},{"type":"mrkdwn","text":"*PR:* <${{ github.event.pull_request.html_url || format('https://github.com/{0}/pull/{1}', github.repository, inputs.pr-number) }}|#${{ inputs.pr-number || github.event.pull_request.number }}>"}]},{"type":"section","text":{"type":"mrkdwn","text":"See PR comment for details."}}]}
