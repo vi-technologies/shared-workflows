@@ -16,7 +16,7 @@
 #       uses: vi-technologies/shared-workflows/.github/workflows/docker-build.yaml@main
 #       with:
 #         services-folder: jobs
-#         services-config: |
+#         ecr-services-repo-names: |
 #           {
 #             "bronze": { "staging": "staging_engage_bronze_etl", "production": "production_engage_bronze_etl" },
 #             "silver": { "staging": "staging_engage_silver_etl", "production": "production_engage_silver_etl" }
@@ -36,8 +36,8 @@ on:
         required: false
         type: string
         default: 'jobs'
-      services-config:
-        description: 'JSON mapping of service names to image names: {"service": {"staging": "image_name", "production": "image_name"}}'
+      ecr-services-repo-names:
+        description: 'JSON mapping of service names to ECR repo names: {"service": {"staging": "repo_name", "production": "repo_name"}}'
         required: true
         type: string
       aws-region:
@@ -97,7 +97,7 @@ jobs:
         id: detect
         env:
           SERVICES_FOLDER: ${{ inputs.services-folder }}
-          SERVICES_CONFIG: ${{ inputs.services-config }}
+          SERVICES_CONFIG: ${{ inputs.ecr-services-repo-names }}
           BUILD_ALL: ${{ inputs.build-all }}
           SHARED_PATHS: ${{ inputs.shared-paths }}
         run: |
@@ -220,7 +220,7 @@ jobs:
         uses: actions/github-script@v7
         env:
           SERVICES: ${{ needs.detect.outputs.services }}
-          SERVICES_CONFIG: ${{ inputs.services-config }}
+          SERVICES_CONFIG: ${{ inputs.ecr-services-repo-names }}
           CHANGED_FILES: ${{ needs.detect.outputs.changed_files }}
           SERVICES_FOLDER: ${{ inputs.services-folder }}
           COMMIT_SHA: ${{ github.event.pull_request.head.sha }}
@@ -346,7 +346,7 @@ jobs:
           TARGET_ENV: ${{ steps.env.outputs.TARGET_ENV }}
           AWS_ACCOUNT_ID: ${{ steps.env.outputs.AWS_ACCOUNT_ID }}
           AWS_REGION: ${{ inputs.aws-region }}
-          SERVICES_CONFIG: ${{ inputs.services-config }}
+          SERVICES_CONFIG: ${{ inputs.ecr-services-repo-names }}
         run: |
           # Get image name from services-config based on environment
           # Normalize environment name for config lookup
