@@ -363,65 +363,108 @@ jobs:
             try {
               data = JSON.parse(raw);
             } catch (e) {
-              core.setOutput('comment', `## 🔍 CDK Diff\n\n❌ Parse error: ${e.message}\n\n\`\`\`\n${raw.slice(0, 500)}\n\`\`\``);
+              core.setOutput('comment', `## 🔍 CDK Diff\n\n❌ Parse error: ${e.message}`);
               return;
             }
             
-            const accountNames = JSON.parse(process.env.ACCOUNT_NAMES || '{}');
-            const getEnv = (name) => name.toLowerCase().includes('prod') ? 'production' : name.toLowerCase().includes('staging') ? 'staging' : 'dev';
+            const getEnv = (name) => {
+              const n = name.toLowerCase();
+              if (n.includes('prod')) return 'production';
+              if (n.includes('staging')) return 'staging';
+              return 'dev';
+            };
             
-            let md = '## 🔍 CDK Diff Results\n\n';
+            // Clean up logical ID - remove CDK hash suffix
+            const cleanId = (id) => id.replace(/[A-F0-9]{8}$/i, '').replace(/([a-z])([A-Z])/g, '$1 $2');
+            
+            // Short type name
+            const shortType = (t) => t.split('::').pop();
+            
+            let md = '## 🔍 CDK Diff\n\n';
             
             if (!data.success) {
               md += `❌ **Error:** ${data.error}\n\n`;
+              core.setOutput('comment', md);
+              return;
             }
             
             const changed = data.stacks.filter(s => s.hasDiff);
             const unchanged = data.stacks.filter(s => !s.hasDiff);
             
-            // Summary
+            // Summary counts
             const adds = data.stacks.reduce((n, s) => n + s.resources.filter(r => r.action === 'ADD').length, 0);
             const updates = data.stacks.reduce((n, s) => n + s.resources.filter(r => r.action === 'UPDATE').length, 0);
             const removes = data.stacks.reduce((n, s) => n + s.resources.filter(r => r.action === 'REMOVE').length, 0);
             
             if (changed.length === 0) {
-              md += '✅ **No infrastructure changes**\n\n';
+              md += '✅ **No changes**\n';
             } else {
+              // Summary line
               const parts = [];
-              if (adds) parts.push(`➕ ${adds} add`);
-              if (updates) parts.push(`🔄 ${updates} update`);
-              if (removes) parts.push(`➖ ${removes} remove`);
-              md += `📊 **Summary:** ${parts.join(' | ')}\n\n`;
-            }
-            
-            // Changed stacks
-            for (const stack of changed) {
-              md += `### 📦 ${stack.stackName} _(${getEnv(stack.stackName)})_\n\n`;
-              md += '| Resource | Type | Action | Properties |\n|----------|------|--------|------------|\n';
+              if (adds) parts.push(`🟢 ${adds} to add`);
+              if (updates) parts.push(`🟡 ${updates} to update`);
+              if (removes) parts.push(`🔴 ${removes} to destroy`);
+              md += `**${parts.join(' · ')}**\n\n`;
               
-              for (const res of stack.resources) {
-                const icon = res.action === 'ADD' ? '🟢' : res.action === 'REMOVE' ? '🔴' : '🟡';
-                const props = res.properties.length 
-                  ? res.properties.map(p => `\`${p.name}\`${p.impact === 'WILL_REPLACE' ? ' ⚠️' : ''}`).join(', ')
-                  : res.action === 'ADD' ? '_(new)_' : res.action === 'REMOVE' ? '_(deleted)_' : '-';
+              // Each changed stack
+              for (const stack of changed) {
+                const env = getEnv(stack.stackName);
+                md += `### ${stack.stackName}\n`;
+                md += `> _${env}_`;
+                if (stack.drift) {
+                  md += stack.drift.status === 'DRIFTED' 
+                    ? ` · ⚠️ drift detected (${stack.drift.count})` 
+                    : ' · ✓ no drift';
+                }
+                md += '\n\n';
                 
-                md += `| \`${res.logicalId}\` | ${res.type} | ${icon} ${res.action} | ${props} |\n`;
+                // Group by action
+                const byAction = { ADD: [], UPDATE: [], REMOVE: [] };
+                for (const res of stack.resources) {
+                  byAction[res.action].push(res);
+                }
+                
+                // Adds
+                if (byAction.ADD.length) {
+                  md += '**➕ Create**\n';
+                  for (const r of byAction.ADD) {
+                    md += `- \`${shortType(r.type)}\` ${cleanId(r.logicalId)}\n`;
+                  }
+                  md += '\n';
+                }
+                
+                // Updates
+                if (byAction.UPDATE.length) {
+                  md += '**✏️ Update**\n';
+                  for (const r of byAction.UPDATE) {
+                    const props = r.properties.map(p => {
+                      const warn = p.impact === 'WILL_REPLACE' ? ' ⚠️replace' : '';
+                      return `\`${p.name}\`${warn}`;
+                    }).join(', ');
+                    md += `- \`${shortType(r.type)}\` ${cleanId(r.logicalId)}`;
+                    if (props) md += ` → ${props}`;
+                    md += '\n';
+                  }
+                  md += '\n';
+                }
+                
+                // Removes
+                if (byAction.REMOVE.length) {
+                  md += '**🗑️ Destroy**\n';
+                  for (const r of byAction.REMOVE) {
+                    md += `- \`${shortType(r.type)}\` ${cleanId(r.logicalId)}\n`;
+                  }
+                  md += '\n';
+                }
               }
-              
-              if (stack.drift) {
-                md += `\n**Drift:** ${stack.drift.status === 'DRIFTED' ? `⚠️ ${stack.drift.count} drifted` : '✅ IN_SYNC'}\n`;
-              }
-              md += '\n';
             }
             
-            // Unchanged stacks
+            // Unchanged stacks (collapsed)
             if (unchanged.length > 0) {
-              md += `<details>\n<summary>✅ Unchanged (${unchanged.length})</summary>\n\n`;
-              for (const s of unchanged) md += `- ${s.stackName}\n`;
-              md += '\n</details>\n\n';
+              md += `<details><summary>✅ ${unchanged.length} unchanged stacks</summary>\n\n`;
+              md += unchanged.map(s => `- ${s.stackName}`).join('\n');
+              md += '\n</details>\n';
             }
-            
-            md += `---\n_Generated at ${new Date().toISOString()}_`;
             
             core.setOutput('comment', md);
 
