@@ -278,7 +278,7 @@ jobs:
           elif [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             TARGET_ENV="staging"
           elif [ "${{ github.ref }}" = "refs/heads/main" ]; then
-            TARGET_ENV="prod"
+            TARGET_ENV="production"
           else
             TARGET_ENV="staging"
           fi
@@ -286,7 +286,7 @@ jobs:
           echo "TARGET_ENV=$TARGET_ENV" >> $GITHUB_OUTPUT
           
           # Select AWS account
-          if [ "$TARGET_ENV" = "prod" ]; then
+          if [ "$TARGET_ENV" = "production" ] || [ "$TARGET_ENV" = "prod" ]; then
             echo "AWS_ACCOUNT_ID=$AWS_ACCOUNT_PROD" >> $GITHUB_OUTPUT
           else
             echo "AWS_ACCOUNT_ID=$AWS_ACCOUNT_STAGING" >> $GITHUB_OUTPUT
