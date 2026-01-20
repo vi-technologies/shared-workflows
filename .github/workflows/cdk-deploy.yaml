@@ -134,8 +134,18 @@ jobs:
           aws-region: ${{ inputs.aws-region }}
 
       # =======================================================================
-      # CDK DIFF
+      # CDK SYNTH & DIFF (using toolkit-lib for structured output)
       # =======================================================================
+      - name: Checkout shared-workflows for formatter
+        uses: actions/checkout@v4
+        with:
+          repository: vi-technologies/shared-workflows
+          path: .shared-workflows
+          sparse-checkout: .github/scripts
+
+      - name: CDK Synth
+        run: npx cdk synth --quiet --output cdk.out
+
       - name: Run CDK diff
         id: diff
         env:
@@ -143,67 +153,49 @@ jobs:
         run: |
           echo "Running CDK diff for: $STACKS"
           
-          # Capture diff output
-          DIFF_OUTPUT=$(npx cdk diff $STACKS --no-color 2>&1 || true)
+          mkdir -p /tmp/cdk-runner && cd /tmp/cdk-runner
+          echo '{"type":"module","dependencies":{"@aws-cdk/toolkit-lib":"*"}}' > package.json
+          npm install --silent
           
-          # Save raw output for debugging
-          echo "$DIFF_OUTPUT" > diff_raw.txt
+          cat > run.js << 'SCRIPT'
+          import { Toolkit, StackSelectionStrategy } from '@aws-cdk/toolkit-lib';
+          const stacks = (process.env.STACKS || '').split(' ').filter(Boolean);
+          async function main() {
+            const output = { success: false, stacks: [], error: '' };
+            try {
+              const toolkit = new Toolkit({ ioHost: { notify: async () => {}, requestResponse: async (msg) => msg.defaultResponse } });
+              const cx = await toolkit.fromAssemblyDirectory(process.env.CDK_OUT);
+              const selector = stacks.length ? { strategy: StackSelectionStrategy.PATTERN_MUST_MATCH, patterns: stacks } : { strategy: StackSelectionStrategy.ALL_STACKS };
+              const diffResults = await toolkit.diff(cx, { stacks: selector });
+              const fmtVal = (v) => v === undefined || v === null ? null : typeof v === 'object' ? JSON.stringify(v) : String(v);
+              for (const [name, diff] of Object.entries(diffResults)) {
+                const result = { stackName: name, hasDiff: false, resources: [] };
+                for (const [logicalId, resDiff] of Object.entries(diff.resources?.diffs || {})) {
+                  const type = resDiff.resourceTypes?.newType || resDiff.resourceTypes?.oldType || 'Unknown';
+                  const action = resDiff.isAddition ? 'ADD' : resDiff.isRemoval ? 'REMOVE' : 'UPDATE';
+                  const properties = Object.entries(resDiff.propertyDiffs || {}).filter(([_, p]) => p.isDifferent).map(([n, p]) => ({ name: n, impact: p.changeImpact || 'UNKNOWN', oldValue: fmtVal(p.oldValue), newValue: fmtVal(p.newValue) }));
+                  result.resources.push({ logicalId, type, action, properties });
+                  result.hasDiff = true;
+                }
+                output.stacks.push(result);
+              }
+              output.success = true;
+            } catch (e) { output.error = e.message || String(e); }
+            console.log(JSON.stringify(output));
+          }
+          main();
+          SCRIPT
           
-          # Parse diff to extract meaningful changes (filter out warnings and noise)
-          # Note: grep -c outputs "0" but exits with code 1 when no matches, so we use || true and default to 0
-          ADDS=$(echo "$DIFF_OUTPUT" | grep -cE '^\s*\[\+\]\s*AWS::' || true)
-          ADDS=${ADDS:-0}
-          UPDATES=$(echo "$DIFF_OUTPUT" | grep -cE '^\s*\[~\]\s*AWS::' || true)
-          UPDATES=${UPDATES:-0}
-          DESTROYS=$(echo "$DIFF_OUTPUT" | grep -cE '^\s*\[-\]\s*AWS::' || true)
-          DESTROYS=${DESTROYS:-0}
+          cd ${{ github.workspace }}/${{ inputs.working-directory }}
+          CDK_OUT="$(pwd)/cdk.out" node /tmp/cdk-runner/run.js > /tmp/diff_result.json 2>&1 || true
+          RESULT=$(cat /tmp/diff_result.json | tail -1 || echo '{"success":false,"error":"no output","stacks":[]}')
           
-          # Extract resource changes WITH property details
-          # This captures both the resource line and the property changes below it
-          CHANGES=$(echo "$DIFF_OUTPUT" | awk '
-            /^\s*\[[+~-]\]\s*AWS::/ {
-              # Resource line - print it and set flag to capture property changes
-              gsub(/\s*\[\+\]/, "🟢"); gsub(/\s*\[~\]/, "🟡"); gsub(/\s*\[-\]/, "🔴");
-              gsub(/AWS::/, "");
-              print; 
-              in_resource=1; 
-              next
-            }
-            in_resource && /^\s*[└├│]/ {
-              # Property change lines (indented with tree characters)
-              gsub(/\[\+\]/, "→"); gsub(/\[-\]/, "←"); gsub(/\[~\]/, "↔");
-              print "  " $0
-            }
-            in_resource && /^[^ ]/ && !/^\s*[└├│]/ {
-              # Non-indented line that is not a tree char - end of this resource
-              in_resource=0
-            }
-            /^Stack / {
-              # Stack header
-              print ""; print "📦 " $0
-            }
-          ' | head -60 || echo "")
+          # Save for later steps
+          echo "$RESULT" > diff_result.json
           
-          # Build summary
-          TOTAL=$((ADDS + UPDATES + DESTROYS))
-          if [ "$TOTAL" -eq 0 ]; then
-            SUMMARY="✅ No infrastructure changes"
-          else
-            SUMMARY="📊 *${TOTAL} changes:* 🟢 ${ADDS} add | 🟡 ${UPDATES} update | 🔴 ${DESTROYS} destroy"
-          fi
-          
-          # Save formatted output
-          echo "$SUMMARY" > diff_summary.txt
-          if [ -n "$CHANGES" ]; then
-            echo "" >> diff_summary.txt
-            echo "$CHANGES" >> diff_summary.txt
-          fi
-          
-          # Output for subsequent steps
-          echo "total_changes=$TOTAL" >> $GITHUB_OUTPUT
-          echo "adds=$ADDS" >> $GITHUB_OUTPUT
-          echo "updates=$UPDATES" >> $GITHUB_OUTPUT
-          echo "destroys=$DESTROYS" >> $GITHUB_OUTPUT
+          echo "result<<EOF" >> $GITHUB_OUTPUT
+          echo "$RESULT" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
 
       # =======================================================================
       # CDK DEPLOY
@@ -226,13 +218,12 @@ jobs:
           echo "Would have deployed: ${{ inputs.stacks }}"
 
       # =======================================================================
-      # SLACK NOTIFICATION
+      # SLACK NOTIFICATION (using shared formatter)
       # =======================================================================
-      - name: Send Slack notification
+      - name: Format and send Slack notification
         if: always()
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.slack-webhook-url }}
-          STACKS: ${{ inputs.stacks }}
           JOB_STATUS: ${{ job.status }}
           DRY_RUN: ${{ inputs.dry-run }}
           REPO: ${{ github.repository }}
@@ -245,88 +236,28 @@ jobs:
             exit 0
           fi
           
-          # Read formatted diff summary
-          if [ -f diff_summary.txt ]; then
-            DIFF_CONTENT=$(cat diff_summary.txt | jq -Rs .)
+          # Read diff result
+          if [ -f diff_result.json ]; then
+            DIFF_JSON=$(cat diff_result.json)
           else
-            DIFF_CONTENT='"No changes detected"'
+            DIFF_JSON='{"success":true,"stacks":[]}'
           fi
           
-          # Format stacks as bullet list
-          STACKS_LIST=$(echo "$STACKS" | tr ' ' '\n' | sed '/^$/d' | sed 's/^/• /')
-          STACKS_ESCAPED=$(echo "$STACKS_LIST" | jq -Rs .)
-          
-          # Set status emoji and header
-          if [ "$JOB_STATUS" == "success" ]; then
-            if [ "$DRY_RUN" == "true" ]; then
-              HEADER="🔍 CDK Diff Complete (Dry Run)"
-            else
-              HEADER="✅ CDK Deploy Succeeded"
-            fi
-          else
-            HEADER="❌ CDK Deploy Failed"
-          fi
-          
-          # Build JSON payload
-          PAYLOAD=$(jq -n \
-            --arg header "$HEADER" \
+          # Build context for formatter
+          CONTEXT_JSON=$(jq -nc \
             --arg repo "$REPO" \
+            --arg runUrl "$RUN_URL" \
             --arg actor "$ACTOR" \
-            --argjson stacks "$STACKS_ESCAPED" \
-            --arg status "$JOB_STATUS" \
-            --argjson diff "$DIFF_CONTENT" \
-            --arg run_url "$RUN_URL" \
-            '{
-              "blocks": [
-                {
-                  "type": "header",
-                  "text": {
-                    "type": "plain_text",
-                    "text": $header,
-                    "emoji": true
-                  }
-                },
-                {
-                  "type": "section",
-                  "fields": [
-                    {
-                      "type": "mrkdwn",
-                      "text": ("*Repository:*\n`" + $repo + "`")
-                    },
-                    {
-                      "type": "mrkdwn",
-                      "text": ("*Triggered by:*\n" + $actor)
-                    }
-                  ]
-                },
-                {
-                  "type": "section",
-                  "text": {
-                    "type": "mrkdwn",
-                    "text": ("*Stacks:*\n" + $stacks)
-                  }
-                },
-                {
-                  "type": "divider"
-                },
-                {
-                  "type": "section",
-                  "text": {
-                    "type": "mrkdwn",
-                    "text": $diff
-                  }
-                },
-                {
-                  "type": "context",
-                  "elements": [
-                    {
-                      "type": "mrkdwn",
-                      "text": ("<" + $run_url + "|View workflow run>")
-                    }
-                  ]
-                }
-              ]
-            }')
+            --arg jobStatus "$JOB_STATUS" \
+            --argjson isDeployment true \
+            '{repo: $repo, runUrl: $runUrl, actor: $actor, jobStatus: $jobStatus, isDeployment: $isDeployment}')
           
-          # Send to Slack
+          # Use shared formatter script
+          FORMATTED=$(node ${{ github.workspace }}/.shared-workflows/.github/scripts/format-cdk-diff.js "$DIFF_JSON" "$CONTEXT_JSON")
+          
+          # Extract Slack blocks
+          SLACK_BLOCKS=$(echo "$FORMATTED" | jq -c '.slack_blocks')
+          
+          # Build and send payload
+          PAYLOAD=$(jq -nc --argjson blocks "$SLACK_BLOCKS" '{blocks: $blocks}')
           curl -X POST -H 'Content-type: application/json' --data "$PAYLOAD" "$SLACK_WEBHOOK_URL"

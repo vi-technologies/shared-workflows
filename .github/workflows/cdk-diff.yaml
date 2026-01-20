@@ -328,7 +328,7 @@ jobs:
           echo "EOF" >> $GITHUB_OUTPUT
 
   # ===========================================================================
-  # COMMENT: Post PR comment and Slack
+  # COMMENT: Post PR comment and Slack (using shared formatter)
   # ===========================================================================
   comment:
     name: Post Comment
@@ -338,146 +338,59 @@ jobs:
     permissions:
       pull-requests: write
     steps:
-      - name: Generate comment
-        id: comment
-        uses: actions/github-script@v7
+      - name: Checkout shared-workflows for formatter
+        uses: actions/checkout@v4
+        with:
+          repository: vi-technologies/shared-workflows
+          path: .shared-workflows
+          sparse-checkout: .github/scripts
+
+      - name: Generate comment and Slack blocks
+        id: format
         env:
           DIFF_SINGLE: ${{ needs.diff-single.outputs.result }}
           DIFF_MULTI: ${{ needs.aggregate.outputs.combined }}
-        with:
-          script: |
-            const raw = process.env.DIFF_SINGLE || process.env.DIFF_MULTI;
-            if (!raw) { core.setOutput('comment', '## 🔍 CDK Diff\n\n⚠️ No diff results'); return; }
-            
-            let data;
-            try { data = JSON.parse(raw); } catch (e) { core.setOutput('comment', `## 🔍 CDK Diff\n\n❌ Parse error`); return; }
-            
-            const getEnv = (n) => n.toLowerCase().includes('prod') ? 'production' : n.toLowerCase().includes('staging') ? 'staging' : 'dev';
-            const cleanId = (id) => id.replace(/[A-F0-9]{8}$/i, '').replace(/([a-z])([A-Z])/g, '$1 $2');
-            const shortType = (t) => t.split('::').pop();
-            
-            let md = '## 🔍 CDK Diff\n\n';
-            if (!data.success) { md += `❌ **Error:** ${data.error}\n`; core.setOutput('comment', md); return; }
-            
-            const changed = data.stacks.filter(s => s.hasDiff);
-            const unchanged = data.stacks.filter(s => !s.hasDiff);
-            const adds = data.stacks.reduce((n, s) => n + s.resources.filter(r => r.action === 'ADD').length, 0);
-            const updates = data.stacks.reduce((n, s) => n + s.resources.filter(r => r.action === 'UPDATE').length, 0);
-            const removes = data.stacks.reduce((n, s) => n + s.resources.filter(r => r.action === 'REMOVE').length, 0);
-            
-            if (changed.length === 0) { md += '✅ **No changes**\n'; }
-            else {
-              const parts = [];
-              if (adds) parts.push(`🟢 ${adds} to add`);
-              if (updates) parts.push(`🟡 ${updates} to update`);
-              if (removes) parts.push(`🔴 ${removes} to destroy`);
-              md += `**${parts.join(' · ')}**\n\n`;
-              
-              for (const stack of changed) {
-                md += `### ${stack.stackName}\n> _${getEnv(stack.stackName)}_`;
-                if (stack.drift) md += stack.drift.status === 'DRIFTED' ? ` · ⚠️ drift (${stack.drift.count})` : ' · ✓ no drift';
-                md += '\n\n';
-                
-                const byAction = { ADD: [], UPDATE: [], REMOVE: [] };
-                for (const res of stack.resources) byAction[res.action].push(res);
-                
-                if (byAction.ADD.length) {
-                  md += '**➕ Create**\n';
-                  for (const r of byAction.ADD) {
-                    md += `- \`${shortType(r.type)}\` **${cleanId(r.logicalId)}**\n`;
-                    for (const p of r.properties) if (p.newValue) md += `  - \`${p.name}\`: \`${p.newValue}\`\n`;
-                  }
-                  md += '\n';
-                }
-                if (byAction.UPDATE.length) {
-                  md += '**✏️ Update**\n';
-                  for (const r of byAction.UPDATE) {
-                    md += `- \`${shortType(r.type)}\` **${cleanId(r.logicalId)}**${r.properties.some(p => p.impact === 'WILL_REPLACE') ? ' ⚠️' : ''}\n`;
-                    for (const p of r.properties) {
-                      const warn = p.impact === 'WILL_REPLACE' ? ' ⚠️' : '';
-                      md += `  - \`${p.name}\`${warn}\n`;
-                      md += `    | | |\n    |---|---|\n`;
-                      md += `    | **OLD** | \`${p.oldValue || '(none)'}\` |\n`;
-                      md += `    | **NEW** | \`${p.newValue || '(removed)'}\` |\n\n`;
-                    }
-                  }
-                  md += '\n';
-                }
-                if (byAction.REMOVE.length) {
-                  md += '**🗑️ Destroy**\n';
-                  for (const r of byAction.REMOVE) md += `- \`${shortType(r.type)}\` **${cleanId(r.logicalId)}**\n`;
-                  md += '\n';
-                }
-              }
-            }
-            if (unchanged.length) md += `<details><summary>✅ ${unchanged.length} unchanged</summary>\n\n${unchanged.map(s => `- ${s.stackName}`).join('\n')}\n</details>\n`;
-            
-            core.setOutput('comment', md);
-            
-            // Slack
-            const prUrl = '${{ github.event.pull_request.html_url || format('https://github.com/{0}/pull/{1}', github.repository, inputs.pr-number) }}';
-            const prNum = '${{ inputs.pr-number || github.event.pull_request.number }}';
-            const repo = '${{ github.repository }}';
-            const runUrl = '${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}';
-            
-            const blocks = [
-              { type: 'header', text: { type: 'plain_text', text: '🔍 CDK Diff', emoji: true } },
-              { type: 'context', elements: [{ type: 'mrkdwn', text: `<${prUrl}|PR #${prNum}> in \`${repo}\`` }] },
-              { type: 'section', fields: [
-                { type: 'mrkdwn', text: `🟢 *Add*\n${adds}` }, { type: 'mrkdwn', text: `🟡 *Update*\n${updates}` },
-                { type: 'mrkdwn', text: `🔴 *Remove*\n${removes}` }, { type: 'mrkdwn', text: `📦 *Stacks*\n${changed.length}` }
-              ]},
-              { type: 'actions', elements: [
-                { type: 'button', text: { type: 'plain_text', text: 'View PR' }, url: prUrl },
-                { type: 'button', text: { type: 'plain_text', text: 'Workflow' }, url: runUrl }
-              ]}
-            ];
-            
-            for (const stack of changed.slice(0, 5)) {
-              blocks.push({ type: 'divider' });
-              let txt = `📦 *${stack.stackName}* _(${getEnv(stack.stackName)})_`;
-              const byAction = { ADD: [], UPDATE: [], REMOVE: [] };
-              for (const res of stack.resources) byAction[res.action].push(res);
-              
-              if (byAction.ADD.length) {
-                txt += '\n🟢 *Create*';
-                for (const r of byAction.ADD) {
-                  txt += `\n• \`${shortType(r.type)}\` *${cleanId(r.logicalId)}*`;
-                  for (const p of r.properties.slice(0, 3)) {
-                    if (p.newValue) txt += `\n   \`${p.name}\`:\n\`\`\`${p.newValue}\`\`\``;
-                  }
-                  if (r.properties.length > 3) txt += `\n   _+${r.properties.length - 3} more..._`;
-                }
-              }
-              if (byAction.UPDATE.length) {
-                txt += '\n🟡 *Update*';
-                for (const r of byAction.UPDATE) {
-                  txt += `\n• \`${shortType(r.type)}\` *${cleanId(r.logicalId)}*`;
-                  for (const p of r.properties.slice(0, 2)) {
-                    txt += `\n   \`${p.name}\`${p.impact === 'WILL_REPLACE' ? ' ⚠️' : ''}`;
-                    txt += `\n   *OLD:*\n\`\`\`${p.oldValue || '(none)'}\`\`\``;
-                    txt += `\n   *NEW:*\n\`\`\`${p.newValue || '(removed)'}\`\`\``;
-                  }
-                  if (r.properties.length > 2) txt += `\n   _+${r.properties.length - 2} more properties..._`;
-                }
-              }
-              if (byAction.REMOVE.length) {
-                txt += '\n🔴 *Destroy*';
-                for (const r of byAction.REMOVE) txt += `\n• \`${shortType(r.type)}\` *${cleanId(r.logicalId)}*`;
-              }
-              
-              blocks.push({ type: 'section', text: { type: 'mrkdwn', text: txt } });
-            }
-            if (changed.length > 5) blocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: `_+${changed.length - 5} more stacks..._` }] });
-            
-            core.setOutput('slack_blocks', JSON.stringify(blocks));
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          PR_NUM: ${{ inputs.pr-number || github.event.pull_request.number }}
+        run: |
+          DIFF_JSON="${DIFF_SINGLE:-$DIFF_MULTI}"
+          if [ -z "$DIFF_JSON" ]; then
+            echo "comment=## 🔍 CDK Diff\n\n⚠️ No diff results" >> $GITHUB_OUTPUT
+            echo 'slack_blocks=[]' >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          # Build context for formatter
+          CONTEXT_JSON=$(jq -nc \
+            --arg repo "$REPO" \
+            --arg runUrl "$RUN_URL" \
+            --arg prUrl "$PR_URL" \
+            --arg prNum "$PR_NUM" \
+            --argjson isDeployment false \
+            '{repo: $repo, runUrl: $runUrl, prUrl: $prUrl, prNum: $prNum, isDeployment: $isDeployment}')
+          
+          # Use shared formatter script
+          FORMATTED=$(node .shared-workflows/.github/scripts/format-cdk-diff.js "$DIFF_JSON" "$CONTEXT_JSON")
+          
+          # Extract outputs
+          MARKDOWN=$(echo "$FORMATTED" | jq -r '.markdown')
+          SLACK_BLOCKS=$(echo "$FORMATTED" | jq -c '.slack_blocks')
+          
+          # Save outputs (use delimiter for multiline)
+          echo "comment<<COMMENT_EOF" >> $GITHUB_OUTPUT
+          echo "$MARKDOWN" >> $GITHUB_OUTPUT
+          echo "COMMENT_EOF" >> $GITHUB_OUTPUT
+          
+          echo "slack_blocks=$SLACK_BLOCKS" >> $GITHUB_OUTPUT
 
       - name: Post PR comment
         uses: marocchino/sticky-pull-request-comment@v2
         with:
           header: cdk-diff
           number: ${{ inputs.pr-number || github.event.pull_request.number }}
-          message: ${{ steps.comment.outputs.comment }}
+          message: ${{ steps.format.outputs.comment }}
 
       - name: Check Slack label
         id: check-label
@@ -494,9 +407,8 @@ jobs:
 
       - name: Send Slack
         if: steps.check-label.outputs.notify == 'true'
-        uses: slackapi/slack-github-action@v1.25.0
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.slack-webhook-url }}
-          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
-        with:
-          payload: '{"blocks": ${{ steps.comment.outputs.slack_blocks }} }'
+        run: |
+          PAYLOAD=$(jq -nc --argjson blocks '${{ steps.format.outputs.slack_blocks }}' '{blocks: $blocks}')
+          curl -X POST -H 'Content-type: application/json' --data "$PAYLOAD" "$SLACK_WEBHOOK_URL"
