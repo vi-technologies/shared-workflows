@@ -151,9 +151,11 @@ jobs:
               echo "  Analyzing: $file"
               
               # Use jq to find matching patterns
+              # Note: .key must be captured in $k first, otherwise it's evaluated in wrong context
               MATCHING_STACKS=$(echo "$STACK_MAPPINGS" | jq -r --arg file "$file" '
                 to_entries[] | 
-                select($file | startswith(.key)) | 
+                .key as $k | 
+                select($file | startswith($k)) | 
                 .value[] 
               ' 2>/dev/null || true)
               
