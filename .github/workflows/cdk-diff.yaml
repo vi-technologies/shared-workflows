@@ -795,14 +795,21 @@ jobs:
                         let oldVal, newVal;
                         if (prop.isUnifiedDiff) {
                           // Unified diff: show full values
-                          oldVal = prop.oldValue ? `\`${prop.oldValue.replace(/\n/g, ' ')}\`` : '_(none)_';
+                          if (prop.oldValue) {
+                            oldVal = `\`${prop.oldValue.replace(/\n/g, ' ')}\``;
+                          } else if (res.action === 'Modify' && prop.newValue) {
+                            oldVal = '_(existing)_';
+                          } else {
+                            oldVal = '_(none)_';
+                          }
                           newVal = prop.newValue ? `\`${prop.newValue.replace(/\n/g, ' ')}\`` : '_(removed)_';
                         } else {
                           // Simple change
                           if (prop.oldValue != null) {
                             oldVal = `\`${prop.oldValue}\``;
-                          } else if (prop.propAction === '~' && prop.newValue != null) {
-                            // Modification with only additions shown (e.g., adding to existing policy)
+                          } else if (res.action === 'Modify' && prop.newValue != null) {
+                            // Resource is being modified, property has additions but no removals
+                            // This means we're adding to an existing value (e.g., adding to existing policy)
                             oldVal = '_(existing)_';
                           } else {
                             oldVal = '_(not set)_';
