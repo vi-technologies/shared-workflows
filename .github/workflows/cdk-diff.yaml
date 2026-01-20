@@ -648,10 +648,17 @@ jobs:
       # =====================================================================
       - name: Check for Slack notification label
         id: check-label
-        if: secrets.slack-webhook-url != ''
+        env:
+          SLACK_WEBHOOK: ${{ secrets.slack-webhook-url }}
         uses: actions/github-script@v7
         with:
           script: |
+            // Check if webhook is configured
+            if (!process.env.SLACK_WEBHOOK) {
+              core.setOutput('should_notify', 'false');
+              return;
+            }
+            
             const prNumber = ${{ inputs.pr-number || github.event.pull_request.number || 0 }};
             if (!prNumber) {
               core.setOutput('should_notify', 'false');
@@ -668,7 +675,7 @@ jobs:
             core.setOutput('should_notify', hasLabel ? 'true' : 'false');
 
       - name: Send Slack notification
-        if: steps.check-label.outputs.should_notify == 'true' && secrets.slack-webhook-url != ''
+        if: steps.check-label.outputs.should_notify == 'true'
         uses: slackapi/slack-github-action@v1.25.0
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.slack-webhook-url }}
