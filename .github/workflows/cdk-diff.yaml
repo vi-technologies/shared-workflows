@@ -497,27 +497,84 @@ jobs:
             
             core.setOutput('comment', md);
             
-            // Generate simple Slack message
+            // Generate Slack message with resource details
             const prUrl = '${{ github.event.pull_request.html_url || format('https://github.com/{0}/pull/{1}', github.repository, inputs.pr-number) }}';
             const prNum = '${{ inputs.pr-number || github.event.pull_request.number }}';
             const repo = '${{ github.repository }}';
-            
-            // Build a clean, simple stack list
-            const stackList = changed.map(s => `• *${s.stackName}* _(${getEnv(s.stackName)})_`).join('\n');
+            const runUrl = '${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}';
             
             const blocks = [
-              { type: 'header', text: { type: 'plain_text', text: '🔍 CDK Diff', emoji: true } },
-              { type: 'section', text: { type: 'mrkdwn', text: `<${prUrl}|*${repo} #${prNum}*>` } },
-              { type: 'section', fields: [
-                { type: 'mrkdwn', text: `*🟢 Add*\n${adds}` },
-                { type: 'mrkdwn', text: `*🟡 Update*\n${updates}` },
-                { type: 'mrkdwn', text: `*🔴 Remove*\n${removes}` },
-                { type: 'mrkdwn', text: `*📦 Stacks*\n${changed.length}` }
-              ]},
+              { type: 'header', text: { type: 'plain_text', text: '🔍 CDK Diff Preview', emoji: true } },
+              { type: 'context', elements: [{ type: 'mrkdwn', text: `👤 opened <${prUrl}|PR #${prNum}> in \`${repo}\`` }] },
               { type: 'divider' },
-              { type: 'section', text: { type: 'mrkdwn', text: stackList || '_No changes_' } },
-              { type: 'context', elements: [{ type: 'mrkdwn', text: '_See PR comment for full details_' }] }
+              { type: 'section', fields: [
+                { type: 'mrkdwn', text: `🟢 *Additions*\n${adds} resources` },
+                { type: 'mrkdwn', text: `🟡 *Updates*\n${updates} resources` },
+                { type: 'mrkdwn', text: `🔴 *Deletions*\n${removes} resources` },
+                { type: 'mrkdwn', text: `📦 *Stacks*\n${changed.length} affected` }
+              ]},
+              { type: 'actions', elements: [
+                { type: 'button', text: { type: 'plain_text', text: '📄 View PR', emoji: true }, url: prUrl },
+                { type: 'button', text: { type: 'plain_text', text: '⚙️ View Workflow', emoji: true }, url: runUrl }
+              ]}
             ];
+            
+            // Add stack details (one text block per stack to stay under 50 block limit)
+            for (const stack of changed) {
+              blocks.push({ type: 'divider' });
+              
+              // Stack header
+              let stackText = `📦 *${stack.stackName}*\n_${getEnv(stack.stackName)}_`;
+              if (stack.drift) {
+                stackText += stack.drift.status === 'DRIFTED' 
+                  ? ` · ⚠️ drift detected (${stack.drift.count})`
+                  : ' · ✓ no drift';
+              }
+              
+              // Group resources by action
+              const byAction = { ADD: [], UPDATE: [], REMOVE: [] };
+              for (const res of stack.resources) {
+                byAction[res.action].push(res);
+              }
+              
+              // Build resource text
+              let resourceText = '';
+              
+              if (byAction.ADD.length > 0) {
+                resourceText += '\n\n🟢 *Create*\n';
+                for (const r of byAction.ADD) {
+                  resourceText += `• \`${shortType(r.type)}\` *${cleanId(r.logicalId)}*\n`;
+                }
+              }
+              
+              if (byAction.UPDATE.length > 0) {
+                resourceText += '\n🟡 *Update*\n';
+                for (const r of byAction.UPDATE) {
+                  resourceText += `• \`${shortType(r.type)}\` *${cleanId(r.logicalId)}*\n`;
+                  for (const p of r.properties) {
+                    const replaceWarn = p.impact === 'WILL_REPLACE' ? ' ⚠️replace' : '';
+                    resourceText += `   \`${p.name}\`${replaceWarn}\n`;
+                    resourceText += `   *OLD:* ${p.oldValue || '_(none)_'}\n`;
+                    resourceText += `   *NEW:* ${p.newValue || '_(removed)_'}\n`;
+                  }
+                }
+              }
+              
+              if (byAction.REMOVE.length > 0) {
+                resourceText += '\n🔴 *Destroy*\n';
+                for (const r of byAction.REMOVE) {
+                  resourceText += `• \`${shortType(r.type)}\` *${cleanId(r.logicalId)}*\n`;
+                }
+              }
+              
+              blocks.push({ type: 'section', text: { type: 'mrkdwn', text: stackText + resourceText } });
+              
+              // Safety: stop if we're getting close to 50 block limit
+              if (blocks.length >= 45) {
+                blocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: '_...more stacks in PR comment_' }] });
+                break;
+              }
+            }
             
             core.setOutput('slack_blocks', JSON.stringify(blocks));
 
