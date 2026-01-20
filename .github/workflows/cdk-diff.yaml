@@ -536,22 +536,54 @@ jobs:
                 accessory: { type: 'button', text: { type: 'plain_text', text: getEnv(stack.stackName) }, style: 'primary', action_id: `stack_${stack.stackName}` }
               });
               
+              // Group resources by action
+              const byAction = { ADD: [], UPDATE: [], REMOVE: [] };
               for (const res of stack.resources) {
-                const icon = res.action === 'ADD' ? '🟢' : res.action === 'REMOVE' ? '🔴' : '🟡';
-                let text = `${icon} \`${res.type}\` *${cleanId(res.logicalId)}*`;
-                
-                // Add property changes
-                if (res.properties.length > 0) {
-                  const propDetails = res.properties.map(p => {
-                    if (p.oldValue && p.newValue) return `\`${p.name}\`: ${p.oldValue} → ${p.newValue}`;
-                    if (p.newValue) return `\`${p.name}\`: → ${p.newValue}`;
-                    if (p.oldValue) return `\`${p.name}\`: ${p.oldValue} → _(removed)_`;
-                    return `\`${p.name}\``;
-                  }).join('\n');
-                  text += `\n${propDetails}`;
+                byAction[res.action].push(res);
+              }
+              
+              // Additions
+              if (byAction.ADD.length > 0) {
+                blocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: '🟢 *Additions*' }] });
+                const fields = byAction.ADD.map(r => ({ type: 'mrkdwn', text: `\`${shortType(r.type)}\`\n${cleanId(r.logicalId)}` }));
+                // Block Kit allows max 10 fields per section
+                for (let i = 0; i < fields.length; i += 10) {
+                  blocks.push({ type: 'section', fields: fields.slice(i, i + 10) });
                 }
-                
-                blocks.push({ type: 'section', text: { type: 'mrkdwn', text } });
+              }
+              
+              // Updates with property details
+              if (byAction.UPDATE.length > 0) {
+                blocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: '🟡 *Updates*' }] });
+                for (const res of byAction.UPDATE) {
+                  const propFields = res.properties.map(p => {
+                    let val;
+                    if (p.oldValue && p.newValue) val = `${p.oldValue} → ${p.newValue}`;
+                    else if (p.newValue) val = `→ ${p.newValue}`;
+                    else if (p.oldValue) val = `${p.oldValue} → _(removed)_`;
+                    else val = '_(changed)_';
+                    return { type: 'mrkdwn', text: `*${p.name}*\n${val}` };
+                  });
+                  
+                  blocks.push({
+                    type: 'section',
+                    text: { type: 'mrkdwn', text: `\`${shortType(res.type)}\` *${cleanId(res.logicalId)}*` }
+                  });
+                  
+                  // Add property fields in chunks of 10
+                  for (let i = 0; i < propFields.length; i += 10) {
+                    blocks.push({ type: 'section', fields: propFields.slice(i, i + 10) });
+                  }
+                }
+              }
+              
+              // Deletions
+              if (byAction.REMOVE.length > 0) {
+                blocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: '🔴 *Deletions*' }] });
+                const fields = byAction.REMOVE.map(r => ({ type: 'mrkdwn', text: `\`${shortType(r.type)}\`\n${cleanId(r.logicalId)}` }));
+                for (let i = 0; i < fields.length; i += 10) {
+                  blocks.push({ type: 'section', fields: fields.slice(i, i + 10) });
+                }
               }
             }
             
