@@ -1,7 +1,8 @@
 # =============================================================================
 # CDK DIFF WORKFLOW (using @aws-cdk/toolkit-lib)
 # =============================================================================
-# Uses the CDK Toolkit Library for structured, reliable diff output.
+# Runs CDK diff in parallel for each account using matrix strategy.
+# Each account gets its own OIDC authentication - no cross-account trust needed.
 # =============================================================================
 
 name: CDK Diff
@@ -74,233 +75,108 @@ on:
         required: false
         type: string
         default: 'slack-notify'
-      slack-channel-name:
-        description: 'Slack channel name'
-        required: false
-        type: string
-        default: 'devops'
     secrets:
       slack-webhook-url:
         description: 'Slack webhook URL'
         required: false
 
 jobs:
-  diff:
+  # ===========================================================================
+  # PREPARE: Build matrix of accounts to diff
+  # ===========================================================================
+  prepare:
+    name: Prepare
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+      is-multi-account: ${{ steps.matrix.outputs.is_multi }}
+    steps:
+      - name: Build matrix
+        id: matrix
+        run: |
+          if [ -n '${{ inputs.aws-role-arns }}' ] && [ -n '${{ inputs.stacks-per-account }}' ]; then
+            echo "is_multi=true" >> $GITHUB_OUTPUT
+            # Build matrix from role ARNs and stacks
+            MATRIX=$(echo '${{ inputs.aws-role-arns }}' | jq -c --argjson stacks '${{ inputs.stacks-per-account }}' '
+              to_entries | map({
+                account: .key,
+                role: .value,
+                stacks: ($stacks[.key] // "")
+              }) | {include: .}
+            ')
+            echo "matrix=$MATRIX" >> $GITHUB_OUTPUT
+          else
+            echo "is_multi=false" >> $GITHUB_OUTPUT
+            echo 'matrix={"include":[]}' >> $GITHUB_OUTPUT
+          fi
+
+  # ===========================================================================
+  # SINGLE ACCOUNT MODE
+  # ===========================================================================
+  diff-single:
     name: CDK Diff
+    if: needs.prepare.outputs.is-multi-account == 'false' && inputs.aws-role-arn != ''
+    needs: prepare
     runs-on: ubuntu-latest
     permissions:
       id-token: write
       contents: read
       pull-requests: write
+    outputs:
+      result: ${{ steps.diff.outputs.result }}
     defaults:
       run:
         working-directory: ${{ inputs.working-directory }}
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Setup Python
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         if: inputs.python-version != ''
-        uses: actions/setup-python@v5
         with:
           python-version: ${{ inputs.python-version }}
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: ${{ inputs.node-version }}
-
-      - name: Install dependencies
-        run: ${{ inputs.install-command }}
-
-      - name: Install CDK tools
-        run: |
-          npm install -g aws-cdk
-          npm install -g @aws-cdk/toolkit-lib typescript ts-node @types/node
-
-      # =====================================================================
-      # SINGLE ACCOUNT MODE
-      # =====================================================================
-      - name: Configure AWS credentials (single account)
-        if: inputs.aws-role-arn != '' && inputs.aws-role-arns == ''
-        uses: aws-actions/configure-aws-credentials@v4
+      - run: ${{ inputs.install-command }}
+      - run: npm install -g aws-cdk
+      - uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ inputs.aws-role-arn }}
           role-duration-seconds: 3600
           aws-region: ${{ inputs.aws-region }}
-
-      - name: Run CDK Diff (single account)
-        if: inputs.aws-role-arn != '' && inputs.aws-role-arns == ''
-        id: single-diff
+      - name: Run diff
+        id: diff
         env:
           STACKS: ${{ inputs.stacks }}
           ENABLE_DRIFT: ${{ inputs.enable-drift-detection }}
         run: |
-          # Synth
           npx cdk synth --quiet --output cdk.out
           
-          # Create temp project for toolkit
-          mkdir -p /tmp/cdk-diff-runner
-          cd /tmp/cdk-diff-runner
-          
-          cat > package.json << 'PKG'
-          {"type":"module","dependencies":{"@aws-cdk/toolkit-lib":"*"}}
-          PKG
-          
-          npm install --silent
-          
-          cat > run.js << 'SCRIPT'
-          import { Toolkit, StackSelectionStrategy } from '@aws-cdk/toolkit-lib';
-          
-          const stacks = (process.env.STACKS || '').split(' ').filter(Boolean);
-          const enableDrift = process.env.ENABLE_DRIFT === 'true';
-          const assemblyDir = process.env.CDK_OUT;
-          
-          async function main() {
-            const output = { success: false, stacks: [], error: '' };
-            
-            try {
-              const toolkit = new Toolkit({
-                ioHost: {
-                  notify: async () => {},
-                  requestResponse: async (msg) => msg.defaultResponse,
-                },
-              });
-              
-              const cx = await toolkit.fromAssemblyDirectory(assemblyDir);
-              const selector = stacks.length
-                ? { strategy: StackSelectionStrategy.PATTERN_MUST_MATCH, patterns: stacks }
-                : { strategy: StackSelectionStrategy.ALL_STACKS };
-              
-              const diffResults = await toolkit.diff(cx, { stacks: selector });
-              
-              for (const [name, diff] of Object.entries(diffResults)) {
-                const result = { stackName: name, hasDiff: false, resources: [] };
-                
-                for (const [logicalId, resDiff] of Object.entries(diff.resources?.diffs || {})) {
-                  const type = resDiff.resourceTypes?.newType || resDiff.resourceTypes?.oldType || 'Unknown';
-                  const action = resDiff.isAddition ? 'ADD' : resDiff.isRemoval ? 'REMOVE' : 'UPDATE';
-                  
-                  // Format value for display
-                  const fmtVal = (v) => {
-                    if (v === undefined || v === null) return null;
-                    return typeof v === 'object' ? JSON.stringify(v) : String(v);
-                  };
-                  
-                  const properties = Object.entries(resDiff.propertyDiffs || {})
-                    .filter(([_, p]) => p.isDifferent)
-                    .map(([propName, p]) => ({
-                      name: propName,
-                      impact: p.changeImpact || 'UNKNOWN',
-                      oldValue: fmtVal(p.oldValue),
-                      newValue: fmtVal(p.newValue)
-                    }));
-                  
-                  result.resources.push({ logicalId, type, action, properties });
-                  result.hasDiff = true;
-                }
-                
-                output.stacks.push(result);
-              }
-              
-              // Drift detection
-              if (enableDrift) {
-                try {
-                  const driftResults = await toolkit.drift(cx, { stacks: selector });
-                  for (const [name, driftInfo] of Object.entries(driftResults)) {
-                    const stack = output.stacks.find(s => s.stackName === name);
-                    if (stack) {
-                      stack.drift = {
-                        status: (driftInfo.numResourcesWithDrift || 0) > 0 ? 'DRIFTED' : 'IN_SYNC',
-                        count: driftInfo.numResourcesWithDrift || 0
-                      };
-                    }
-                  }
-                } catch (e) {
-                  // Drift failed, skip
-                }
-              }
-              
-              output.success = true;
-            } catch (e) {
-              output.error = e.message || String(e);
-            }
-            
-            console.log(JSON.stringify(output));
-          }
-          
-          main();
-          SCRIPT
-          
-          cd ${{ github.workspace }}/${{ inputs.working-directory }}
-          CDK_OUT="$(pwd)/cdk.out" node /tmp/cdk-diff-runner/run.js > /tmp/diff-output.json 2>/tmp/diff-stderr.txt || true
-          
-          if [ -s /tmp/diff-output.json ]; then
-            RESULT=$(cat /tmp/diff-output.json | tail -1)
-          else
-            STDERR=$(cat /tmp/diff-stderr.txt 2>/dev/null || echo "unknown error")
-            RESULT='{"success":false,"error":"'"${STDERR//\"/\\\"}"'","stacks":[]}'
-          fi
-          
-          echo "diff_result<<EOF" >> $GITHUB_OUTPUT
-          echo "$RESULT" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
-
-      # =====================================================================
-      # MULTI-ACCOUNT MODE  
-      # =====================================================================
-      - name: Setup toolkit runner (multi-account)
-        if: inputs.aws-role-arns != '' && inputs.stacks-per-account != ''
-        run: |
-          mkdir -p /tmp/cdk-diff-runner
-          cd /tmp/cdk-diff-runner
+          mkdir -p /tmp/cdk-runner && cd /tmp/cdk-runner
           echo '{"type":"module","dependencies":{"@aws-cdk/toolkit-lib":"*"}}' > package.json
           npm install --silent
           
           cat > run.js << 'SCRIPT'
           import { Toolkit, StackSelectionStrategy } from '@aws-cdk/toolkit-lib';
-          
           const stacks = (process.env.STACKS || '').split(' ').filter(Boolean);
           const enableDrift = process.env.ENABLE_DRIFT === 'true';
-          const assemblyDir = process.env.CDK_OUT;
-          
           async function main() {
             const output = { success: false, stacks: [], error: '' };
             try {
-              const toolkit = new Toolkit({
-                ioHost: { notify: async () => {}, requestResponse: async (msg) => msg.defaultResponse },
-              });
-              const cx = await toolkit.fromAssemblyDirectory(assemblyDir);
-              const selector = stacks.length
-                ? { strategy: StackSelectionStrategy.PATTERN_MUST_MATCH, patterns: stacks }
-                : { strategy: StackSelectionStrategy.ALL_STACKS };
+              const toolkit = new Toolkit({ ioHost: { notify: async () => {}, requestResponse: async (msg) => msg.defaultResponse } });
+              const cx = await toolkit.fromAssemblyDirectory(process.env.CDK_OUT);
+              const selector = stacks.length ? { strategy: StackSelectionStrategy.PATTERN_MUST_MATCH, patterns: stacks } : { strategy: StackSelectionStrategy.ALL_STACKS };
               const diffResults = await toolkit.diff(cx, { stacks: selector });
-              
-              const fmtVal = (v) => {
-                if (v === undefined || v === null) return null;
-                return typeof v === 'object' ? JSON.stringify(v) : String(v);
-              };
+              const fmtVal = (v) => v === undefined || v === null ? null : typeof v === 'object' ? JSON.stringify(v) : String(v);
               for (const [name, diff] of Object.entries(diffResults)) {
                 const result = { stackName: name, hasDiff: false, resources: [] };
                 for (const [logicalId, resDiff] of Object.entries(diff.resources?.diffs || {})) {
                   const type = resDiff.resourceTypes?.newType || resDiff.resourceTypes?.oldType || 'Unknown';
                   const action = resDiff.isAddition ? 'ADD' : resDiff.isRemoval ? 'REMOVE' : 'UPDATE';
-                  const properties = Object.entries(resDiff.propertyDiffs || {})
-                    .filter(([_, p]) => p.isDifferent)
-                    .map(([propName, p]) => ({ name: propName, impact: p.changeImpact || 'UNKNOWN', oldValue: fmtVal(p.oldValue), newValue: fmtVal(p.newValue) }));
+                  const properties = Object.entries(resDiff.propertyDiffs || {}).filter(([_, p]) => p.isDifferent).map(([n, p]) => ({ name: n, impact: p.changeImpact || 'UNKNOWN', oldValue: fmtVal(p.oldValue), newValue: fmtVal(p.newValue) }));
                   result.resources.push({ logicalId, type, action, properties });
                   result.hasDiff = true;
                 }
-                if (enableDrift) {
-                  try {
-                    const driftResults = await toolkit.drift(cx, { stacks: { strategy: StackSelectionStrategy.PATTERN_MUST_MATCH, patterns: [name] } });
-                    const driftInfo = driftResults[name];
-                    result.drift = { status: (driftInfo?.numResourcesWithDrift || 0) > 0 ? 'DRIFTED' : 'IN_SYNC', count: driftInfo?.numResourcesWithDrift || 0 };
-                  } catch (e) {}
-                }
+                if (enableDrift) { try { const dr = await toolkit.drift(cx, { stacks: { strategy: StackSelectionStrategy.PATTERN_MUST_MATCH, patterns: [name] } }); result.drift = { status: (dr[name]?.numResourcesWithDrift || 0) > 0 ? 'DRIFTED' : 'IN_SYNC', count: dr[name]?.numResourcesWithDrift || 0 }; } catch {} }
                 output.stacks.push(result);
               }
               output.success = true;
@@ -309,308 +185,272 @@ jobs:
           }
           main();
           SCRIPT
+          
+          cd ${{ github.workspace }}/${{ inputs.working-directory }}
+          CDK_OUT="$(pwd)/cdk.out" node /tmp/cdk-runner/run.js > /tmp/result.json 2>&1 || true
+          RESULT=$(cat /tmp/result.json | tail -1 || echo '{"success":false,"error":"no output","stacks":[]}')
+          echo "result<<EOF" >> $GITHUB_OUTPUT
+          echo "$RESULT" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
 
-      - name: Get first role for OIDC (multi-account)
-        if: inputs.aws-role-arns != '' && inputs.stacks-per-account != ''
-        id: first-role
-        run: |
-          FIRST_ROLE=$(echo '${{ inputs.aws-role-arns }}' | jq -r 'to_entries | .[0].value')
-          echo "role=$FIRST_ROLE" >> $GITHUB_OUTPUT
+  # ===========================================================================
+  # MULTI-ACCOUNT: Parallel matrix jobs
+  # ===========================================================================
+  diff-multi:
+    name: Diff (${{ matrix.account }})
+    if: needs.prepare.outputs.is-multi-account == 'true'
+    needs: prepare
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
+    outputs:
+      # Matrix outputs - collected by aggregate job
+      result: ${{ steps.diff.outputs.result }}
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        if: inputs.python-version != ''
+        with:
+          python-version: ${{ inputs.python-version }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+      - run: ${{ inputs.install-command }}
+      - run: npm install -g aws-cdk
 
-      - name: Configure AWS credentials via OIDC (multi-account)
-        if: inputs.aws-role-arns != '' && inputs.stacks-per-account != ''
+      - name: Configure AWS (${{ matrix.account }})
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ steps.first-role.outputs.role }}
+          role-to-assume: ${{ matrix.role }}
           role-duration-seconds: 3600
           aws-region: ${{ inputs.aws-region }}
 
-      - name: Run CDK Diff (multi-account)
-        if: inputs.aws-role-arns != '' && inputs.stacks-per-account != ''
-        id: multi-diff
+      - name: Run diff
+        id: diff
         env:
-          AWS_ROLE_ARNS: ${{ inputs.aws-role-arns }}
-          STACKS_PER_ACCOUNT: ${{ inputs.stacks-per-account }}
-          AWS_REGION: ${{ inputs.aws-region }}
+          STACKS: ${{ matrix.stacks }}
           ENABLE_DRIFT: ${{ inputs.enable-drift-detection }}
+          CDK_DEFAULT_ACCOUNT: ${{ matrix.account }}
+          CDK_DEFAULT_REGION: ${{ inputs.aws-region }}
         run: |
-          ALL_STACKS='[]'
-          FIRST_ACCOUNT=$(echo "$AWS_ROLE_ARNS" | jq -r 'keys[0]')
+          [ -z "$STACKS" ] && echo 'result={"success":true,"stacks":[]}' >> $GITHUB_OUTPUT && exit 0
           
-          for ACCOUNT_ID in $(echo "$AWS_ROLE_ARNS" | jq -r 'keys[]'); do
-            ROLE_ARN=$(echo "$AWS_ROLE_ARNS" | jq -r --arg acc "$ACCOUNT_ID" '.[$acc]')
-            STACKS=$(echo "$STACKS_PER_ACCOUNT" | jq -r --arg acc "$ACCOUNT_ID" '.[$acc] // ""')
-            
-            [ -z "$STACKS" ] && continue
-            
-            echo "=== Account $ACCOUNT_ID ==="
-            
-            # For first account, use existing OIDC creds; for others, assume role
-            if [ "$ACCOUNT_ID" != "$FIRST_ACCOUNT" ]; then
-              echo "Assuming role for account $ACCOUNT_ID..."
-              CREDS=$(aws sts assume-role --role-arn "$ROLE_ARN" --role-session-name "cdk-diff" --duration-seconds 3600 --output json)
-              export AWS_ACCESS_KEY_ID=$(echo "$CREDS" | jq -r '.Credentials.AccessKeyId')
-              export AWS_SECRET_ACCESS_KEY=$(echo "$CREDS" | jq -r '.Credentials.SecretAccessKey')
-              export AWS_SESSION_TOKEN=$(echo "$CREDS" | jq -r '.Credentials.SessionToken')
-            fi
-            
-            export CDK_DEFAULT_ACCOUNT="$ACCOUNT_ID"
-            export CDK_DEFAULT_REGION="$AWS_REGION"
-            
-            # Synth
-            rm -rf cdk.out
-            npx cdk synth --quiet --output cdk.out
-            
-            STACKS="$STACKS" CDK_OUT="$(pwd)/cdk.out" node /tmp/cdk-diff-runner/run.js > /tmp/account-diff.json 2>/tmp/diff-stderr.txt || true
-            
-            if [ -s /tmp/account-diff.json ]; then
-              ACCOUNT_RESULT=$(cat /tmp/account-diff.json | tail -1)
-              ALL_STACKS=$(echo "$ALL_STACKS" | jq --argjson new "$(echo "$ACCOUNT_RESULT" | jq '.stacks')" '. + $new')
-            fi
-            
-            # Restore original OIDC creds for next iteration
-            if [ "$ACCOUNT_ID" != "$FIRST_ACCOUNT" ]; then
-              unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
-            fi
-          done
+          npx cdk synth --quiet --output cdk.out
           
-          FINAL='{"success":true,"stacks":'$ALL_STACKS'}'
+          mkdir -p /tmp/cdk-runner && cd /tmp/cdk-runner
+          echo '{"type":"module","dependencies":{"@aws-cdk/toolkit-lib":"*"}}' > package.json
+          npm install --silent
           
-          echo "diff_result<<EOF" >> $GITHUB_OUTPUT
-          echo "$FINAL" >> $GITHUB_OUTPUT
+          cat > run.js << 'SCRIPT'
+          import { Toolkit, StackSelectionStrategy } from '@aws-cdk/toolkit-lib';
+          const stacks = (process.env.STACKS || '').split(' ').filter(Boolean);
+          const enableDrift = process.env.ENABLE_DRIFT === 'true';
+          async function main() {
+            const output = { success: false, stacks: [], error: '' };
+            try {
+              const toolkit = new Toolkit({ ioHost: { notify: async () => {}, requestResponse: async (msg) => msg.defaultResponse } });
+              const cx = await toolkit.fromAssemblyDirectory(process.env.CDK_OUT);
+              const selector = stacks.length ? { strategy: StackSelectionStrategy.PATTERN_MUST_MATCH, patterns: stacks } : { strategy: StackSelectionStrategy.ALL_STACKS };
+              const diffResults = await toolkit.diff(cx, { stacks: selector });
+              const fmtVal = (v) => v === undefined || v === null ? null : typeof v === 'object' ? JSON.stringify(v) : String(v);
+              for (const [name, diff] of Object.entries(diffResults)) {
+                const result = { stackName: name, hasDiff: false, resources: [] };
+                for (const [logicalId, resDiff] of Object.entries(diff.resources?.diffs || {})) {
+                  const type = resDiff.resourceTypes?.newType || resDiff.resourceTypes?.oldType || 'Unknown';
+                  const action = resDiff.isAddition ? 'ADD' : resDiff.isRemoval ? 'REMOVE' : 'UPDATE';
+                  const properties = Object.entries(resDiff.propertyDiffs || {}).filter(([_, p]) => p.isDifferent).map(([n, p]) => ({ name: n, impact: p.changeImpact || 'UNKNOWN', oldValue: fmtVal(p.oldValue), newValue: fmtVal(p.newValue) }));
+                  result.resources.push({ logicalId, type, action, properties });
+                  result.hasDiff = true;
+                }
+                if (enableDrift) { try { const dr = await toolkit.drift(cx, { stacks: { strategy: StackSelectionStrategy.PATTERN_MUST_MATCH, patterns: [name] } }); result.drift = { status: (dr[name]?.numResourcesWithDrift || 0) > 0 ? 'DRIFTED' : 'IN_SYNC', count: dr[name]?.numResourcesWithDrift || 0 }; } catch {} }
+                output.stacks.push(result);
+              }
+              output.success = true;
+            } catch (e) { output.error = e.message || String(e); }
+            console.log(JSON.stringify(output));
+          }
+          main();
+          SCRIPT
+          
+          cd ${{ github.workspace }}/${{ inputs.working-directory }}
+          CDK_OUT="$(pwd)/cdk.out" node /tmp/cdk-runner/run.js > /tmp/result.json 2>&1 || true
+          RESULT=$(cat /tmp/result.json | tail -1 || echo '{"success":false,"error":"no output","stacks":[]}')
+          echo "result<<EOF" >> $GITHUB_OUTPUT
+          echo "$RESULT" >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
 
-      # =====================================================================
-      # GENERATE AND POST PR COMMENT
-      # =====================================================================
-      - name: Generate PR Comment
+      - name: Upload result
+        uses: actions/upload-artifact@v4
+        with:
+          name: diff-${{ matrix.account }}
+          path: /tmp/result.json
+          retention-days: 1
+
+  # ===========================================================================
+  # AGGREGATE: Combine multi-account results
+  # ===========================================================================
+  aggregate:
+    name: Aggregate Results
+    if: needs.prepare.outputs.is-multi-account == 'true'
+    needs: [prepare, diff-multi]
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    outputs:
+      combined: ${{ steps.combine.outputs.result }}
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/diffs
+          pattern: diff-*
+
+      - name: Combine results
+        id: combine
+        run: |
+          ALL_STACKS='[]'
+          for f in /tmp/diffs/*/result.json; do
+            if [ -f "$f" ]; then
+              STACKS=$(cat "$f" | tail -1 | jq -c '.stacks // []')
+              ALL_STACKS=$(echo "$ALL_STACKS" | jq --argjson new "$STACKS" '. + $new')
+            fi
+          done
+          RESULT='{"success":true,"stacks":'$ALL_STACKS'}'
+          echo "result<<EOF" >> $GITHUB_OUTPUT
+          echo "$RESULT" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+  # ===========================================================================
+  # COMMENT: Post PR comment and Slack
+  # ===========================================================================
+  comment:
+    name: Post Comment
+    needs: [prepare, diff-single, aggregate]
+    if: always() && (needs.diff-single.result == 'success' || needs.aggregate.result == 'success')
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Generate comment
         id: comment
         uses: actions/github-script@v7
         env:
-          DIFF_RESULT: ${{ steps.single-diff.outputs.diff_result || steps.multi-diff.outputs.diff_result }}
-          ACCOUNT_NAMES: ${{ inputs.account-names }}
+          DIFF_SINGLE: ${{ needs.diff-single.outputs.result }}
+          DIFF_MULTI: ${{ needs.aggregate.outputs.combined }}
         with:
           script: |
-            const raw = process.env.DIFF_RESULT;
-            if (!raw) {
-              core.setOutput('comment', '## 🔍 CDK Diff\n\n⚠️ No diff results');
-              return;
-            }
+            const raw = process.env.DIFF_SINGLE || process.env.DIFF_MULTI;
+            if (!raw) { core.setOutput('comment', '## 🔍 CDK Diff\n\n⚠️ No diff results'); return; }
             
             let data;
-            try {
-              data = JSON.parse(raw);
-            } catch (e) {
-              core.setOutput('comment', `## 🔍 CDK Diff\n\n❌ Parse error: ${e.message}`);
-              return;
-            }
+            try { data = JSON.parse(raw); } catch (e) { core.setOutput('comment', `## 🔍 CDK Diff\n\n❌ Parse error`); return; }
             
-            const getEnv = (name) => {
-              const n = name.toLowerCase();
-              if (n.includes('prod')) return 'production';
-              if (n.includes('staging')) return 'staging';
-              return 'dev';
-            };
-            
-            // Clean up logical ID - remove CDK hash suffix
+            const getEnv = (n) => n.toLowerCase().includes('prod') ? 'production' : n.toLowerCase().includes('staging') ? 'staging' : 'dev';
             const cleanId = (id) => id.replace(/[A-F0-9]{8}$/i, '').replace(/([a-z])([A-Z])/g, '$1 $2');
-            
-            // Short type name
             const shortType = (t) => t.split('::').pop();
             
             let md = '## 🔍 CDK Diff\n\n';
-            
-            if (!data.success) {
-              md += `❌ **Error:** ${data.error}\n\n`;
-              core.setOutput('comment', md);
-              return;
-            }
+            if (!data.success) { md += `❌ **Error:** ${data.error}\n`; core.setOutput('comment', md); return; }
             
             const changed = data.stacks.filter(s => s.hasDiff);
             const unchanged = data.stacks.filter(s => !s.hasDiff);
-            
-            // Summary counts
             const adds = data.stacks.reduce((n, s) => n + s.resources.filter(r => r.action === 'ADD').length, 0);
             const updates = data.stacks.reduce((n, s) => n + s.resources.filter(r => r.action === 'UPDATE').length, 0);
             const removes = data.stacks.reduce((n, s) => n + s.resources.filter(r => r.action === 'REMOVE').length, 0);
             
-            if (changed.length === 0) {
-              md += '✅ **No changes**\n';
-            } else {
-              // Summary line
+            if (changed.length === 0) { md += '✅ **No changes**\n'; }
+            else {
               const parts = [];
               if (adds) parts.push(`🟢 ${adds} to add`);
               if (updates) parts.push(`🟡 ${updates} to update`);
               if (removes) parts.push(`🔴 ${removes} to destroy`);
               md += `**${parts.join(' · ')}**\n\n`;
               
-              // Each changed stack
               for (const stack of changed) {
-                const env = getEnv(stack.stackName);
-                md += `### ${stack.stackName}\n`;
-                md += `> _${env}_`;
-                if (stack.drift) {
-                  md += stack.drift.status === 'DRIFTED' 
-                    ? ` · ⚠️ drift detected (${stack.drift.count})` 
-                    : ' · ✓ no drift';
-                }
+                md += `### ${stack.stackName}\n> _${getEnv(stack.stackName)}_`;
+                if (stack.drift) md += stack.drift.status === 'DRIFTED' ? ` · ⚠️ drift (${stack.drift.count})` : ' · ✓ no drift';
                 md += '\n\n';
                 
-                // Group by action
                 const byAction = { ADD: [], UPDATE: [], REMOVE: [] };
-                for (const res of stack.resources) {
-                  byAction[res.action].push(res);
-                }
+                for (const res of stack.resources) byAction[res.action].push(res);
                 
-                // Adds
                 if (byAction.ADD.length) {
                   md += '**➕ Create**\n';
                   for (const r of byAction.ADD) {
                     md += `- \`${shortType(r.type)}\` **${cleanId(r.logicalId)}**\n`;
-                    // Show new properties for added resources
-                    for (const p of r.properties) {
-                      if (p.newValue) md += `  - \`${p.name}\`: ${p.newValue}\n`;
-                    }
+                    for (const p of r.properties) if (p.newValue) md += `  - \`${p.name}\`: ${p.newValue}\n`;
                   }
                   md += '\n';
                 }
-                
-                // Updates
                 if (byAction.UPDATE.length) {
                   md += '**✏️ Update**\n';
                   for (const r of byAction.UPDATE) {
-                    const warn = r.properties.some(p => p.impact === 'WILL_REPLACE') ? ' ⚠️' : '';
-                    md += `- \`${shortType(r.type)}\` **${cleanId(r.logicalId)}**${warn}\n`;
-                    // Show property changes
+                    md += `- \`${shortType(r.type)}\` **${cleanId(r.logicalId)}**${r.properties.some(p => p.impact === 'WILL_REPLACE') ? ' ⚠️' : ''}\n`;
                     for (const p of r.properties) {
-                      const replaceWarn = p.impact === 'WILL_REPLACE' ? ' ⚠️replace' : '';
-                      md += `  - \`${p.name}\`${replaceWarn}\n`;
-                      if (p.oldValue) {
-                        md += `    **OLD:** ${p.oldValue}\n`;
-                      } else {
-                        md += `    **OLD:** _(none)_\n`;
-                      }
-                      if (p.newValue) {
-                        md += `    **NEW:** ${p.newValue}\n`;
-                      } else {
-                        md += `    **NEW:** _(removed)_\n`;
-                      }
+                      md += `  - \`${p.name}\`${p.impact === 'WILL_REPLACE' ? ' ⚠️replace' : ''}\n`;
+                      md += `    **OLD:** ${p.oldValue || '_(none)_'}\n    **NEW:** ${p.newValue || '_(removed)_'}\n`;
                     }
                   }
                   md += '\n';
                 }
-                
-                // Removes
                 if (byAction.REMOVE.length) {
                   md += '**🗑️ Destroy**\n';
-                  for (const r of byAction.REMOVE) {
-                    md += `- \`${shortType(r.type)}\` **${cleanId(r.logicalId)}**\n`;
-                  }
+                  for (const r of byAction.REMOVE) md += `- \`${shortType(r.type)}\` **${cleanId(r.logicalId)}**\n`;
                   md += '\n';
                 }
               }
             }
-            
-            // Unchanged stacks (collapsed)
-            if (unchanged.length > 0) {
-              md += `<details><summary>✅ ${unchanged.length} unchanged stacks</summary>\n\n`;
-              md += unchanged.map(s => `- ${s.stackName}`).join('\n');
-              md += '\n</details>\n';
-            }
+            if (unchanged.length) md += `<details><summary>✅ ${unchanged.length} unchanged</summary>\n\n${unchanged.map(s => `- ${s.stackName}`).join('\n')}\n</details>\n`;
             
             core.setOutput('comment', md);
             
-            // Generate Slack message with resource details
+            // Slack
             const prUrl = '${{ github.event.pull_request.html_url || format('https://github.com/{0}/pull/{1}', github.repository, inputs.pr-number) }}';
             const prNum = '${{ inputs.pr-number || github.event.pull_request.number }}';
             const repo = '${{ github.repository }}';
             const runUrl = '${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}';
             
             const blocks = [
-              { type: 'header', text: { type: 'plain_text', text: '🔍 CDK Diff Preview', emoji: true } },
-              { type: 'context', elements: [{ type: 'mrkdwn', text: `👤 opened <${prUrl}|PR #${prNum}> in \`${repo}\`` }] },
-              { type: 'divider' },
+              { type: 'header', text: { type: 'plain_text', text: '🔍 CDK Diff', emoji: true } },
+              { type: 'context', elements: [{ type: 'mrkdwn', text: `<${prUrl}|PR #${prNum}> in \`${repo}\`` }] },
               { type: 'section', fields: [
-                { type: 'mrkdwn', text: `🟢 *Additions*\n${adds} resources` },
-                { type: 'mrkdwn', text: `🟡 *Updates*\n${updates} resources` },
-                { type: 'mrkdwn', text: `🔴 *Deletions*\n${removes} resources` },
-                { type: 'mrkdwn', text: `📦 *Stacks*\n${changed.length} affected` }
+                { type: 'mrkdwn', text: `🟢 *Add*\n${adds}` }, { type: 'mrkdwn', text: `🟡 *Update*\n${updates}` },
+                { type: 'mrkdwn', text: `🔴 *Remove*\n${removes}` }, { type: 'mrkdwn', text: `📦 *Stacks*\n${changed.length}` }
               ]},
               { type: 'actions', elements: [
-                { type: 'button', text: { type: 'plain_text', text: '📄 View PR', emoji: true }, url: prUrl },
-                { type: 'button', text: { type: 'plain_text', text: '⚙️ View Workflow', emoji: true }, url: runUrl }
+                { type: 'button', text: { type: 'plain_text', text: 'View PR' }, url: prUrl },
+                { type: 'button', text: { type: 'plain_text', text: 'Workflow' }, url: runUrl }
               ]}
             ];
             
-            // Add stack details (one text block per stack to stay under 50 block limit)
-            for (const stack of changed) {
+            for (const stack of changed.slice(0, 5)) {
               blocks.push({ type: 'divider' });
-              
-              // Stack header
-              let stackText = `📦 *${stack.stackName}*\n_${getEnv(stack.stackName)}_`;
-              if (stack.drift) {
-                stackText += stack.drift.status === 'DRIFTED' 
-                  ? ` · ⚠️ drift detected (${stack.drift.count})`
-                  : ' · ✓ no drift';
-              }
-              
-              // Group resources by action
+              let txt = `📦 *${stack.stackName}* _(${getEnv(stack.stackName)})_`;
               const byAction = { ADD: [], UPDATE: [], REMOVE: [] };
-              for (const res of stack.resources) {
-                byAction[res.action].push(res);
-              }
-              
-              // Build resource text
-              let resourceText = '';
-              
-              if (byAction.ADD.length > 0) {
-                resourceText += '\n\n🟢 *Create*\n';
-                for (const r of byAction.ADD) {
-                  resourceText += `• \`${shortType(r.type)}\` *${cleanId(r.logicalId)}*\n`;
-                }
-              }
-              
-              if (byAction.UPDATE.length > 0) {
-                resourceText += '\n🟡 *Update*\n';
-                for (const r of byAction.UPDATE) {
-                  resourceText += `• \`${shortType(r.type)}\` *${cleanId(r.logicalId)}*\n`;
-                  for (const p of r.properties) {
-                    const replaceWarn = p.impact === 'WILL_REPLACE' ? ' ⚠️replace' : '';
-                    resourceText += `   \`${p.name}\`${replaceWarn}\n`;
-                    resourceText += `   *OLD:* ${p.oldValue || '_(none)_'}\n`;
-                    resourceText += `   *NEW:* ${p.newValue || '_(removed)_'}\n`;
-                  }
-                }
-              }
-              
-              if (byAction.REMOVE.length > 0) {
-                resourceText += '\n🔴 *Destroy*\n';
-                for (const r of byAction.REMOVE) {
-                  resourceText += `• \`${shortType(r.type)}\` *${cleanId(r.logicalId)}*\n`;
-                }
-              }
-              
-              blocks.push({ type: 'section', text: { type: 'mrkdwn', text: stackText + resourceText } });
-              
-              // Safety: stop if we're getting close to 50 block limit
-              if (blocks.length >= 45) {
-                blocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: '_...more stacks in PR comment_' }] });
-                break;
-              }
+              for (const res of stack.resources) byAction[res.action].push(res);
+              if (byAction.ADD.length) { txt += '\n🟢 '; for (const r of byAction.ADD) txt += `\`${shortType(r.type)}\` `; }
+              if (byAction.UPDATE.length) { txt += '\n🟡 '; for (const r of byAction.UPDATE) txt += `\`${shortType(r.type)}\` `; }
+              if (byAction.REMOVE.length) { txt += '\n🔴 '; for (const r of byAction.REMOVE) txt += `\`${shortType(r.type)}\` `; }
+              blocks.push({ type: 'section', text: { type: 'mrkdwn', text: txt } });
             }
+            if (changed.length > 5) blocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: `_+${changed.length - 5} more stacks..._` }] });
             
             core.setOutput('slack_blocks', JSON.stringify(blocks));
 
-      - name: Post PR Comment
+      - name: Post PR comment
         uses: marocchino/sticky-pull-request-comment@v2
         with:
           header: cdk-diff
           number: ${{ inputs.pr-number || github.event.pull_request.number }}
           message: ${{ steps.comment.outputs.comment }}
 
-      # =====================================================================
-      # SLACK (Optional)
-      # =====================================================================
       - name: Check Slack label
         id: check-label
         env:
@@ -631,5 +471,4 @@ jobs:
           SLACK_WEBHOOK_URL: ${{ secrets.slack-webhook-url }}
           SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
         with:
-          payload: |
-            {"blocks": ${{ steps.comment.outputs.slack_blocks }} }
+          payload: '{"blocks": ${{ steps.comment.outputs.slack_blocks }} }'
