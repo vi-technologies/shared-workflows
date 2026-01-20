@@ -310,6 +310,21 @@ jobs:
           main();
           SCRIPT
 
+      - name: Get first role for OIDC (multi-account)
+        if: inputs.aws-role-arns != '' && inputs.stacks-per-account != ''
+        id: first-role
+        run: |
+          FIRST_ROLE=$(echo '${{ inputs.aws-role-arns }}' | jq -r 'to_entries | .[0].value')
+          echo "role=$FIRST_ROLE" >> $GITHUB_OUTPUT
+
+      - name: Configure AWS credentials via OIDC (multi-account)
+        if: inputs.aws-role-arns != '' && inputs.stacks-per-account != ''
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ steps.first-role.outputs.role }}
+          role-duration-seconds: 3600
+          aws-region: ${{ inputs.aws-region }}
+
       - name: Run CDK Diff (multi-account)
         if: inputs.aws-role-arns != '' && inputs.stacks-per-account != ''
         id: multi-diff
@@ -320,6 +335,7 @@ jobs:
           ENABLE_DRIFT: ${{ inputs.enable-drift-detection }}
         run: |
           ALL_STACKS='[]'
+          FIRST_ACCOUNT=$(echo "$AWS_ROLE_ARNS" | jq -r 'keys[0]')
           
           for ACCOUNT_ID in $(echo "$AWS_ROLE_ARNS" | jq -r 'keys[]'); do
             ROLE_ARN=$(echo "$AWS_ROLE_ARNS" | jq -r --arg acc "$ACCOUNT_ID" '.[$acc]')
@@ -329,11 +345,15 @@ jobs:
             
             echo "=== Account $ACCOUNT_ID ==="
             
-            # Assume role
-            CREDS=$(aws sts assume-role --role-arn "$ROLE_ARN" --role-session-name "cdk-diff" --duration-seconds 3600 --output json)
-            export AWS_ACCESS_KEY_ID=$(echo "$CREDS" | jq -r '.Credentials.AccessKeyId')
-            export AWS_SECRET_ACCESS_KEY=$(echo "$CREDS" | jq -r '.Credentials.SecretAccessKey')
-            export AWS_SESSION_TOKEN=$(echo "$CREDS" | jq -r '.Credentials.SessionToken')
+            # For first account, use existing OIDC creds; for others, assume role
+            if [ "$ACCOUNT_ID" != "$FIRST_ACCOUNT" ]; then
+              echo "Assuming role for account $ACCOUNT_ID..."
+              CREDS=$(aws sts assume-role --role-arn "$ROLE_ARN" --role-session-name "cdk-diff" --duration-seconds 3600 --output json)
+              export AWS_ACCESS_KEY_ID=$(echo "$CREDS" | jq -r '.Credentials.AccessKeyId')
+              export AWS_SECRET_ACCESS_KEY=$(echo "$CREDS" | jq -r '.Credentials.SecretAccessKey')
+              export AWS_SESSION_TOKEN=$(echo "$CREDS" | jq -r '.Credentials.SessionToken')
+            fi
+            
             export CDK_DEFAULT_ACCOUNT="$ACCOUNT_ID"
             export CDK_DEFAULT_REGION="$AWS_REGION"
             
@@ -348,7 +368,10 @@ jobs:
               ALL_STACKS=$(echo "$ALL_STACKS" | jq --argjson new "$(echo "$ACCOUNT_RESULT" | jq '.stacks')" '. + $new')
             fi
             
-            unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
+            # Restore original OIDC creds for next iteration
+            if [ "$ACCOUNT_ID" != "$FIRST_ACCOUNT" ]; then
+              unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
+            fi
           done
           
           FINAL='{"success":true,"stacks":'$ALL_STACKS'}'
