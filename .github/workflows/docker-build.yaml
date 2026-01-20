@@ -57,6 +57,11 @@ on:
         required: false
         type: boolean
         default: false
+      shared-paths:
+        description: 'Space-separated paths that, if changed, trigger ALL services to rebuild (e.g., "utils/ shared/")'
+        required: false
+        type: string
+        default: ''
     secrets:
       aws-account-id-staging:
         description: 'AWS Account ID for staging environment'
@@ -95,6 +100,7 @@ jobs:
         env:
           SERVICES_FOLDER: ${{ inputs.services-folder }}
           BUILD_ALL: ${{ inputs.build-all }}
+          SHARED_PATHS: ${{ inputs.shared-paths }}
         run: |
           set -euo pipefail
           
@@ -132,23 +138,42 @@ jobs:
             SERVICES="$ALL_SERVICES"
             CHANGED_FILES="(build-all requested)"
           else
-            # Get changed files in the services folder
-            CHANGED_FILES=$(git diff --name-only "$DIFF_RANGE" -- "${SERVICES_FOLDER}/**" 2>/dev/null || true)
+            # Check if any shared paths changed (triggers all services)
+            SHARED_CHANGED=""
+            if [ -n "$SHARED_PATHS" ]; then
+              for shared_path in $SHARED_PATHS; do
+                SHARED_FILES=$(git diff --name-only "$DIFF_RANGE" -- "$shared_path" 2>/dev/null || true)
+                if [ -n "$SHARED_FILES" ]; then
+                  SHARED_CHANGED="$SHARED_CHANGED $SHARED_FILES"
+                fi
+              done
+              SHARED_CHANGED=$(echo "$SHARED_CHANGED" | xargs)
+            fi
             
-            echo "Changed files:"
-            echo "$CHANGED_FILES"
-            
-            # Extract unique service names from changed files
-            SERVICES=""
-            for file in $CHANGED_FILES; do
-              # Extract the service folder name (second component after services folder)
-              SERVICE_NAME=$(echo "$file" | sed -n "s|^${SERVICES_FOLDER}/\([^/]*\)/.*|\1|p")
-              # Only include if Dockerfile exists and is non-empty
-              if [ -n "$SERVICE_NAME" ] && [ -f "${SERVICES_FOLDER}/${SERVICE_NAME}/Dockerfile" ] && [ -s "${SERVICES_FOLDER}/${SERVICE_NAME}/Dockerfile" ]; then
-                SERVICES="$SERVICES $SERVICE_NAME"
-              fi
-            done
-            SERVICES=$(echo "$SERVICES" | tr ' ' '\n' | sort -u | tr '\n' ' ' | xargs || true)
+            if [ -n "$SHARED_CHANGED" ]; then
+              echo "Shared paths changed - rebuilding all services"
+              echo "Changed shared files: $SHARED_CHANGED"
+              SERVICES="$ALL_SERVICES"
+              CHANGED_FILES="$SHARED_CHANGED"
+            else
+              # Get changed files in the services folder
+              CHANGED_FILES=$(git diff --name-only "$DIFF_RANGE" -- "${SERVICES_FOLDER}/**" 2>/dev/null || true)
+              
+              echo "Changed files:"
+              echo "$CHANGED_FILES"
+              
+              # Extract unique service names from changed files
+              SERVICES=""
+              for file in $CHANGED_FILES; do
+                # Extract the service folder name (second component after services folder)
+                SERVICE_NAME=$(echo "$file" | sed -n "s|^${SERVICES_FOLDER}/\([^/]*\)/.*|\1|p")
+                # Only include if Dockerfile exists and is non-empty
+                if [ -n "$SERVICE_NAME" ] && [ -f "${SERVICES_FOLDER}/${SERVICE_NAME}/Dockerfile" ] && [ -s "${SERVICES_FOLDER}/${SERVICE_NAME}/Dockerfile" ]; then
+                  SERVICES="$SERVICES $SERVICE_NAME"
+                fi
+              done
+              SERVICES=$(echo "$SERVICES" | tr ' ' '\n' | sort -u | tr '\n' ' ' | xargs || true)
+            fi
           fi
           
           echo "Services to build: $SERVICES"
@@ -195,6 +220,7 @@ jobs:
           SERVICES_FOLDER: ${{ inputs.services-folder }}
           REPO_NAME: ${{ github.event.repository.name }}
           COMMIT_SHA: ${{ github.event.pull_request.head.sha }}
+          SHARED_PATHS: ${{ inputs.shared-paths }}
         with:
           script: |
             const services = (process.env.SERVICES || '').trim();
@@ -223,6 +249,17 @@ jobs:
             }
             
             if (changedFiles && changedFiles !== '(build-all requested)') {
+              // Check if this was triggered by shared paths
+              const sharedPaths = process.env.SHARED_PATHS || '';
+              const isSharedTrigger = sharedPaths && changedFiles.split('\n').some(f => 
+                sharedPaths.split(/\s+/).some(sp => f.startsWith(sp.replace(/\/$/, '')))
+              );
+              
+              if (isSharedTrigger) {
+                lines.push(`> ⚠️ **Shared code changed** - all services will be rebuilt`);
+                lines.push('');
+              }
+              
               lines.push('<details>');
               lines.push('<summary>Changed files</summary>');
               lines.push('');
