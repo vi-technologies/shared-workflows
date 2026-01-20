@@ -570,6 +570,7 @@ jobs:
               // State tracking variables
               let currentResource = null;   // Current resource being parsed
               let currentProperty = null;   // Current property being parsed
+              let currentPropAction = null; // Property change type: +, ~, or -
               let inUnifiedDiff = false;    // Whether we're in unified diff mode
               let removedLines = [];        // Lines removed (accumulated)
               let addedLines = [];          // Lines added (accumulated)
@@ -589,18 +590,19 @@ jobs:
                 return toJoin.join(' ').replace(/\s+/g, ' ').trim();
               }
               
-              // Helper to save current property to current resource
-              function saveCurrentProperty() {
-                if (!currentResource || !currentProperty) return;
-                if (removedLines.length > 0 || addedLines.length > 0) {
-                  currentResource.properties.push({
-                    name: currentProperty,
-                    oldValue: formatValue(removedLines),
-                    newValue: formatValue(addedLines),
-                    isUnifiedDiff: inUnifiedDiff
-                  });
-                }
+            // Helper to save current property to current resource
+            function saveCurrentProperty() {
+              if (!currentResource || !currentProperty) return;
+              if (removedLines.length > 0 || addedLines.length > 0) {
+                currentResource.properties.push({
+                  name: currentProperty,
+                  oldValue: formatValue(removedLines),
+                  newValue: formatValue(addedLines),
+                  isUnifiedDiff: inUnifiedDiff,
+                  propAction: currentPropAction  // Track if this was +, ~, or -
+                });
               }
+            }
               
               for (const line of lines) {
                 // ---------------------------------------------------------
@@ -629,6 +631,7 @@ jobs:
                   
                   // Reset state for new resource
                   currentProperty = null;
+                  currentPropAction = null;
                   inUnifiedDiff = false;
                   removedLines = [];
                   addedLines = [];
@@ -655,7 +658,7 @@ jobs:
                   saveCurrentProperty();
                   
                   // Start tracking new property
-                  const propAction = propMatch[1];
+                  currentPropAction = propMatch[1];  // +, ~, or -
                   currentProperty = propMatch[2];
                   inUnifiedDiff = false;
                   removedLines = [];
@@ -796,7 +799,14 @@ jobs:
                           newVal = prop.newValue ? `\`${prop.newValue.replace(/\n/g, ' ')}\`` : '_(removed)_';
                         } else {
                           // Simple change
-                          oldVal = prop.oldValue != null ? `\`${prop.oldValue}\`` : '_(not set)_';
+                          if (prop.oldValue != null) {
+                            oldVal = `\`${prop.oldValue}\``;
+                          } else if (prop.propAction === '~' && prop.newValue != null) {
+                            // Modification with only additions shown (e.g., adding to existing policy)
+                            oldVal = '_(existing)_';
+                          } else {
+                            oldVal = '_(not set)_';
+                          }
                           newVal = prop.newValue != null ? `\`${prop.newValue}\`` : '_(removed)_';
                         }
                         content += `| \`${prop.name}\` | ${oldVal} | ${newVal} |\n`;
