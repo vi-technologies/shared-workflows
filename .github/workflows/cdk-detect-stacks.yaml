@@ -196,7 +196,7 @@ jobs:
           else
             echo "has_changes=true" >> $GITHUB_OUTPUT
             echo "stacks=$AFFECTED_STACKS" >> $GITHUB_OUTPUT
-            # Create JSON array
-            STACKS_JSON=$(echo "$AFFECTED_STACKS" | tr ' ' '\n' | jq -R . | jq -s .)
+            # Create JSON array (use -c for compact single-line output)
+            STACKS_JSON=$(echo "$AFFECTED_STACKS" | tr ' ' '\n' | jq -R . | jq -sc .)
             echo "stacks_json=$STACKS_JSON" >> $GITHUB_OUTPUT
           fi
