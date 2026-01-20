@@ -6,7 +6,7 @@
 # CONVENTION:
 #   - A top-level folder (default: "jobs") contains subfolders
 #   - Each subfolder is a microservice with its own Dockerfile
-#   - Image naming: {environment}_{repo_name}_{folder_name}
+#   - Caller provides explicit image names via services-config JSON
 #   - Auto-detects changed folders and only builds what changed
 #   - Tags images with both :latest and :$COMMIT_SHA
 #
@@ -16,7 +16,11 @@
 #       uses: vi-technologies/shared-workflows/.github/workflows/docker-build.yaml@main
 #       with:
 #         services-folder: jobs
-#         aws-region: us-east-1
+#         services-config: |
+#           {
+#             "bronze": { "staging": "staging_engage_bronze_etl", "production": "production_engage_bronze_etl" },
+#             "silver": { "staging": "staging_engage_silver_etl", "production": "production_engage_silver_etl" }
+#           }
 #       secrets:
 #         aws-account-id-staging: ${{ secrets.AWS_ACCOUNTID_STAGING }}
 #         aws-account-id-prod: ${{ secrets.AWS_ACCOUNTID_PROD }}
@@ -32,23 +36,17 @@ on:
         required: false
         type: string
         default: 'jobs'
+      services-config:
+        description: 'JSON mapping of service names to image names: {"service": {"staging": "image_name", "production": "image_name"}}'
+        required: true
+        type: string
       aws-region:
         description: 'AWS region for ECR'
         required: false
         type: string
         default: 'us-east-1'
       environment:
-        description: 'Target environment (staging/prod). If not set, auto-detects from trigger.'
-        required: false
-        type: string
-        default: ''
-      image-name-pattern:
-        description: 'Pattern for image names. Use {env}, {repo}, {service} placeholders. Default: {env}_{repo}_{service}'
-        required: false
-        type: string
-        default: '{env}_{repo}_{service}'
-      pr-number:
-        description: 'PR number for commenting (required for PR events)'
+        description: 'Target environment (staging/production). If not set, auto-detects from trigger.'
         required: false
         type: string
         default: ''
@@ -99,6 +97,7 @@ jobs:
         id: detect
         env:
           SERVICES_FOLDER: ${{ inputs.services-folder }}
+          SERVICES_CONFIG: ${{ inputs.services-config }}
           BUILD_ALL: ${{ inputs.build-all }}
           SHARED_PATHS: ${{ inputs.shared-paths }}
         run: |
@@ -119,16 +118,18 @@ jobs:
           
           echo "Using diff range: $DIFF_RANGE"
           
-          # Find all service folders (directories with non-empty Dockerfiles)
+          # Get list of configured services from services-config
+          CONFIGURED_SERVICES=$(echo "$SERVICES_CONFIG" | jq -r 'keys[]')
+          echo "Configured services: $CONFIGURED_SERVICES"
+          
+          # Find all service folders that have a non-empty Dockerfile AND are in config
           ALL_SERVICES=""
-          if [ -d "$SERVICES_FOLDER" ]; then
-            for dir in "$SERVICES_FOLDER"/*/; do
-              if [ -f "${dir}Dockerfile" ] && [ -s "${dir}Dockerfile" ]; then
-                SERVICE_NAME=$(basename "$dir")
-                ALL_SERVICES="$ALL_SERVICES $SERVICE_NAME"
-              fi
-            done
-          fi
+          for SERVICE_NAME in $CONFIGURED_SERVICES; do
+            dir="${SERVICES_FOLDER}/${SERVICE_NAME}/"
+            if [ -d "$dir" ] && [ -f "${dir}Dockerfile" ] && [ -s "${dir}Dockerfile" ]; then
+              ALL_SERVICES="$ALL_SERVICES $SERVICE_NAME"
+            fi
+          done
           ALL_SERVICES=$(echo "$ALL_SERVICES" | xargs)
           echo "All available services: $ALL_SERVICES"
           
@@ -162,13 +163,16 @@ jobs:
               echo "Changed files:"
               echo "$CHANGED_FILES"
               
-              # Extract unique service names from changed files
+              # Extract unique service names from changed files (only if in config)
               SERVICES=""
               for file in $CHANGED_FILES; do
                 # Extract the service folder name (second component after services folder)
                 SERVICE_NAME=$(echo "$file" | sed -n "s|^${SERVICES_FOLDER}/\([^/]*\)/.*|\1|p")
-                # Only include if Dockerfile exists and is non-empty
-                if [ -n "$SERVICE_NAME" ] && [ -f "${SERVICES_FOLDER}/${SERVICE_NAME}/Dockerfile" ] && [ -s "${SERVICES_FOLDER}/${SERVICE_NAME}/Dockerfile" ]; then
+                # Only include if in config and has non-empty Dockerfile
+                if [ -n "$SERVICE_NAME" ] && \
+                   echo "$SERVICES_CONFIG" | jq -e ".[\"$SERVICE_NAME\"]" > /dev/null 2>&1 && \
+                   [ -f "${SERVICES_FOLDER}/${SERVICE_NAME}/Dockerfile" ] && \
+                   [ -s "${SERVICES_FOLDER}/${SERVICE_NAME}/Dockerfile" ]; then
                   SERVICES="$SERVICES $SERVICE_NAME"
                 fi
               done
@@ -216,17 +220,17 @@ jobs:
         uses: actions/github-script@v7
         env:
           SERVICES: ${{ needs.detect.outputs.services }}
+          SERVICES_CONFIG: ${{ inputs.services-config }}
           CHANGED_FILES: ${{ needs.detect.outputs.changed_files }}
           SERVICES_FOLDER: ${{ inputs.services-folder }}
-          REPO_NAME: ${{ github.event.repository.name }}
           COMMIT_SHA: ${{ github.event.pull_request.head.sha }}
           SHARED_PATHS: ${{ inputs.shared-paths }}
         with:
           script: |
             const services = (process.env.SERVICES || '').trim();
+            const servicesConfig = JSON.parse(process.env.SERVICES_CONFIG || '{}');
             const changedFiles = (process.env.CHANGED_FILES || '').trim();
             const servicesFolder = process.env.SERVICES_FOLDER;
-            const repoName = process.env.REPO_NAME;
             const commitSha = process.env.COMMIT_SHA.substring(0, 7);
             
             const lines = [];
@@ -239,12 +243,16 @@ jobs:
               const serviceList = services.split(/\s+/);
               lines.push(`**${serviceList.length} service(s) will be built on merge:**`);
               lines.push('');
-              lines.push('| Service | Image Tags |');
-              lines.push('|---------|------------|');
+              lines.push('| Service | Staging Image | Production Image |');
+              lines.push('|---------|---------------|------------------|');
               for (const svc of serviceList) {
-                const imageName = `staging_${repoName.replace(/-/g, '_')}_${svc}`;
-                lines.push(`| \`${svc}\` | \`:latest\`, \`:${commitSha}\` |`);
+                const config = servicesConfig[svc] || {};
+                const stagingImage = config.staging || '(not configured)';
+                const prodImage = config.production || '(not configured)';
+                lines.push(`| \`${svc}\` | \`${stagingImage}\` | \`${prodImage}\` |`);
               }
+              lines.push('');
+              lines.push(`> Tags: \`:latest\` and \`:${commitSha}\``);
               lines.push('');
             }
             
@@ -331,24 +339,30 @@ jobs:
           
           echo "Environment: $TARGET_ENV"
 
-      - name: Generate image name
+      - name: Get image name from config
         id: image
         env:
           SERVICE: ${{ matrix.service }}
           TARGET_ENV: ${{ steps.env.outputs.TARGET_ENV }}
           AWS_ACCOUNT_ID: ${{ steps.env.outputs.AWS_ACCOUNT_ID }}
           AWS_REGION: ${{ inputs.aws-region }}
-          IMAGE_PATTERN: ${{ inputs.image-name-pattern }}
-          REPO_NAME: ${{ github.event.repository.name }}
+          SERVICES_CONFIG: ${{ inputs.services-config }}
         run: |
-          # Sanitize repo name (replace dashes with underscores)
-          REPO_NAME_SAFE=$(echo "$REPO_NAME" | tr '-' '_')
+          # Get image name from services-config based on environment
+          # Normalize environment name for config lookup
+          if [ "$TARGET_ENV" = "prod" ]; then
+            CONFIG_ENV="production"
+          else
+            CONFIG_ENV="$TARGET_ENV"
+          fi
           
-          # Generate image name from pattern
-          IMAGE_NAME=$(echo "$IMAGE_PATTERN" | sed \
-            -e "s/{env}/$TARGET_ENV/g" \
-            -e "s/{repo}/$REPO_NAME_SAFE/g" \
-            -e "s/{service}/$SERVICE/g")
+          IMAGE_NAME=$(echo "$SERVICES_CONFIG" | jq -r ".[\"$SERVICE\"][\"$CONFIG_ENV\"] // empty")
+          
+          if [ -z "$IMAGE_NAME" ]; then
+            echo "ERROR: No image name configured for service '$SERVICE' in environment '$CONFIG_ENV'"
+            echo "Available config: $SERVICES_CONFIG"
+            exit 1
+          fi
           
           ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
           FULL_IMAGE="${ECR_REGISTRY}/${IMAGE_NAME}"
@@ -367,21 +381,17 @@ jobs:
           aws-region: ${{ inputs.aws-region }}
           audience: sts.amazonaws.com
 
-      - name: Create ECR repository if not exists
+      - name: Verify ECR repository exists
         env:
           IMAGE_NAME: ${{ steps.image.outputs.IMAGE_NAME }}
           AWS_REGION: ${{ inputs.aws-region }}
         run: |
           if ! aws ecr describe-repositories --repository-names "$IMAGE_NAME" --region "$AWS_REGION" 2>/dev/null; then
-            echo "Creating ECR repository: $IMAGE_NAME"
-            aws ecr create-repository \
-              --repository-name "$IMAGE_NAME" \
-              --region "$AWS_REGION" \
-              --image-scanning-configuration scanOnPush=true \
-              --encryption-configuration encryptionType=AES256
-          else
-            echo "ECR repository already exists: $IMAGE_NAME"
+            echo "ERROR: ECR repository '$IMAGE_NAME' does not exist!"
+            echo "Please create the repository before running this workflow."
+            exit 1
           fi
+          echo "✅ ECR repository exists: $IMAGE_NAME"
 
       - name: Login to Amazon ECR
         uses: aws-actions/amazon-ecr-login@v2
