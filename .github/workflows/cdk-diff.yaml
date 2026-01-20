@@ -529,8 +529,16 @@ jobs:
               ]
             });
             
-            // Stack details
+            // Stack details (Slack has a 50 block limit, so we need to be concise)
+            const maxBlocks = 45; // Leave room for header/summary
+            let truncated = false;
+            
             for (const stack of changed) {
+              if (blocks.length >= maxBlocks) {
+                truncated = true;
+                break;
+              }
+              
               blocks.push({ type: 'divider' });
               blocks.push({
                 type: 'section',
@@ -544,46 +552,25 @@ jobs:
                 byAction[res.action].push(res);
               }
               
-              // Additions
+              // Compact summary for Slack - just show resource names grouped by action
+              const parts = [];
               if (byAction.ADD.length > 0) {
-                blocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: '🟢 *Additions*' }] });
-                const fields = byAction.ADD.map(r => ({ type: 'mrkdwn', text: `\`${shortType(r.type)}\`\n${cleanId(r.logicalId)}` }));
-                // Block Kit allows max 10 fields per section
-                for (let i = 0; i < fields.length; i += 10) {
-                  blocks.push({ type: 'section', fields: fields.slice(i, i + 10) });
-                }
+                parts.push(`🟢 ${byAction.ADD.map(r => cleanId(r.logicalId)).join(', ')}`);
               }
-              
-              // Updates with property details
               if (byAction.UPDATE.length > 0) {
-                blocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: '🟡 *Updates*' }] });
-                for (const res of byAction.UPDATE) {
-                  const propFields = res.properties.map(p => {
-                    const oldVal = p.oldValue || '_(none)_';
-                    const newVal = p.newValue || '_(removed)_';
-                    return { type: 'mrkdwn', text: `*${p.name}*\n*OLD:* ${oldVal}\n*NEW:* ${newVal}` };
-                  });
-                  
-                  blocks.push({
-                    type: 'section',
-                    text: { type: 'mrkdwn', text: `\`${shortType(res.type)}\` *${cleanId(res.logicalId)}*` }
-                  });
-                  
-                  // Add property fields in chunks of 10
-                  for (let i = 0; i < propFields.length; i += 10) {
-                    blocks.push({ type: 'section', fields: propFields.slice(i, i + 10) });
-                  }
-                }
+                parts.push(`🟡 ${byAction.UPDATE.map(r => cleanId(r.logicalId)).join(', ')}`);
+              }
+              if (byAction.REMOVE.length > 0) {
+                parts.push(`🔴 ${byAction.REMOVE.map(r => cleanId(r.logicalId)).join(', ')}`);
               }
               
-              // Deletions
-              if (byAction.REMOVE.length > 0) {
-                blocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: '🔴 *Deletions*' }] });
-                const fields = byAction.REMOVE.map(r => ({ type: 'mrkdwn', text: `\`${shortType(r.type)}\`\n${cleanId(r.logicalId)}` }));
-                for (let i = 0; i < fields.length; i += 10) {
-                  blocks.push({ type: 'section', fields: fields.slice(i, i + 10) });
-                }
+              if (parts.length > 0 && blocks.length < maxBlocks) {
+                blocks.push({ type: 'section', text: { type: 'mrkdwn', text: parts.join('\n') } });
               }
+            }
+            
+            if (truncated) {
+              blocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: `_...and more stacks. See PR for full details._` }] });
             }
             
             core.setOutput('slack_blocks', JSON.stringify(blocks));
