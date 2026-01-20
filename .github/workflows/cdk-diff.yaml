@@ -66,17 +66,31 @@ on:
         default: 'us-east-1'
 
       aws-role-arn:
-        description: 'AWS IAM role ARN to assume'
-        required: true
+        description: 'AWS IAM role ARN to assume (for single account) - DEPRECATED, use aws-role-arns'
+        required: false
         type: string
+        default: ''
+
+      aws-role-arns:
+        description: 'JSON map of account IDs to role ARNs for multi-account diff (e.g. {"123456789012": "arn:aws:iam::123456789012:role/GithubActionsAppRole"})'
+        required: false
+        type: string
+        default: ''
 
       # -----------------------------------------------------------------------
       # CDK Diff Configuration
       # -----------------------------------------------------------------------
       stacks:
-        description: 'Space-separated list of stack names to diff'
-        required: true
+        description: 'Space-separated list of stack names to diff (for single account mode)'
+        required: false
         type: string
+        default: ''
+
+      stacks-per-account:
+        description: 'JSON map of account IDs to stack lists (e.g. {"123456789012": "StackA StackB", "987654321098": "StackC StackD"})'
+        required: false
+        type: string
+        default: ''
 
       enable-drift-detection:
         description: 'Whether to run drift detection'
@@ -171,9 +185,10 @@ jobs:
         run: npm install -g aws-cdk
 
       # -----------------------------------------------------------------------
-      # 2.4 AWS Authentication
+      # 2.4 AWS Authentication (Single Account Mode)
       # -----------------------------------------------------------------------
-      - name: Configure AWS credentials
+      - name: Configure AWS credentials (single account)
+        if: inputs.aws-role-arn != '' && inputs.aws-role-arns == ''
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ inputs.aws-role-arn }}
@@ -181,20 +196,25 @@ jobs:
           aws-region: ${{ inputs.aws-region }}
 
       # -----------------------------------------------------------------------
-      # 2.5 CDK Synthesis
+      # 2.5 CDK Synthesis (Single Account Mode)
       # -----------------------------------------------------------------------
-      - name: Synth CDK app
+      - name: Synth CDK app (single account)
+        if: inputs.aws-role-arn != '' && inputs.aws-role-arns == ''
         run: npx cdk synth --quiet --output cdk.out
 
       # =======================================================================
       # SECTION 3: CDK DIFF & DRIFT DETECTION
       # =======================================================================
       # This is the main logic that:
-      #   - Iterates through each stack
+      #   - Iterates through each stack (or each account for multi-account mode)
       #   - Handles cross-account role assumption
       #   - Runs `cdk diff` to detect changes
       #   - Runs CloudFormation drift detection (if enabled)
       #   - Aggregates results into JSON output
+      #
+      # MODES:
+      #   - Single Account: Uses aws-role-arn and stacks inputs
+      #   - Multi Account: Uses aws-role-arns and stacks-per-account inputs
       #
       # HELPER FUNCTIONS:
       #   - get_stack_account()    : Gets AWS account ID from CDK manifest
@@ -207,6 +227,9 @@ jobs:
         id: diff
         env:
           STACKS: ${{ inputs.stacks }}
+          STACKS_PER_ACCOUNT: ${{ inputs.stacks-per-account }}
+          AWS_ROLE_ARNS: ${{ inputs.aws-role-arns }}
+          SINGLE_ROLE_ARN: ${{ inputs.aws-role-arn }}
           ENABLE_DRIFT: ${{ inputs.enable-drift-detection }}
           AWS_REGION: ${{ inputs.aws-region }}
           ACCOUNT_NAMES: ${{ inputs.account-names }}
@@ -214,20 +237,23 @@ jobs:
           echo "=== Starting CDK Diff ==="
           
           # ---------------------------------------------------------------------
-          # 3.1 Initialize: Capture Current Account & Store Original Credentials
+          # 3.1 Initialize Variables
           # ---------------------------------------------------------------------
-          # We need to save original credentials so we can restore them after
-          # assuming roles in other accounts (for cross-account deployments).
-          # ---------------------------------------------------------------------
-          CURRENT_ACCOUNT=$(aws sts get-caller-identity --query 'Account' --output text)
-          echo "Current AWS account: $CURRENT_ACCOUNT"
-          
-          ORIGINAL_ACCESS_KEY="$AWS_ACCESS_KEY_ID"
-          ORIGINAL_SECRET_KEY="$AWS_SECRET_ACCESS_KEY"
-          ORIGINAL_SESSION_TOKEN="$AWS_SESSION_TOKEN"
-          
-          # Results array - will hold diff results for all stacks
           RESULTS="[]"
+          
+          # Determine mode: multi-account or single-account
+          if [ -n "$AWS_ROLE_ARNS" ] && [ "$AWS_ROLE_ARNS" != "{}" ]; then
+            echo "Running in MULTI-ACCOUNT mode"
+            MULTI_ACCOUNT_MODE=true
+          else
+            echo "Running in SINGLE-ACCOUNT mode"
+            MULTI_ACCOUNT_MODE=false
+            CURRENT_ACCOUNT=$(aws sts get-caller-identity --query 'Account' --output text)
+            echo "Current AWS account: $CURRENT_ACCOUNT"
+            ORIGINAL_ACCESS_KEY="$AWS_ACCESS_KEY_ID"
+            ORIGINAL_SECRET_KEY="$AWS_SECRET_ACCESS_KEY"
+            ORIGINAL_SESSION_TOKEN="$AWS_SESSION_TOKEN"
+          fi
           
           # ---------------------------------------------------------------------
           # 3.2 Helper Function: get_stack_account
@@ -338,22 +364,79 @@ jobs:
           }
           
           # =====================================================================
-          # 3.7 Main Loop: Process Each Stack
+          # 3.7 Multi-Account Processing Function
           # =====================================================================
-          # For each stack:
-          #   1. Determine target account and CF stack name
-          #   2. Assume cross-account role if needed
-          #   3. Run cdk diff
-          #   4. Count changes (adds, updates, destroys, replaces)
-          #   5. Run drift detection (if enabled)
-          #   6. Aggregate results
+          # This function processes all stacks for a given account:
+          #   1. Assumes the role for the account
+          #   2. Runs cdk synth for that account
+          #   3. Processes each stack with diff and drift detection
           # =====================================================================
-          for STACK in $STACKS; do
+          process_account_stacks() {
+            local account_id="$1"
+            local role_arn="$2"
+            local account_stacks="$3"
+            
+            echo ""
+            echo "=========================================="
+            echo "Processing account: $account_id"
+            echo "Role: $role_arn"
+            echo "Stacks: $account_stacks"
+            echo "=========================================="
+            
+            # Assume role via AWS CLI (we'll use the OIDC token from GitHub)
+            echo "Assuming role for account $account_id..."
+            
+            # Get OIDC token from GitHub
+            local token=$(curl -s -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+              "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=sts.amazonaws.com" | jq -r '.value')
+            
+            # Assume role with web identity
+            local creds=$(aws sts assume-role-with-web-identity \
+              --role-arn "$role_arn" \
+              --role-session-name "cdk-diff-$account_id" \
+              --web-identity-token "$token" \
+              --duration-seconds 3600 \
+              --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' \
+              --output text 2>&1) || {
+                echo "Failed to assume role: $creds"
+                return 1
+              }
+            
+            export AWS_ACCESS_KEY_ID=$(echo "$creds" | cut -f1)
+            export AWS_SECRET_ACCESS_KEY=$(echo "$creds" | cut -f2)
+            export AWS_SESSION_TOKEN=$(echo "$creds" | cut -f3)
+            
+            local current=$(aws sts get-caller-identity --query 'Account' --output text)
+            echo "Now authenticated as account: $current"
+            
+            # Synth CDK app for this account
+            echo "Running cdk synth for account $account_id..."
+            rm -rf cdk.out 2>/dev/null || true
+            npx cdk synth --quiet --output cdk.out
+            
+            # Set current account for helper functions
+            CURRENT_ACCOUNT="$account_id"
+            ORIGINAL_ACCESS_KEY="$AWS_ACCESS_KEY_ID"
+            ORIGINAL_SECRET_KEY="$AWS_SECRET_ACCESS_KEY"
+            ORIGINAL_SESSION_TOKEN="$AWS_SESSION_TOKEN"
+            
+            # Process each stack
+            for STACK in $account_stacks; do
+              process_single_stack "$STACK"
+            done
+          }
+          
+          # =====================================================================
+          # 3.8 Single Stack Processing Function
+          # =====================================================================
+          process_single_stack() {
+            local STACK="$1"
+            
             echo ""
             echo "=== Processing stack: $STACK ==="
             
             # -------------------------------------------------------------------
-            # 3.7.1 Resolve Stack Metadata
+            # Resolve Stack Metadata
             # -------------------------------------------------------------------
             TARGET_ACCOUNT=$(get_stack_account "$STACK")
             CF_STACK_NAME=$(get_cf_stack_name "$STACK")
@@ -363,151 +446,131 @@ jobs:
             echo "CloudFormation stack name: $CF_STACK_NAME"
             
             # -------------------------------------------------------------------
-            # 3.7.2 Cross-Account Role Assumption
+            # Cross-Account Role Assumption (for single-account mode)
             # -------------------------------------------------------------------
-            # If the stack deploys to a different account, assume the CDK lookup
-            # role in that account to perform drift detection.
-            # -------------------------------------------------------------------
-            if [ "$TARGET_ACCOUNT" != "$CURRENT_ACCOUNT" ]; then
+            if [ "$MULTI_ACCOUNT_MODE" = "false" ] && [ "$TARGET_ACCOUNT" != "$CURRENT_ACCOUNT" ]; then
               assume_target_role "$TARGET_ACCOUNT" || true
             fi
             
             # -------------------------------------------------------------------
-            # 3.7.3 Run CDK Diff
-            # -------------------------------------------------------------------
-            # Execute cdk diff and capture output. The diff shows:
-            #   [+] = Resources to be added
-            #   [~] = Resources to be modified
-            #   [-] = Resources to be removed
+            # Run CDK Diff
             # -------------------------------------------------------------------
             echo "Running cdk diff..."
             DIFF_OUTPUT=$(npx cdk diff "$STACK" --no-color 2>&1) || true
             
-            # Check if stack exists (new stacks show "does not exist" message)
+            # Check if stack exists
             STACK_EXISTS="true"
             if echo "$DIFF_OUTPUT" | grep -q "does not exist\|has not been deployed"; then
               STACK_EXISTS="false"
             fi
             
             # -------------------------------------------------------------------
-            # 3.7.4 Count Resource Changes
-            # -------------------------------------------------------------------
-            # Parse the diff output to count different types of changes.
-            # We look for AWS:: prefixed lines to count actual resource changes.
+            # Count Resource Changes
             # -------------------------------------------------------------------
             ADDS=$(echo "$DIFF_OUTPUT" | grep -E '\[\+\] AWS::' | wc -l | tr -d ' ')
             UPDATES=$(echo "$DIFF_OUTPUT" | grep -E '\[~\] AWS::' | wc -l | tr -d ' ')
             DESTROYS=$(echo "$DIFF_OUTPUT" | grep -E '\[-\] AWS::' | wc -l | tr -d ' ')
             REPLACES=$(echo "$DIFF_OUTPUT" | grep -i 'replace' | wc -l | tr -d ' ')
             
-            # Ensure numbers are valid (default to 0 if parsing failed)
+            # Ensure numbers are valid
             ADDS=${ADDS:-0}
             UPDATES=${UPDATES:-0}
             DESTROYS=${DESTROYS:-0}
             REPLACES=${REPLACES:-0}
-            [[ "$ADDS" =~ ^[0-9]+$ ]] || ADDS=0
-            [[ "$UPDATES" =~ ^[0-9]+$ ]] || UPDATES=0
-            [[ "$DESTROYS" =~ ^[0-9]+$ ]] || DESTROYS=0
-            [[ "$REPLACES" =~ ^[0-9]+$ ]] || REPLACES=0
-            
-            echo "Change counts: adds=$ADDS, updates=$UPDATES, destroys=$DESTROYS, replaces=$REPLACES"
             
             # -------------------------------------------------------------------
-            # 3.7.5 Drift Detection
+            # Drift Detection
             # -------------------------------------------------------------------
-            # If enabled, detect configuration drift between the CloudFormation
-            # template and actual deployed resources. This helps identify manual
-            # changes made outside of CDK/CloudFormation.
-            #
-            # Drift statuses:
-            #   - IN_SYNC: No drift detected
-            #   - DRIFTED: Resources have drifted from template
-            #   - NOT_SUPPORTED: Some resources don't support drift detection
-            # -------------------------------------------------------------------
-            DRIFT_STATUS="⏭️ Skipped"
-            DRIFT_DETAILS=""
-            
-            if [ "$ENABLE_DRIFT" = "true" ]; then
-              # Check if stack is deployed before running drift detection
-              if aws cloudformation describe-stacks --stack-name "$CF_STACK_NAME" >/dev/null 2>&1; then
-                # Initiate drift detection
-                DRIFT_ID=$(aws cloudformation detect-stack-drift --stack-name "$CF_STACK_NAME" --query 'StackDriftDetectionId' --output text 2>/dev/null) || true
-                
-                if [ -n "$DRIFT_ID" ] && [ "$DRIFT_ID" != "None" ]; then
-                  # Poll for drift detection completion (max 60 seconds = 12 * 5s)
-                  for i in {1..12}; do
-                    sleep 5
-                    DRIFT_CHECK=$(aws cloudformation describe-stack-drift-detection-status \
+            DRIFT_STATUS="NOT_CHECKED"
+            if [ "$ENABLE_DRIFT" = "true" ] && [ "$STACK_EXISTS" = "true" ]; then
+              echo "Running drift detection..."
+              DRIFT_ID=$(aws cloudformation detect-stack-drift --stack-name "$CF_STACK_NAME" --query 'StackDriftDetectionId' --output text 2>/dev/null) || true
+              
+              if [ -n "$DRIFT_ID" ] && [ "$DRIFT_ID" != "None" ]; then
+                for i in {1..20}; do
+                  sleep 3
+                  STATUS=$(aws cloudformation describe-stack-drift-detection-status \
+                    --stack-drift-detection-id "$DRIFT_ID" \
+                    --query 'DetectionStatus' --output text 2>/dev/null) || break
+                  
+                  if [ "$STATUS" = "DETECTION_COMPLETE" ]; then
+                    DRIFT_STATUS=$(aws cloudformation describe-stack-drift-detection-status \
                       --stack-drift-detection-id "$DRIFT_ID" \
-                      --query 'DetectionStatus' --output text 2>/dev/null) || echo "FAILED"
-                    
-                    if [ "$DRIFT_CHECK" = "DETECTION_COMPLETE" ]; then
-                      # Get final drift status
-                      DRIFT_RESULT=$(aws cloudformation describe-stack-drift-detection-status \
-                        --stack-drift-detection-id "$DRIFT_ID" \
-                        --query 'StackDriftStatus' --output text 2>/dev/null) || echo "UNKNOWN"
-                      
-                      if [ "$DRIFT_RESULT" = "IN_SYNC" ]; then
-                        DRIFT_STATUS="✅ In Sync"
-                      elif [ "$DRIFT_RESULT" = "DRIFTED" ]; then
-                        DRIFT_STATUS="🚨 Drifted"
-                        # Get detailed drift information for reporting
-                        DRIFT_DETAILS=$(aws cloudformation describe-stack-resource-drifts \
-                          --stack-name "$CF_STACK_NAME" \
-                          --stack-resource-drift-status-filters MODIFIED DELETED \
-                          --query 'StackResourceDrifts[].{Type:ResourceType,Id:LogicalResourceId,Status:StackResourceDriftStatus,Props:PropertyDifferences}' \
-                          --output json 2>/dev/null) || echo "[]"
-                      else
-                        DRIFT_STATUS="⚠️ $DRIFT_RESULT"
-                      fi
-                      break
-                    elif [ "$DRIFT_CHECK" = "DETECTION_FAILED" ]; then
-                      DRIFT_STATUS="⚠️ Not Supported"
-                      break
-                    fi
-                  done
-                else
-                  DRIFT_STATUS="⚠️ Not Supported"
-                fi
-              else
-                DRIFT_STATUS="🆕 Not Deployed"
+                      --query 'StackDriftStatus' --output text 2>/dev/null) || DRIFT_STATUS="UNKNOWN"
+                    break
+                  elif [ "$STATUS" = "DETECTION_FAILED" ]; then
+                    DRIFT_STATUS="DETECTION_FAILED"
+                    break
+                  fi
+                done
               fi
+            elif [ "$STACK_EXISTS" = "false" ]; then
+              DRIFT_STATUS="NOT_DEPLOYED"
             fi
             
-            # Restore original credentials for next iteration
-            restore_credentials
+            echo "Drift status: $DRIFT_STATUS"
             
             # -------------------------------------------------------------------
-            # 3.7.6 Clean & Aggregate Results
+            # Restore credentials (for single-account mode cross-account)
             # -------------------------------------------------------------------
-            # Remove CDK notices/warnings from diff output and build JSON result.
-            # -------------------------------------------------------------------
-            CLEAN_DIFF=$(echo "$DIFF_OUTPUT" | grep -v "^Notice:" | grep -v "^\*\*\*" | grep -v "newer version" | grep -v "Please upgrade")
-            
-            # Ensure drift details is valid JSON
-            if [ -z "$DRIFT_DETAILS" ]; then
-              DRIFT_DETAILS_ESCAPED="[]"
-            else
-              DRIFT_DETAILS_ESCAPED=$(echo "$DRIFT_DETAILS" | jq -c '.' 2>/dev/null || echo "[]")
+            if [ "$MULTI_ACCOUNT_MODE" = "false" ]; then
+              restore_credentials
             fi
             
-            # Build JSON result object for this stack
+            # -------------------------------------------------------------------
+            # Aggregate Results
+            # -------------------------------------------------------------------
+            ESCAPED_DIFF=$(echo "$DIFF_OUTPUT" | jq -Rs '.')
             RESULT=$(jq -n \
               --arg stack "$STACK" \
+              --arg account "$TARGET_ACCOUNT" \
+              --arg account_name "$ACCOUNT_NAME" \
+              --arg cf_stack "$CF_STACK_NAME" \
+              --arg diff "$DIFF_OUTPUT" \
+              --arg drift "$DRIFT_STATUS" \
+              --arg exists "$STACK_EXISTS" \
               --argjson adds "$ADDS" \
               --argjson updates "$UPDATES" \
               --argjson destroys "$DESTROYS" \
               --argjson replaces "$REPLACES" \
-              --arg drift "$DRIFT_STATUS" \
-              --argjson drift_details "$DRIFT_DETAILS_ESCAPED" \
-              --arg diff "$CLEAN_DIFF" \
-              --arg account_name "$ACCOUNT_NAME" \
-              --arg stack_exists "$STACK_EXISTS" \
-              '{stack: $stack, adds: $adds, updates: $updates, destroys: $destroys, replaces: $replaces, drift: $drift, drift_details: $drift_details, diff: $diff, account_name: $account_name, stack_exists: $stack_exists}')
+              '{stack: $stack, account: $account, account_name: $account_name, cf_stack: $cf_stack, diff: $diff, drift: $drift, exists: $exists, adds: $adds, updates: $updates, destroys: $destroys, replaces: $replaces}')
             
-            # Append to results array
-            RESULTS=$(echo "$RESULTS" | jq --argjson result "$RESULT" '. + [$result]')
-          done
+            RESULTS=$(echo "$RESULTS" | jq --argjson r "$RESULT" '. + [$r]')
+          }
+          
+          # =====================================================================
+          # 3.9 Main Processing Logic
+          # =====================================================================
+          if [ "$MULTI_ACCOUNT_MODE" = "true" ]; then
+            # Multi-account mode: iterate through each account
+            echo "Processing multiple accounts..."
+            
+            # Parse accounts from AWS_ROLE_ARNS JSON
+            ACCOUNTS=$(echo "$AWS_ROLE_ARNS" | jq -r 'keys[]')
+            
+            for ACCOUNT_ID in $ACCOUNTS; do
+              ROLE_ARN=$(echo "$AWS_ROLE_ARNS" | jq -r ".[\"$ACCOUNT_ID\"]")
+              
+              # Get stacks for this account from STACKS_PER_ACCOUNT
+              if [ -n "$STACKS_PER_ACCOUNT" ] && [ "$STACKS_PER_ACCOUNT" != "{}" ]; then
+                ACCOUNT_STACKS=$(echo "$STACKS_PER_ACCOUNT" | jq -r ".[\"$ACCOUNT_ID\"] // \"\"")
+              else
+                # If no per-account stacks specified, use the general STACKS list
+                ACCOUNT_STACKS="$STACKS"
+              fi
+              
+              if [ -n "$ACCOUNT_STACKS" ]; then
+                process_account_stacks "$ACCOUNT_ID" "$ROLE_ARN" "$ACCOUNT_STACKS"
+              else
+                echo "No stacks specified for account $ACCOUNT_ID, skipping..."
+              fi
+            done
+          else
+            # Single-account mode: process stacks directly
+            for STACK in $STACKS; do
+              process_single_stack "$STACK"
+            done
+          fi
           
           # Output results for next step
           echo "results<<EOF" >> $GITHUB_OUTPUT
