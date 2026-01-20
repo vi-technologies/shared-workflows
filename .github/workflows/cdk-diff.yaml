@@ -385,7 +385,7 @@ jobs:
                   md += '**➕ Create**\n';
                   for (const r of byAction.ADD) {
                     md += `- \`${shortType(r.type)}\` **${cleanId(r.logicalId)}**\n`;
-                    for (const p of r.properties) if (p.newValue) md += `  - \`${p.name}\`: ${p.newValue}\n`;
+                    for (const p of r.properties) if (p.newValue) md += `  - \`${p.name}\`:\n\`\`\`\n${p.newValue}\n\`\`\`\n`;
                   }
                   md += '\n';
                 }
@@ -395,7 +395,8 @@ jobs:
                     md += `- \`${shortType(r.type)}\` **${cleanId(r.logicalId)}**${r.properties.some(p => p.impact === 'WILL_REPLACE') ? ' ⚠️' : ''}\n`;
                     for (const p of r.properties) {
                       md += `  - \`${p.name}\`${p.impact === 'WILL_REPLACE' ? ' ⚠️replace' : ''}\n`;
-                      md += `    **OLD:** ${p.oldValue || '_(none)_'}\n    **NEW:** ${p.newValue || '_(removed)_'}\n`;
+                      md += `    **OLD:**\n\`\`\`\n${p.oldValue || '(none)'}\n\`\`\`\n`;
+                      md += `    **NEW:**\n\`\`\`\n${p.newValue || '(removed)'}\n\`\`\`\n`;
                     }
                   }
                   md += '\n';
@@ -435,9 +436,34 @@ jobs:
               let txt = `📦 *${stack.stackName}* _(${getEnv(stack.stackName)})_`;
               const byAction = { ADD: [], UPDATE: [], REMOVE: [] };
               for (const res of stack.resources) byAction[res.action].push(res);
-              if (byAction.ADD.length) { txt += '\n🟢 '; for (const r of byAction.ADD) txt += `\`${shortType(r.type)}\` `; }
-              if (byAction.UPDATE.length) { txt += '\n🟡 '; for (const r of byAction.UPDATE) txt += `\`${shortType(r.type)}\` `; }
-              if (byAction.REMOVE.length) { txt += '\n🔴 '; for (const r of byAction.REMOVE) txt += `\`${shortType(r.type)}\` `; }
+              
+              if (byAction.ADD.length) {
+                txt += '\n🟢 *Create*';
+                for (const r of byAction.ADD) {
+                  txt += `\n• \`${shortType(r.type)}\` *${cleanId(r.logicalId)}*`;
+                  for (const p of r.properties.slice(0, 3)) {
+                    if (p.newValue) txt += `\n   \`${p.name}\`:\n\`\`\`${p.newValue}\`\`\``;
+                  }
+                  if (r.properties.length > 3) txt += `\n   _+${r.properties.length - 3} more..._`;
+                }
+              }
+              if (byAction.UPDATE.length) {
+                txt += '\n🟡 *Update*';
+                for (const r of byAction.UPDATE) {
+                  txt += `\n• \`${shortType(r.type)}\` *${cleanId(r.logicalId)}*`;
+                  for (const p of r.properties.slice(0, 2)) {
+                    txt += `\n   \`${p.name}\`${p.impact === 'WILL_REPLACE' ? ' ⚠️' : ''}`;
+                    txt += `\n   *OLD:*\n\`\`\`${p.oldValue || '(none)'}\`\`\``;
+                    txt += `\n   *NEW:*\n\`\`\`${p.newValue || '(removed)'}\`\`\``;
+                  }
+                  if (r.properties.length > 2) txt += `\n   _+${r.properties.length - 2} more properties..._`;
+                }
+              }
+              if (byAction.REMOVE.length) {
+                txt += '\n🔴 *Destroy*';
+                for (const r of byAction.REMOVE) txt += `\n• \`${shortType(r.type)}\` *${cleanId(r.logicalId)}*`;
+              }
+              
               blocks.push({ type: 'section', text: { type: 'mrkdwn', text: txt } });
             }
             if (changed.length > 5) blocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: `_+${changed.length - 5} more stacks..._` }] });
