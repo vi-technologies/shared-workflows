@@ -328,7 +328,7 @@ jobs:
           echo "EOF" >> $GITHUB_OUTPUT
 
   # ===========================================================================
-  # COMMENT: Post PR comment and Slack (using shared formatter)
+  # COMMENT: Post PR comment and Slack (inline formatter)
   # ===========================================================================
   comment:
     name: Post Comment
@@ -338,13 +338,6 @@ jobs:
     permissions:
       pull-requests: write
     steps:
-      - name: Checkout shared-workflows for formatter
-        uses: actions/checkout@v4
-        with:
-          repository: vi-technologies/shared-workflows
-          path: .shared-workflows
-          sparse-checkout: .github/scripts
-
       - name: Generate comment and Slack blocks
         id: format
         env:
@@ -362,6 +355,129 @@ jobs:
             exit 0
           fi
           
+          # Create inline formatter script
+          cat > /tmp/format-cdk-diff.js << 'FORMATTER_SCRIPT'
+          const getEnv = (n) => n.toLowerCase().includes('prod') ? 'production' : n.toLowerCase().includes('staging') ? 'staging' : 'dev';
+          const cleanId = (id) => id.replace(/[A-F0-9]{8}$/i, '').replace(/([a-z])([A-Z])/g, '$1 $2');
+          const shortType = (t) => t.split('::').pop();
+          
+          function formatMarkdown(data, context) {
+            const { repo, runUrl, prUrl, prNum, isDeployment } = context;
+            const changed = data.stacks?.filter(s => s.hasDiff) || [];
+            const unchanged = data.stacks?.filter(s => !s.hasDiff) || [];
+            const adds = data.stacks?.reduce((n, s) => n + s.resources.filter(r => r.action === 'ADD').length, 0) || 0;
+            const updates = data.stacks?.reduce((n, s) => n + s.resources.filter(r => r.action === 'UPDATE').length, 0) || 0;
+            const removes = data.stacks?.reduce((n, s) => n + s.resources.filter(r => r.action === 'REMOVE').length, 0) || 0;
+            
+            let md = `## 🔍 CDK Diff\n\n`;
+            md += `| 🟢 Add | 🟡 Update | 🔴 Remove | 📦 Stacks |\n|:---:|:---:|:---:|:---:|\n| ${adds} | ${updates} | ${removes} | ${changed.length} |\n\n`;
+            
+            for (const stack of changed) {
+              const env = getEnv(stack.stackName);
+              md += `### 📦 ${stack.stackName} _(${env})_\n`;
+              if (stack.drift?.status === 'DRIFTED') md += `> ⚠️ **Drift detected**: ${stack.drift.count} resources\n\n`;
+              
+              const byAction = { ADD: [], UPDATE: [], REMOVE: [] };
+              for (const res of stack.resources) byAction[res.action].push(res);
+              
+              if (byAction.ADD.length) {
+                md += `\n#### 🟢 Create\n`;
+                for (const r of byAction.ADD) {
+                  md += `- **${cleanId(r.logicalId)}** \`${shortType(r.type)}\`\n`;
+                  for (const p of (r.properties || []).slice(0, 3)) {
+                    if (p.newValue) md += `  - \`${p.name}\`:\n\`\`\`\n${p.newValue}\n\`\`\`\n`;
+                  }
+                  if ((r.properties || []).length > 3) md += `  - _+${r.properties.length - 3} more properties..._\n`;
+                }
+              }
+              if (byAction.UPDATE.length) {
+                md += `\n#### 🟡 Update\n`;
+                for (const r of byAction.UPDATE) {
+                  md += `- **${cleanId(r.logicalId)}** \`${shortType(r.type)}\`\n`;
+                  for (const p of (r.properties || []).slice(0, 3)) {
+                    md += `  - \`${p.name}\`${p.impact === 'WILL_REPLACE' ? ' ⚠️ **REPLACE**' : ''}\n`;
+                    md += `    | OLD | NEW |\n    |-----|-----|\n    | \`${p.oldValue || '(none)'}\` | \`${p.newValue || '(removed)'}\` |\n`;
+                  }
+                  if ((r.properties || []).length > 3) md += `  - _+${r.properties.length - 3} more properties..._\n`;
+                }
+              }
+              if (byAction.REMOVE.length) {
+                md += `\n#### 🔴 Destroy\n`;
+                for (const r of byAction.REMOVE) md += `- **${cleanId(r.logicalId)}** \`${shortType(r.type)}\`\n`;
+              }
+              md += '\n---\n';
+            }
+            if (unchanged.length) md += `\n<details><summary>📋 ${unchanged.length} unchanged stacks</summary>\n\n${unchanged.map(s => `- ${s.stackName}`).join('\n')}\n</details>\n`;
+            return md;
+          }
+          
+          function formatSlackBlocks(data, context) {
+            const { repo, runUrl, prUrl, prNum } = context;
+            const changed = data.stacks?.filter(s => s.hasDiff) || [];
+            const adds = data.stacks?.reduce((n, s) => n + s.resources.filter(r => r.action === 'ADD').length, 0) || 0;
+            const updates = data.stacks?.reduce((n, s) => n + s.resources.filter(r => r.action === 'UPDATE').length, 0) || 0;
+            const removes = data.stacks?.reduce((n, s) => n + s.resources.filter(r => r.action === 'REMOVE').length, 0) || 0;
+            
+            const blocks = [
+              { type: 'header', text: { type: 'plain_text', text: '🔍 CDK Diff', emoji: true } },
+              { type: 'context', elements: [{ type: 'mrkdwn', text: `<${prUrl}|PR #${prNum}> in \`${repo}\`` }] },
+              { type: 'section', fields: [
+                { type: 'mrkdwn', text: `🟢 *Add*\n${adds}` }, { type: 'mrkdwn', text: `🟡 *Update*\n${updates}` },
+                { type: 'mrkdwn', text: `🔴 *Remove*\n${removes}` }, { type: 'mrkdwn', text: `📦 *Stacks*\n${changed.length}` }
+              ]},
+              { type: 'actions', elements: [
+                { type: 'button', text: { type: 'plain_text', text: 'View PR' }, url: prUrl },
+                { type: 'button', text: { type: 'plain_text', text: 'Workflow' }, url: runUrl }
+              ]}
+            ];
+            
+            for (const stack of changed.slice(0, 5)) {
+              blocks.push({ type: 'divider' });
+              let txt = `📦 *${stack.stackName}* _(${getEnv(stack.stackName)})_`;
+              const byAction = { ADD: [], UPDATE: [], REMOVE: [] };
+              for (const res of stack.resources) byAction[res.action].push(res);
+              
+              if (byAction.ADD.length) {
+                txt += '\n🟢 *Create*';
+                for (const r of byAction.ADD) {
+                  txt += `\n• \`${shortType(r.type)}\` *${cleanId(r.logicalId)}*`;
+                  for (const p of (r.properties || []).slice(0, 3)) {
+                    if (p.newValue) txt += `\n   \`${p.name}\`:\n\`\`\`${p.newValue}\`\`\``;
+                  }
+                  if ((r.properties || []).length > 3) txt += `\n   _+${r.properties.length - 3} more..._`;
+                }
+              }
+              if (byAction.UPDATE.length) {
+                txt += '\n🟡 *Update*';
+                for (const r of byAction.UPDATE) {
+                  txt += `\n• \`${shortType(r.type)}\` *${cleanId(r.logicalId)}*`;
+                  for (const p of (r.properties || []).slice(0, 2)) {
+                    txt += `\n   \`${p.name}\`${p.impact === 'WILL_REPLACE' ? ' ⚠️' : ''}`;
+                    txt += `\n   *OLD:*\n\`\`\`${p.oldValue || '(none)'}\`\`\``;
+                    txt += `\n   *NEW:*\n\`\`\`${p.newValue || '(removed)'}\`\`\``;
+                  }
+                  if ((r.properties || []).length > 2) txt += `\n   _+${r.properties.length - 2} more properties..._`;
+                }
+              }
+              if (byAction.REMOVE.length) {
+                txt += '\n🔴 *Destroy*';
+                for (const r of byAction.REMOVE) txt += `\n• \`${shortType(r.type)}\` *${cleanId(r.logicalId)}*`;
+              }
+              blocks.push({ type: 'section', text: { type: 'mrkdwn', text: txt } });
+            }
+            if (changed.length > 5) blocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: `_+${changed.length - 5} more stacks..._` }] });
+            return blocks;
+          }
+          
+          try {
+            const data = JSON.parse(process.argv[2]);
+            const context = JSON.parse(process.argv[3]);
+            console.log(JSON.stringify({ markdown: formatMarkdown(data, context), slack_blocks: formatSlackBlocks(data, context) }));
+          } catch (e) {
+            console.log(JSON.stringify({ markdown: `## 🔍 CDK Diff\n\n❌ Error: ${e.message}`, slack_blocks: [] }));
+          }
+          FORMATTER_SCRIPT
+          
           # Build context for formatter
           CONTEXT_JSON=$(jq -nc \
             --arg repo "$REPO" \
@@ -371,8 +487,8 @@ jobs:
             --argjson isDeployment false \
             '{repo: $repo, runUrl: $runUrl, prUrl: $prUrl, prNum: $prNum, isDeployment: $isDeployment}')
           
-          # Use shared formatter script
-          FORMATTED=$(node .shared-workflows/.github/scripts/format-cdk-diff.js "$DIFF_JSON" "$CONTEXT_JSON")
+          # Use inline formatter script
+          FORMATTED=$(node /tmp/format-cdk-diff.js "$DIFF_JSON" "$CONTEXT_JSON")
           
           # Extract outputs
           MARKDOWN=$(echo "$FORMATTED" | jq -r '.markdown')
