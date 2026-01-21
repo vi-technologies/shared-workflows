@@ -236,7 +236,7 @@ jobs:
             DIFF_JSON='{"success":true,"stacks":[]}'
           fi
           
-          # Create inline formatter script
+          # Create inline formatter script (matches shared format-cdk-diff.js)
           cat > /tmp/format-slack.js << 'FORMATTER_SCRIPT'
           const getEnv = (n) => n.toLowerCase().includes('prod') ? 'production' : n.toLowerCase().includes('staging') ? 'staging' : 'dev';
           const cleanId = (id) => id.replace(/[A-F0-9]{8}$/i, '').replace(/([a-z])([A-Z])/g, '$1 $2');
@@ -270,15 +270,24 @@ jobs:
               
               if (byAction.ADD.length) {
                 txt += '\n🟢 *Create*';
-                for (const r of byAction.ADD) txt += `\n• \`${shortType(r.type)}\` *${cleanId(r.logicalId)}*`;
+                for (const r of byAction.ADD) {
+                  txt += `\n• \`${shortType(r.type)}\` *${cleanId(r.logicalId)}*`;
+                  for (const p of (r.properties || []).slice(0, 3)) {
+                    if (p.newValue) txt += `\n   \`${p.name}\`:\n\`\`\`${p.newValue}\`\`\``;
+                  }
+                  if ((r.properties || []).length > 3) txt += `\n   _+${r.properties.length - 3} more..._`;
+                }
               }
               if (byAction.UPDATE.length) {
                 txt += '\n🟡 *Update*';
                 for (const r of byAction.UPDATE) {
                   txt += `\n• \`${shortType(r.type)}\` *${cleanId(r.logicalId)}*`;
-                  for (const p of r.properties.slice(0, 2)) {
+                  for (const p of (r.properties || []).slice(0, 2)) {
                     txt += `\n   \`${p.name}\`${p.impact === 'WILL_REPLACE' ? ' ⚠️' : ''}`;
+                    txt += `\n   *OLD:*\n\`\`\`${p.oldValue || '(none)'}\`\`\``;
+                    txt += `\n   *NEW:*\n\`\`\`${p.newValue || '(removed)'}\`\`\``;
                   }
+                  if ((r.properties || []).length > 2) txt += `\n   _+${r.properties.length - 2} more properties..._`;
                 }
               }
               if (byAction.REMOVE.length) {
@@ -287,6 +296,7 @@ jobs:
               }
               blocks.push({ type: 'section', text: { type: 'mrkdwn', text: txt } });
             }
+            if (changed.length > 5) blocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: `_+${changed.length - 5} more stacks..._` }] });
             return blocks;
           }
           
