@@ -114,7 +114,7 @@ jobs:
   # SINGLE ACCOUNT MODE
   # ===========================================================================
   diff-single:
-    name: CDK Diff
+    name: Diff (iac-aws-org)
     if: needs.prepare.outputs.is-multi-account == 'false' && inputs.aws-role-arn != ''
     needs: prepare
     runs-on: ubuntu-latest
