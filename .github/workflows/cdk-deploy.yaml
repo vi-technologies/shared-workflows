@@ -90,9 +90,6 @@ on:
       slack-webhook-url:
         description: 'Slack webhook URL for notifications'
         required: false
-      repo-token:
-        description: 'Token with access to shared-workflows repo (for formatter script)'
-        required: false
 
 jobs:
   deploy:
@@ -139,14 +136,6 @@ jobs:
       # =======================================================================
       # CDK SYNTH & DIFF (using toolkit-lib for structured output)
       # =======================================================================
-      - name: Checkout shared-workflows for formatter
-        uses: actions/checkout@v4
-        with:
-          repository: vi-technologies/shared-workflows
-          token: ${{ secrets.repo-token || github.token }}
-          path: .shared-workflows
-          sparse-checkout: .github/scripts
-
       - name: CDK Synth
         run: npx cdk synth --quiet --output cdk.out
 
@@ -222,7 +211,7 @@ jobs:
           echo "Would have deployed: ${{ inputs.stacks }}"
 
       # =======================================================================
-      # SLACK NOTIFICATION (using shared formatter)
+      # SLACK NOTIFICATION (inline formatter)
       # =======================================================================
       - name: Format and send Slack notification
         if: always()
@@ -247,21 +236,78 @@ jobs:
             DIFF_JSON='{"success":true,"stacks":[]}'
           fi
           
-          # Build context for formatter
+          # Create inline formatter script
+          cat > /tmp/format-slack.js << 'FORMATTER_SCRIPT'
+          const getEnv = (n) => n.toLowerCase().includes('prod') ? 'production' : n.toLowerCase().includes('staging') ? 'staging' : 'dev';
+          const cleanId = (id) => id.replace(/[A-F0-9]{8}$/i, '').replace(/([a-z])([A-Z])/g, '$1 $2');
+          const shortType = (t) => t.split('::').pop();
+          
+          function formatSlackBlocks(data, context) {
+            const { repo, runUrl, actor, jobStatus } = context;
+            const changed = data.stacks?.filter(s => s.hasDiff) || [];
+            const adds = data.stacks?.reduce((n, s) => n + s.resources.filter(r => r.action === 'ADD').length, 0) || 0;
+            const updates = data.stacks?.reduce((n, s) => n + s.resources.filter(r => r.action === 'UPDATE').length, 0) || 0;
+            const removes = data.stacks?.reduce((n, s) => n + s.resources.filter(r => r.action === 'REMOVE').length, 0) || 0;
+            
+            const headerText = jobStatus === 'success' ? '✅ CDK Deploy Succeeded' : '❌ CDK Deploy Failed';
+            const blocks = [
+              { type: 'header', text: { type: 'plain_text', text: headerText, emoji: true } },
+              { type: 'context', elements: [{ type: 'mrkdwn', text: `\`${repo}\`${actor ? ` by ${actor}` : ''}` }] },
+              { type: 'section', fields: [
+                { type: 'mrkdwn', text: `🟢 *Add*\n${adds}` },
+                { type: 'mrkdwn', text: `🟡 *Update*\n${updates}` },
+                { type: 'mrkdwn', text: `🔴 *Remove*\n${removes}` },
+                { type: 'mrkdwn', text: `📦 *Stacks*\n${changed.length}` }
+              ]},
+              { type: 'actions', elements: [{ type: 'button', text: { type: 'plain_text', text: 'Workflow' }, url: runUrl }] }
+            ];
+            
+            for (const stack of changed.slice(0, 5)) {
+              blocks.push({ type: 'divider' });
+              let txt = `📦 *${stack.stackName}* _(${getEnv(stack.stackName)})_`;
+              const byAction = { ADD: [], UPDATE: [], REMOVE: [] };
+              for (const res of stack.resources) byAction[res.action].push(res);
+              
+              if (byAction.ADD.length) {
+                txt += '\n🟢 *Create*';
+                for (const r of byAction.ADD) txt += `\n• \`${shortType(r.type)}\` *${cleanId(r.logicalId)}*`;
+              }
+              if (byAction.UPDATE.length) {
+                txt += '\n🟡 *Update*';
+                for (const r of byAction.UPDATE) {
+                  txt += `\n• \`${shortType(r.type)}\` *${cleanId(r.logicalId)}*`;
+                  for (const p of r.properties.slice(0, 2)) {
+                    txt += `\n   \`${p.name}\`${p.impact === 'WILL_REPLACE' ? ' ⚠️' : ''}`;
+                  }
+                }
+              }
+              if (byAction.REMOVE.length) {
+                txt += '\n🔴 *Destroy*';
+                for (const r of byAction.REMOVE) txt += `\n• \`${shortType(r.type)}\` *${cleanId(r.logicalId)}*`;
+              }
+              blocks.push({ type: 'section', text: { type: 'mrkdwn', text: txt } });
+            }
+            return blocks;
+          }
+          
+          try {
+            const data = JSON.parse(process.argv[2]);
+            const context = JSON.parse(process.argv[3]);
+            console.log(JSON.stringify(formatSlackBlocks(data, context)));
+          } catch (e) {
+            console.log(JSON.stringify([{ type: 'section', text: { type: 'mrkdwn', text: `❌ Format error: ${e.message}` }}]));
+          }
+          FORMATTER_SCRIPT
+          
+          # Build context
           CONTEXT_JSON=$(jq -nc \
             --arg repo "$REPO" \
             --arg runUrl "$RUN_URL" \
             --arg actor "$ACTOR" \
             --arg jobStatus "$JOB_STATUS" \
-            --argjson isDeployment true \
-            '{repo: $repo, runUrl: $runUrl, actor: $actor, jobStatus: $jobStatus, isDeployment: $isDeployment}')
+            '{repo: $repo, runUrl: $runUrl, actor: $actor, jobStatus: $jobStatus}')
           
-          # Use shared formatter script
-          FORMATTED=$(node ${{ github.workspace }}/.shared-workflows/.github/scripts/format-cdk-diff.js "$DIFF_JSON" "$CONTEXT_JSON")
-          
-          # Extract Slack blocks
-          SLACK_BLOCKS=$(echo "$FORMATTED" | jq -c '.slack_blocks')
-          
-          # Build and send payload
+          # Format and send
+          SLACK_BLOCKS=$(node /tmp/format-slack.js "$DIFF_JSON" "$CONTEXT_JSON")
           PAYLOAD=$(jq -nc --argjson blocks "$SLACK_BLOCKS" '{blocks: $blocks}')
           curl -X POST -H 'Content-type: application/json' --data "$PAYLOAD" "$SLACK_WEBHOOK_URL"
