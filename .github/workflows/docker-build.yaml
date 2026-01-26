@@ -112,7 +112,9 @@ jobs:
             DIFF_RANGE="${{ github.event.before }}...${{ github.sha }}"
           else
             # workflow_dispatch or other - compare to main
-            git fetch origin main --depth=1 || true
+            # Note: fetch-depth: 0 in checkout already fetches all branches
+            # Only fetch main if it's not already available
+            git fetch origin main || true
             DIFF_RANGE="origin/main...HEAD"
           fi
           
