@@ -85,7 +85,7 @@ jobs:
   # PREPARE: Build matrix of accounts to diff
   # ===========================================================================
   prepare:
-    name: Prepare
+    name: Setup
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.matrix.outputs.matrix }}
@@ -96,12 +96,13 @@ jobs:
         run: |
           if [ -n '${{ inputs.aws-role-arns }}' ] && [ -n '${{ inputs.stacks-per-account }}' ]; then
             echo "is_multi=true" >> $GITHUB_OUTPUT
-            # Build matrix from role ARNs and stacks
-            MATRIX=$(echo '${{ inputs.aws-role-arns }}' | jq -c --argjson stacks '${{ inputs.stacks-per-account }}' '
+            # Build matrix from role ARNs, stacks, and account names
+            MATRIX=$(echo '${{ inputs.aws-role-arns }}' | jq -c --argjson stacks '${{ inputs.stacks-per-account }}' --argjson names '${{ inputs.account-names }}' '
               to_entries | map({
                 account: .key,
                 role: .value,
-                stacks: ($stacks[.key] // "")
+                stacks: ($stacks[.key] // ""),
+                name: ($names[.key] // .key)
               }) | {include: .}
             ')
             echo "matrix=$MATRIX" >> $GITHUB_OUTPUT
@@ -197,7 +198,7 @@ jobs:
   # MULTI-ACCOUNT: Parallel matrix jobs
   # ===========================================================================
   diff-multi:
-    name: Diff (${{ matrix.account }})
+    name: ${{ matrix.name }}
     if: needs.prepare.outputs.is-multi-account == 'true'
     needs: prepare
     runs-on: ubuntu-latest
@@ -294,26 +295,26 @@ jobs:
           retention-days: 1
 
   # ===========================================================================
-  # AGGREGATE: Combine multi-account results
+  # REPORT: Aggregate multi-account results and post PR comment/Slack
   # ===========================================================================
-  aggregate:
-    name: Aggregate Results
-    if: needs.prepare.outputs.is-multi-account == 'true'
-    needs: [prepare, diff-multi]
+  comment:
+    name: Report
+    needs: [prepare, diff-single, diff-multi]
+    if: always() && (needs.diff-single.result == 'success' || needs.diff-multi.result == 'success')
     runs-on: ubuntu-latest
     permissions:
       pull-requests: write
-    outputs:
-      combined: ${{ steps.combine.outputs.result }}
     steps:
-      - name: Download all artifacts
+      - name: Download multi-account artifacts
+        if: needs.prepare.outputs.is-multi-account == 'true'
         uses: actions/download-artifact@v4
         with:
           path: /tmp/diffs
           pattern: diff-*
 
-      - name: Combine results
-        id: combine
+      - name: Aggregate multi-account results
+        if: needs.prepare.outputs.is-multi-account == 'true'
+        id: aggregate
         run: |
           ALL_STACKS='[]'
           for f in /tmp/diffs/*/result.json; do
@@ -327,22 +328,11 @@ jobs:
           echo "$RESULT" >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
 
-  # ===========================================================================
-  # COMMENT: Post PR comment and Slack (inline formatter)
-  # ===========================================================================
-  comment:
-    name: Post Comment
-    needs: [prepare, diff-single, aggregate]
-    if: always() && (needs.diff-single.result == 'success' || needs.aggregate.result == 'success')
-    runs-on: ubuntu-latest
-    permissions:
-      pull-requests: write
-    steps:
       - name: Generate comment and Slack blocks
         id: format
         env:
           DIFF_SINGLE: ${{ needs.diff-single.outputs.result }}
-          DIFF_MULTI: ${{ needs.aggregate.outputs.combined }}
+          DIFF_MULTI: ${{ steps.aggregate.outputs.result }}
           REPO: ${{ github.repository }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           PR_URL: ${{ github.event.pull_request.html_url }}
