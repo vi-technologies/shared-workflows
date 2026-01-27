@@ -114,8 +114,12 @@ jobs:
             # workflow_dispatch or other - compare to main
             # Note: fetch-depth: 0 in checkout already fetches all branches
             # Only fetch main if it's not already available
-            git fetch origin main || true
-            DIFF_RANGE="origin/main...HEAD"
+            
+            DEFAULT_BRANCH="${{ github.event.repository.default_branch || github.repository_default_branch }}"
+            echo "Default branch: $DEFAULT_BRANCH"
+
+            git fetch origin "$DEFAULT_BRANCH" || true
+            DIFF_RANGE="origin/${DEFAULT_BRANCH}...HEAD"
           fi
           
           echo "Using diff range: $DIFF_RANGE"
