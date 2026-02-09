@@ -1,0 +1,217 @@
+# =============================================================================
+# GIT SYNC TO S3 WORKFLOW
+# =============================================================================
+# This reusable workflow syncs files from a GitHub repository folder to an S3
+# bucket path — "ArgoCD-style" for files: what's in Git is what's in S3.
+#
+# FEATURES:
+#   - Syncs a repo folder to an S3 bucket/prefix using `aws s3 sync --delete`
+#   - Ensures S3 is an exact mirror of the Git source of truth
+#   - Uses OIDC for secure, keyless AWS authentication
+#   - Supports root bucket path (no prefix) or nested prefixes
+#   - Dry-run mode to preview changes without applying
+#   - Optional file exclusion patterns
+#
+# USE CASES:
+#   - Sync Airflow DAGs from Git to S3
+#   - Deploy static config/data files managed in Git
+#   - Any "Git as source of truth → S3" pattern
+#
+# USAGE:
+#   jobs:
+#     sync:
+#       uses: vi-technologies/shared-workflows/.github/workflows/git-sync-s3.yaml@main
+#       with:
+#         aws-role-arn: 'arn:aws:iam::123456789012:role/GithubActionsRole'
+#         github-folder-path: 'dags'
+#         s3-bucket-name: 'my-airflow-bucket'
+#         s3-bucket-path: 'dags'
+#
+#   # Root bucket sync (no prefix):
+#   jobs:
+#     sync:
+#       uses: vi-technologies/shared-workflows/.github/workflows/git-sync-s3.yaml@main
+#       with:
+#         aws-role-arn: 'arn:aws:iam::123456789012:role/GithubActionsRole'
+#         github-folder-path: 'config'
+#         s3-bucket-name: 'my-bucket'
+# =============================================================================
+
+name: Git Sync to S3
+
+on:
+  workflow_call:
+    inputs:
+      # -----------------------------------------------------------------------
+      # AWS Configuration
+      # -----------------------------------------------------------------------
+      aws-role-arn:
+        description: 'AWS IAM role ARN to assume (OIDC)'
+        required: true
+        type: string
+
+      aws-region:
+        description: 'AWS region for credentials'
+        required: false
+        type: string
+        default: 'us-east-1'
+
+      # -----------------------------------------------------------------------
+      # S3 Configuration
+      # -----------------------------------------------------------------------
+      s3-bucket-name:
+        description: 'S3 bucket name'
+        required: true
+        type: string
+
+      s3-bucket-path:
+        description: 'S3 bucket prefix/path (leave empty to sync to bucket root)'
+        required: false
+        type: string
+        default: ''
+
+      # -----------------------------------------------------------------------
+      # Source Configuration
+      # -----------------------------------------------------------------------
+      github-folder-path:
+        description: 'Repo folder path to sync (relative to repo root)'
+        required: true
+        type: string
+
+      # -----------------------------------------------------------------------
+      # Sync Options
+      # -----------------------------------------------------------------------
+      dry-run:
+        description: 'If true, only preview changes without applying (--dryrun)'
+        required: false
+        type: boolean
+        default: false
+
+      exclude-patterns:
+        description: 'Space-separated list of exclude patterns (e.g., "*.pyc __pycache__/*")'
+        required: false
+        type: string
+        default: ''
+
+      extra-args:
+        description: 'Additional arguments to pass to aws s3 sync'
+        required: false
+        type: string
+        default: ''
+
+    outputs:
+      files-synced:
+        description: 'Number of files in the source folder'
+        value: ${{ jobs.sync.outputs.files_synced }}
+      s3-destination:
+        description: 'Full S3 destination URI'
+        value: ${{ jobs.sync.outputs.s3_destination }}
+
+jobs:
+  # ===========================================================================
+  # JOB: SYNC FILES FROM GIT TO S3
+  # ===========================================================================
+  sync:
+    name: Sync to S3
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    outputs:
+      files_synced: ${{ steps.sync.outputs.files_synced }}
+      s3_destination: ${{ steps.sync.outputs.s3_destination }}
+
+    steps:
+      # =======================================================================
+      # SETUP
+      # =======================================================================
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate source folder exists
+        run: |
+          set -euo pipefail
+          if [ ! -d "${{ inputs.github-folder-path }}" ]; then
+            echo "ERROR: Source folder '${{ inputs.github-folder-path }}' does not exist in the repository"
+            exit 1
+          fi
+          FILE_COUNT=$(find "${{ inputs.github-folder-path }}" -type f | wc -l | xargs)
+          echo "Source folder contains $FILE_COUNT file(s)"
+          if [ "$FILE_COUNT" -eq 0 ]; then
+            echo "WARNING: Source folder is empty — S3 destination will be cleared"
+          fi
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ inputs.aws-role-arn }}
+          role-duration-seconds: 3600
+          aws-region: ${{ inputs.aws-region }}
+
+      # =======================================================================
+      # SYNC
+      # =======================================================================
+      - name: Sync to S3
+        id: sync
+        env:
+          S3_BUCKET_NAME: ${{ inputs.s3-bucket-name }}
+          S3_BUCKET_PATH: ${{ inputs.s3-bucket-path }}
+          GITHUB_FOLDER_PATH: ${{ inputs.github-folder-path }}
+          DRY_RUN: ${{ inputs.dry-run }}
+          EXCLUDE_PATTERNS: ${{ inputs.exclude-patterns }}
+          EXTRA_ARGS: ${{ inputs.extra-args }}
+        run: |
+          set -euo pipefail
+
+          # Build S3 destination URI
+          if [ -n "$S3_BUCKET_PATH" ]; then
+            # Strip leading/trailing slashes for clean path construction
+            S3_BUCKET_PATH=$(echo "$S3_BUCKET_PATH" | sed 's|^/||;s|/$||')
+            S3_DEST="s3://${S3_BUCKET_NAME}/${S3_BUCKET_PATH}/"
+          else
+            S3_DEST="s3://${S3_BUCKET_NAME}/"
+          fi
+
+          echo "s3_destination=$S3_DEST" >> $GITHUB_OUTPUT
+
+          # Count files
+          FILE_COUNT=$(find "$GITHUB_FOLDER_PATH" -type f | wc -l | xargs)
+          echo "files_synced=$FILE_COUNT" >> $GITHUB_OUTPUT
+
+          # Build sync command
+          SYNC_CMD="aws s3 sync ./${GITHUB_FOLDER_PATH}/ ${S3_DEST} --delete"
+
+          # Add exclude patterns
+          for pattern in $EXCLUDE_PATTERNS; do
+            SYNC_CMD="$SYNC_CMD --exclude \"$pattern\""
+          done
+
+          # Add dry-run flag if requested
+          if [ "$DRY_RUN" = "true" ]; then
+            SYNC_CMD="$SYNC_CMD --dryrun"
+          fi
+
+          # Add any extra arguments
+          if [ -n "$EXTRA_ARGS" ]; then
+            SYNC_CMD="$SYNC_CMD $EXTRA_ARGS"
+          fi
+
+          echo "=== Sync Configuration ==="
+          echo "Source:      ./${GITHUB_FOLDER_PATH}/"
+          echo "Destination: ${S3_DEST}"
+          echo "Files:       ${FILE_COUNT}"
+          echo "Dry run:     ${DRY_RUN}"
+          echo "Command:     ${SYNC_CMD}"
+          echo "=========================="
+          echo ""
+
+          # Execute sync
+          eval $SYNC_CMD
+
+          if [ "$DRY_RUN" = "true" ]; then
+            echo ""
+            echo "DRY RUN complete — no changes were applied"
+          else
+            echo ""
+            echo "Sync complete — ${FILE_COUNT} file(s) synced to ${S3_DEST}"
+          fi
