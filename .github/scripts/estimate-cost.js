@@ -188,15 +188,23 @@ async function main() {
   const rows = [];
   let totalDelta = 0;
   let pricedCount = 0;
+  let freeCount = 0;
 
   console.error(`Pricing region: ${region} (${locationName})`);
-  console.error(`Resource types in map: ${Object.keys(resourceMap).filter((k) => !k.startsWith('_')).length}`);
+  console.error(`Resource types in map: ${Object.keys(resourceMap).filter((k) => !k.startsWith('_')).length} priced, ${(resourceMap._free || []).length} free`);
 
   for (const stack of diffData.stacks || []) {
     if (!stack.hasDiff) continue;
 
     for (const res of stack.resources || []) {
       if (res.type.startsWith('_') || res.type === 'Unknown') continue;
+
+      // Skip free resources (IAM, policies, etc.)
+      const freeList = resourceMap._free || [];
+      if (freeList.includes(res.type)) {
+        freeCount++;
+        continue;
+      }
 
       const mapping = resourceMap[res.type];
       if (!mapping) {
@@ -273,6 +281,10 @@ async function main() {
 
     if (unmapped > 0) {
       md += `\n> \u2139\uFE0F **${unmapped}** resource(s) have no pricing data. Add entries to \`.github/pricing/resource-map.json\` to extend coverage.\n`;
+    }
+
+    if (freeCount > 0) {
+      md += `\n> \u2705 **${freeCount}** resource(s) are free (IAM, policies, etc.) and excluded from the estimate.\n`;
     }
 
     // Collect estimation notes from resource mappings
