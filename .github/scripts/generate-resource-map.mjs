@@ -176,6 +176,110 @@ const FREE = [
 // ═══════════════════════════════════════════════════════════════════════════════
 // 3. Reasonable monthly usage defaults (for usage-based resources)
 // ═══════════════════════════════════════════════════════════════════════════════
+
+// ── Curated overrides: unit, multiplier, and filters that can't be reliably
+//    auto-parsed from Go source. These always take precedence. ──
+const OVERRIDES = {
+  'AWS::EC2::Instance': { unit:'Hrs', monthlyHours:730, filters:[
+    {Field:'instanceType',Value:{cfProperty:'InstanceType'}},{Field:'operatingSystem',Value:{default:'Linux'}},
+    {Field:'tenancy',Value:{default:'Shared'}},{Field:'capacitystatus',Value:{default:'Used'}},
+    {Field:'preInstalledSw',Value:{default:'NA'}},{Field:'productFamily',Value:{default:'Compute Instance'}}]},
+  'AWS::EC2::NatGateway': { unit:'Hrs', monthlyHours:730, filters:[
+    {Field:'productFamily',Value:{default:'NAT Gateway'}},{Field:'group',Value:{default:'NGW:NatGateway'}}]},
+  'AWS::EC2::Volume': { unit:'GB-Mo', filters:[
+    {Field:'productFamily',Value:{default:'Storage'}},{Field:'volumeApiName',Value:{cfProperty:'VolumeType',default:'gp3'}}]},
+  'AWS::EC2::VPNConnection': { unit:'Hrs', monthlyHours:730, filters:[
+    {Field:'productFamily',Value:{default:'VPNConnection'}}]},
+  'AWS::EC2::TransitGatewayAttachment': { unit:'Hrs', monthlyHours:730, filters:[
+    {Field:'productFamily',Value:{default:'TransitGateway'}}]},
+  'AWS::EC2::ClientVpnEndpoint': { unit:'Hrs', monthlyHours:730, filters:[
+    {Field:'productFamily',Value:{default:'VPNConnection'}},{Field:'usagetype',Value:{default:'USE1-ClientVPN-ConnectionHours'}}]},
+  'AWS::EC2::EIP': { unit:'Hrs', monthlyHours:730, filters:[
+    {Field:'productFamily',Value:{default:'IP Address'}},{Field:'usagetype',Value:{default:'USE1-PublicIPv4:InUseAddress'}}]},
+  'AWS::EC2::VPCEndpoint': { unit:'Hrs', monthlyHours:730, filters:[
+    {Field:'productFamily',Value:{default:'VpcEndpoint'}},{Field:'usagetype',Value:{default:'USE1-VpcEndpoint-Hours'}}]},
+  'AWS::ElasticLoadBalancingV2::LoadBalancer': { unit:'Hrs', monthlyHours:730, filters:[
+    {Field:'productFamily',Value:{default:'Load Balancer-Application'}},{Field:'usagetype',Value:{default:'USE1-LoadBalancerUsage'}}]},
+  'AWS::ElasticLoadBalancing::LoadBalancer': { unit:'Hrs', monthlyHours:730, filters:[
+    {Field:'productFamily',Value:{default:'Load Balancer'}},{Field:'usagetype',Value:{default:'USE1-LoadBalancerUsage'}}]},
+  'AWS::Lambda::Function': { unit:'Lambda-GB-Second', monthlyQuantity:400000, filters:[
+    {Field:'productFamily',Value:{default:'Serverless'}},{Field:'group',Value:{default:'AWS-Lambda-Duration'}},
+    {Field:'usagetype',Value:{default:'USE1-Lambda-GB-Second'}}]},
+  'AWS::StepFunctions::StateMachine': { unit:'StateTransition', monthlyQuantity:10000, filters:[
+    {Field:'productFamily',Value:{default:'AWS Step Functions'}},{Field:'usagetype',Value:{default:'USE1-StateTransition'}}]},
+  'AWS::ECS::Service': { unit:'Hrs', monthlyHours:730, filters:[
+    {Field:'productFamily',Value:{default:'Compute'}},{Field:'usagetype',Value:{default:'USE1-Fargate-vCPU-Hours:perCPU'}}]},
+  'AWS::EKS::Cluster': { unit:'Hrs', monthlyHours:730, filters:[
+    {Field:'productFamily',Value:{default:'Compute'}},{Field:'usagetype',Value:{default:'USE1-AmazonEKS-Hours:perCluster'}}]},
+  'AWS::ECR::Repository': { unit:'GB-Mo', monthlyQuantity:10, filters:[
+    {Field:'productFamily',Value:{default:'EC2 Container Registry'}}]},
+  'AWS::RDS::DBInstance': { unit:'Hrs', monthlyHours:730, filters:[
+    {Field:'productFamily',Value:{default:'Database Instance'}},{Field:'instanceType',Value:{cfProperty:'DBInstanceClass'}},
+    {Field:'databaseEngine',Value:{cfProperty:'Engine'}}]},
+  'AWS::RDS::DBCluster': { unit:'Hrs', monthlyHours:730, filters:[
+    {Field:'productFamily',Value:{default:'Database Instance'}},{Field:'databaseEngine',Value:{cfProperty:'Engine'}}]},
+  'AWS::DynamoDB::Table': { unit:'WriteCapacityUnit-Hrs', monthlyHours:730, filters:[
+    {Field:'productFamily',Value:{default:'Database'}},{Field:'group',Value:{default:'DDB-WriteUnits'}}]},
+  'AWS::ElastiCache::CacheCluster': { unit:'Hrs', monthlyHours:730, filters:[
+    {Field:'productFamily',Value:{default:'Cache Instance'}},{Field:'instanceType',Value:{cfProperty:'CacheNodeType'}}]},
+  'AWS::ElastiCache::ReplicationGroup': { serviceCode:'AmazonElastiCache', unit:'Hrs', monthlyHours:730, filters:[
+    {Field:'productFamily',Value:{default:'Cache Instance'}},{Field:'instanceType',Value:{cfProperty:'CacheNodeType'}}]},
+  'AWS::DocDB::DBInstance': { unit:'Hrs', monthlyHours:730, filters:[
+    {Field:'productFamily',Value:{default:'Database Instance'}},{Field:'instanceType',Value:{cfProperty:'DBInstanceClass'}}]},
+  'AWS::Neptune::DBInstance': { unit:'Hrs', monthlyHours:730, filters:[
+    {Field:'productFamily',Value:{default:'Database Instance'}},{Field:'instanceType',Value:{cfProperty:'DBInstanceClass'}}]},
+  'AWS::Redshift::Cluster': { unit:'Hrs', monthlyHours:730, filters:[
+    {Field:'productFamily',Value:{default:'Compute Instance'}},{Field:'instanceType',Value:{cfProperty:'NodeType'}}]},
+  'AWS::S3::Bucket': { unit:'GB-Mo', monthlyQuantity:100, filters:[
+    {Field:'productFamily',Value:{default:'Storage'}},{Field:'volumeType',Value:{default:'Standard'}}]},
+  'AWS::EFS::FileSystem': { unit:'GB-Mo', monthlyQuantity:100, filters:[
+    {Field:'productFamily',Value:{default:'Storage'}},{Field:'usagetype',Value:{default:'USE1-TimedStorage-ByteHrs'}}]},
+  'AWS::CloudFront::Distribution': { unit:'Requests', monthlyQuantity:10000000, filters:[
+    {Field:'productFamily',Value:{default:'Request'}}]},
+  'AWS::SQS::Queue': { unit:'Requests', monthlyQuantity:1000000, filters:[
+    {Field:'productFamily',Value:{default:'Queue'}},{Field:'queueType',Value:{default:'Standard'}}]},
+  'AWS::SNS::Topic': { unit:'Requests', monthlyQuantity:1000000, filters:[
+    {Field:'productFamily',Value:{default:'Message Delivery'}}]},
+  'AWS::Kinesis::Stream': { unit:'Shard-Hours', monthlyHours:730, filters:[
+    {Field:'productFamily',Value:{default:'Kinesis Streams'}}]},
+  'AWS::KinesisFirehose::DeliveryStream': { unit:'GB', monthlyQuantity:100, filters:[
+    {Field:'productFamily',Value:{default:'Kinesis Firehose'}}]},
+  'AWS::Elasticsearch::Domain': { unit:'Hrs', monthlyHours:730, filters:[
+    {Field:'productFamily',Value:{default:'Compute Instance'}},{Field:'instanceType',Value:{cfProperty:'ElasticsearchClusterConfig.InstanceType'}}]},
+  'AWS::OpenSearchService::Domain': { unit:'Hrs', monthlyHours:730, filters:[
+    {Field:'productFamily',Value:{default:'Compute Instance'}},{Field:'instanceType',Value:{cfProperty:'ClusterConfig.InstanceType'}}]},
+  'AWS::MSK::Cluster': { unit:'Hrs', monthlyHours:730, filters:[
+    {Field:'productFamily',Value:{default:'Managed Streaming for Apache Kafka (MSK)'}},{Field:'instanceType',Value:{cfProperty:'BrokerNodeGroupInfo.InstanceType'}}]},
+  'AWS::MWAA::Environment': { unit:'Hrs', monthlyHours:730, filters:[
+    {Field:'productFamily',Value:{default:'Managed Workflows for Apache Airflow'}},{Field:'usagetype',Value:{cfProperty:'EnvironmentClass',default:'USE1-EnvironmentHours:mw1.small'}}]},
+  'AWS::KMS::Key': { serviceCode:'awskms', unit:'months', filters:[{Field:'productFamily',Value:{default:'Encryption Key'}}]},
+  'AWS::SecretsManager::Secret': { unit:'months', filters:[{Field:'productFamily',Value:{default:'Secret'}}]},
+  'AWS::WAFv2::WebACL': { unit:'months', filters:[{Field:'productFamily',Value:{default:'Web Application Firewall'}}]},
+  'AWS::Route53::HostedZone': { unit:'months', filters:[
+    {Field:'productFamily',Value:{default:'DNS Zone'}},{Field:'usagetype',Value:{default:'HostedZone'}}]},
+  'AWS::CloudWatch::Dashboard': { unit:'months', filters:[{Field:'productFamily',Value:{default:'Dashboard'}}]},
+  'AWS::Logs::LogGroup': { unit:'GB', monthlyQuantity:10, filters:[
+    {Field:'productFamily',Value:{default:'Data Payload'}}]},
+  'AWS::MQ::Broker': { unit:'Hrs', monthlyHours:730, filters:[
+    {Field:'productFamily',Value:{default:'Broker Instances'}},{Field:'instanceType',Value:{cfProperty:'HostInstanceType'}}]},
+  'AWS::DMS::ReplicationInstance': { unit:'Hrs', monthlyHours:730, filters:[
+    {Field:'productFamily',Value:{default:'Database Migration'}},{Field:'instanceType',Value:{cfProperty:'ReplicationInstanceClass'}}]},
+  'AWS::ApiGateway::RestApi': { unit:'Requests', monthlyQuantity:1000000, filters:[
+    {Field:'productFamily',Value:{default:'API Calls'}}]},
+  'AWS::ApiGatewayV2::Api': { unit:'Requests', monthlyQuantity:1000000, filters:[
+    {Field:'productFamily',Value:{default:'WebSocket'}}]},
+  'AWS::Glue::Job': { unit:'DPU-Hour', monthlyHours:20, filters:[
+    {Field:'productFamily',Value:{default:'AWS Glue'}},{Field:'usagetype',Value:{default:'USE1-Glue-DPU-Hour'}}]},
+  'AWS::Glue::Crawler': { unit:'DPU-Hour', monthlyHours:10, filters:[
+    {Field:'productFamily',Value:{default:'AWS Glue'}},{Field:'usagetype',Value:{default:'USE1-Glue-DPU-Hour'}}]},
+  'AWS::CodeBuild::Project': { unit:'Minutes', monthlyQuantity:500, filters:[
+    {Field:'productFamily',Value:{default:'Compute'}}]},
+  'AWS::FSx::FileSystem': { unit:'GB-Mo', monthlyQuantity:1024, filters:[
+    {Field:'productFamily',Value:{default:'Storage'}}]},
+  'AWS::Backup::BackupVault': { serviceCode:'AWSBackup', unit:'GB-Mo', monthlyQuantity:100, filters:[
+    {Field:'productFamily',Value:{default:'AWS Backup Storage'}}]},
+};
+
 const DEFAULTS = {
   'AWS::Lambda::Function':       { monthlyQuantity: 400000, note: 'Estimate based on 400k GB-seconds/month' },
   'AWS::S3::Bucket':             { monthlyQuantity: 100, note: 'Estimate based on 100 GB standard storage' },
@@ -299,45 +403,57 @@ async function buildMap() {
     const parsed = parseGoFile(src);
 
     if (parsed.services.length === 0) {
-      console.log(`  - ${cfnType} (${file}) — no service code found in source`);
-      skipped++;
-      continue;
+      // No service code in Go source — check if we have a manual override
+      if (!OVERRIDES[cfnType]) {
+        console.log(`  - ${cfnType} (${file}) — no service code found in source`);
+        skipped++;
+        continue;
+      }
     }
 
     const serviceCode = parsed.services[0];
-    const productFamily = parsed.families[0] || null;
 
-    // Determine unit and multiplier based on common patterns
+    // If we have a curated override, use it (most accurate)
+    if (OVERRIDES[cfnType]) {
+      const ov = OVERRIDES[cfnType];
+      const entry = { serviceCode: ov.serviceCode || serviceCode, unit: ov.unit };
+      if (ov.monthlyHours) entry.monthlyHours = ov.monthlyHours;
+      if (ov.monthlyQuantity) entry.monthlyQuantity = ov.monthlyQuantity;
+      const defs = DEFAULTS[cfnType];
+      if (defs?.note) entry.note = defs.note;
+      entry.filters = ov.filters;
+      map[cfnType] = entry;
+      matched++;
+      process.stdout.write(`  ✓ ${cfnType} ← override (${entry.serviceCode})\n`);
+      continue;
+    }
+
+    // Auto-parse: determine unit and multiplier from Go source patterns
     let unit = 'Hrs', mulKey = 'monthlyHours', mulVal = 730;
+    const allText = parsed.families.join(' ') + ' ' + parsed.attrs.map(a => a.value).join(' ');
 
-    // Storage-based
-    if (/Storage|GB-Mo|TimedStorage/i.test(parsed.families.join(' ') + ' ' + parsed.attrs.map(a => a.value).join(' '))) {
+    if (/Storage|GB-Mo|TimedStorage/i.test(allText)) {
       unit = 'GB-Mo'; mulKey = null; mulVal = null;
-    }
-    // Request-based
-    if (/Request|Queue|Message|Transition/i.test(parsed.families.join(' '))) {
+    } else if (/Request|Queue|Message|Transition/i.test(parsed.families.join(' '))) {
       unit = 'Requests'; mulKey = 'monthlyQuantity'; mulVal = 1000000;
-    }
-    // Per-month flat
-    if (/months|month/i.test(unit) || /Secret|Encryption Key|DNS Zone|Dashboard|Web Application Firewall/i.test(parsed.families.join(' '))) {
+    } else if (/Secret|Encryption Key|DNS Zone|Dashboard|Web Application Firewall/i.test(parsed.families.join(' '))) {
       unit = 'months'; mulKey = null; mulVal = null;
     }
 
-    // Build filters from first service + product family + static attrs
+    const productFamily = parsed.families[0] || null;
     const filters = [];
     if (productFamily) {
       filters.push({ Field: 'productFamily', Value: { default: productFamily } });
     }
     for (const attr of parsed.attrs) {
-      if (attr.key === 'usagetype' || attr.key === 'group' || attr.key === 'volumeApiName' || attr.key === 'queueType') {
-        if (!attr.value.includes('/') && !attr.value.includes('$')) { // skip regex patterns
+      if (['usagetype','group','volumeApiName','queueType'].includes(attr.key)) {
+        if (!attr.value.includes('/') && !attr.value.includes('$')) {
           filters.push({ Field: attr.key, Value: { default: attr.value } });
         }
       }
     }
 
     const entry = { serviceCode, unit };
-    // Apply defaults from our manual overrides
     const defs = DEFAULTS[cfnType];
     if (defs) {
       if (defs.monthlyHours) { mulKey = 'monthlyHours'; mulVal = defs.monthlyHours; }
@@ -349,7 +465,7 @@ async function buildMap() {
 
     map[cfnType] = entry;
     matched++;
-    process.stdout.write(`  ✓ ${cfnType} ← ${serviceCode}/${productFamily || '?'}\n`);
+    process.stdout.write(`  ✓ ${cfnType} ← auto (${serviceCode}/${productFamily || '?'})\n`);
   }
 
   console.log(`\nDone: ${matched} mapped, ${skipped} skipped`);
