@@ -109,6 +109,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Checkout scripts
+        uses: actions/checkout@v4
+        with:
+          repository: vi-technologies/shared-workflows
+          ref: ${{ github.job_workflow_sha }}
+          sparse-checkout: .github/scripts
+          path: _shared
+
       - name: Setup Python
         if: inputs.python-version != ''
         uses: actions/setup-python@v5
@@ -143,52 +151,13 @@ jobs:
         id: diff
         env:
           STACKS: ${{ inputs.stacks }}
-        run: |
-          echo "Running CDK diff for: $STACKS"
-          
-          mkdir -p /tmp/cdk-runner && cd /tmp/cdk-runner
-          echo '{"type":"module","dependencies":{"@aws-cdk/toolkit-lib":"*"}}' > package.json
-          npm install --silent
-          
-          cat > run.js << 'SCRIPT'
-          import { Toolkit, StackSelectionStrategy } from '@aws-cdk/toolkit-lib';
-          const stacks = (process.env.STACKS || '').split(' ').filter(Boolean);
-          async function main() {
-            const output = { success: false, stacks: [], error: '' };
-            try {
-              const toolkit = new Toolkit({ ioHost: { notify: async () => {}, requestResponse: async (msg) => msg.defaultResponse } });
-              const cx = await toolkit.fromAssemblyDirectory(process.env.CDK_OUT);
-              const selector = stacks.length ? { strategy: StackSelectionStrategy.PATTERN_MUST_MATCH, patterns: stacks } : { strategy: StackSelectionStrategy.ALL_STACKS };
-              const diffResults = await toolkit.diff(cx, { stacks: selector });
-              const fmtVal = (v) => v === undefined || v === null ? null : typeof v === 'object' ? JSON.stringify(v) : String(v);
-              for (const [name, diff] of Object.entries(diffResults)) {
-                const result = { stackName: name, hasDiff: false, resources: [] };
-                for (const [logicalId, resDiff] of Object.entries(diff.resources?.diffs || {})) {
-                  const type = resDiff.resourceTypes?.newType || resDiff.resourceTypes?.oldType || 'Unknown';
-                  const action = resDiff.isAddition ? 'ADD' : resDiff.isRemoval ? 'REMOVE' : 'UPDATE';
-                  const properties = Object.entries(resDiff.propertyDiffs || {}).filter(([_, p]) => p.isDifferent).map(([n, p]) => ({ name: n, impact: p.changeImpact || 'UNKNOWN', oldValue: fmtVal(p.oldValue), newValue: fmtVal(p.newValue) }));
-                  result.resources.push({ logicalId, type, action, properties });
-                  result.hasDiff = true;
-                }
-                output.stacks.push(result);
-              }
-              output.success = true;
-            } catch (e) { output.error = e.message || String(e); }
-            console.log(JSON.stringify(output));
-          }
-          main();
-          SCRIPT
-          
-          cd ${{ github.workspace }}/${{ inputs.working-directory }}
-          CDK_OUT="$(pwd)/cdk.out" node /tmp/cdk-runner/run.js > /tmp/diff_result.json 2>&1 || true
-          RESULT=$(cat /tmp/diff_result.json | tail -1 || echo '{"success":false,"error":"no output","stacks":[]}')
-          
-          # Save for later steps
-          echo "$RESULT" > diff_result.json
-          
-          echo "result<<EOF" >> $GITHUB_OUTPUT
-          echo "$RESULT" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
+          ENABLE_DRIFT: 'false'
+          WORK_DIR: ${{ github.workspace }}/${{ inputs.working-directory }}
+          SCRIPT_PATH: ${{ github.workspace }}/_shared/.github/scripts/run-cdk-diff.mjs
+        run: bash ${{ github.workspace }}/_shared/.github/scripts/run-cdk-diff-wrapper.sh
+
+      - name: Save diff result for Slack
+        run: echo '${{ steps.diff.outputs.result }}' > diff_result.json
 
       # =======================================================================
       # CDK DEPLOY
@@ -211,7 +180,7 @@ jobs:
           echo "Would have deployed: ${{ inputs.stacks }}"
 
       # =======================================================================
-      # SLACK NOTIFICATION (inline formatter)
+      # SLACK NOTIFICATION (using shared formatter)
       # =======================================================================
       - name: Format and send Slack notification
         if: always()
@@ -222,102 +191,5 @@ jobs:
           REPO: ${{ github.repository }}
           ACTOR: ${{ github.actor }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: |
-          # Skip if no webhook URL provided
-          if [ -z "$SLACK_WEBHOOK_URL" ]; then
-            echo "No Slack webhook URL provided, skipping notification"
-            exit 0
-          fi
-          
-          # Read diff result
-          if [ -f diff_result.json ]; then
-            DIFF_JSON=$(cat diff_result.json)
-          else
-            DIFF_JSON='{"success":true,"stacks":[]}'
-          fi
-          
-          # Create inline formatter script (matches shared format-cdk-diff.js)
-          cat > /tmp/format-slack.js << 'FORMATTER_SCRIPT'
-          const getEnv = (n) => n.toLowerCase().includes('prod') ? 'production' : n.toLowerCase().includes('staging') ? 'staging' : 'dev';
-          const cleanId = (id) => id.replace(/[A-F0-9]{8}$/i, '').replace(/([a-z])([A-Z])/g, '$1 $2');
-          const shortType = (t) => t.split('::').pop();
-          
-          function formatSlackBlocks(data, context) {
-            const { repo, runUrl, actor, jobStatus } = context;
-            const changed = data.stacks?.filter(s => s.hasDiff) || [];
-            const adds = data.stacks?.reduce((n, s) => n + s.resources.filter(r => r.action === 'ADD').length, 0) || 0;
-            const updates = data.stacks?.reduce((n, s) => n + s.resources.filter(r => r.action === 'UPDATE').length, 0) || 0;
-            const removes = data.stacks?.reduce((n, s) => n + s.resources.filter(r => r.action === 'REMOVE').length, 0) || 0;
-            
-            const headerText = jobStatus === 'success' ? '✅ CDK Deploy Succeeded' : '❌ CDK Deploy Failed';
-            const blocks = [
-              { type: 'header', text: { type: 'plain_text', text: headerText, emoji: true } },
-              { type: 'context', elements: [{ type: 'mrkdwn', text: `\`${repo}\`${actor ? ` by ${actor}` : ''}` }] },
-              { type: 'section', fields: [
-                { type: 'mrkdwn', text: `🟢 *Add*\n${adds}` },
-                { type: 'mrkdwn', text: `🟡 *Update*\n${updates}` },
-                { type: 'mrkdwn', text: `🔴 *Remove*\n${removes}` },
-                { type: 'mrkdwn', text: `📦 *Stacks*\n${changed.length}` }
-              ]},
-              { type: 'actions', elements: [{ type: 'button', text: { type: 'plain_text', text: 'Workflow' }, url: runUrl }] }
-            ];
-            
-            for (const stack of changed.slice(0, 5)) {
-              blocks.push({ type: 'divider' });
-              let txt = `📦 *${stack.stackName}* _(${getEnv(stack.stackName)})_`;
-              const byAction = { ADD: [], UPDATE: [], REMOVE: [] };
-              for (const res of stack.resources) byAction[res.action].push(res);
-              
-              if (byAction.ADD.length) {
-                txt += '\n🟢 *Create*';
-                for (const r of byAction.ADD) {
-                  txt += `\n• \`${shortType(r.type)}\` *${cleanId(r.logicalId)}*`;
-                  for (const p of (r.properties || []).slice(0, 3)) {
-                    if (p.newValue) txt += `\n   \`${p.name}\`:\n\`\`\`${p.newValue}\`\`\``;
-                  }
-                  if ((r.properties || []).length > 3) txt += `\n   _+${r.properties.length - 3} more..._`;
-                }
-              }
-              if (byAction.UPDATE.length) {
-                txt += '\n🟡 *Update*';
-                for (const r of byAction.UPDATE) {
-                  txt += `\n• \`${shortType(r.type)}\` *${cleanId(r.logicalId)}*`;
-                  for (const p of (r.properties || []).slice(0, 2)) {
-                    txt += `\n   \`${p.name}\`${p.impact === 'WILL_REPLACE' ? ' ⚠️' : ''}`;
-                    txt += `\n   *OLD:*\n\`\`\`${p.oldValue || '(none)'}\`\`\``;
-                    txt += `\n   *NEW:*\n\`\`\`${p.newValue || '(removed)'}\`\`\``;
-                  }
-                  if ((r.properties || []).length > 2) txt += `\n   _+${r.properties.length - 2} more properties..._`;
-                }
-              }
-              if (byAction.REMOVE.length) {
-                txt += '\n🔴 *Destroy*';
-                for (const r of byAction.REMOVE) txt += `\n• \`${shortType(r.type)}\` *${cleanId(r.logicalId)}*`;
-              }
-              blocks.push({ type: 'section', text: { type: 'mrkdwn', text: txt } });
-            }
-            if (changed.length > 5) blocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: `_+${changed.length - 5} more stacks..._` }] });
-            return blocks;
-          }
-          
-          try {
-            const data = JSON.parse(process.argv[2]);
-            const context = JSON.parse(process.argv[3]);
-            console.log(JSON.stringify(formatSlackBlocks(data, context)));
-          } catch (e) {
-            console.log(JSON.stringify([{ type: 'section', text: { type: 'mrkdwn', text: `❌ Format error: ${e.message}` }}]));
-          }
-          FORMATTER_SCRIPT
-          
-          # Build context
-          CONTEXT_JSON=$(jq -nc \
-            --arg repo "$REPO" \
-            --arg runUrl "$RUN_URL" \
-            --arg actor "$ACTOR" \
-            --arg jobStatus "$JOB_STATUS" \
-            '{repo: $repo, runUrl: $runUrl, actor: $actor, jobStatus: $jobStatus}')
-          
-          # Format and send
-          SLACK_BLOCKS=$(node /tmp/format-slack.js "$DIFF_JSON" "$CONTEXT_JSON")
-          PAYLOAD=$(jq -nc --argjson blocks "$SLACK_BLOCKS" '{blocks: $blocks}')
-          curl -X POST -H 'Content-type: application/json' --data "$PAYLOAD" "$SLACK_WEBHOOK_URL"
+          SCRIPT_PATH: ${{ github.workspace }}/_shared/.github/scripts/format-cdk-diff.js
+        run: bash ${{ github.workspace }}/_shared/.github/scripts/send-deploy-slack.sh
