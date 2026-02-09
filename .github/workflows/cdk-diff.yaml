@@ -347,7 +347,8 @@ jobs:
           script: |
             const fs = require('fs');
             const scriptContent = fs.readFileSync('_shared/.github/scripts/check-slack-label.js', 'utf8');
-            eval(scriptContent);
+            const fn = new Function('github', 'context', 'core', `return (async () => { ${scriptContent} })();`);
+            await fn(github, context, core);
 
       - name: Send Slack
         if: steps.check-label.outputs.notify == 'true'
