@@ -159,14 +159,19 @@ jobs:
           echo "flags=$ARGS" >> $GITHUB_OUTPUT
 
       # =======================================================================
-      # SYNC — jakejarvis/s3-sync-action picks up OIDC temp creds from env
+      # SYNC
       # =======================================================================
       - name: Sync to S3
-        uses: jakejarvis/s3-sync-action@v0.5.1
-        with:
-          args: ${{ steps.args.outputs.flags }}
         env:
-          AWS_S3_BUCKET: ${{ inputs.s3-bucket-name }}
-          AWS_REGION: ${{ inputs.aws-region }}
-          SOURCE_DIR: ${{ inputs.github-folder-path }}
+          S3_BUCKET: ${{ inputs.s3-bucket-name }}
           DEST_DIR: ${{ inputs.s3-bucket-path }}
+          SOURCE_DIR: ${{ inputs.github-folder-path }}
+          SYNC_ARGS: ${{ steps.args.outputs.flags }}
+        run: |
+          if [ -n "$DEST_DIR" ]; then
+            DEST="s3://${S3_BUCKET}/${DEST_DIR}/"
+          else
+            DEST="s3://${S3_BUCKET}/"
+          fi
+          echo "Syncing ./${SOURCE_DIR}/ → ${DEST}"
+          eval aws s3 sync "./${SOURCE_DIR}/" "$DEST" $SYNC_ARGS
