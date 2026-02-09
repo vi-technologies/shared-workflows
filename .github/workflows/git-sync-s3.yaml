@@ -18,23 +18,25 @@
 #   - Any "Git as source of truth → S3" pattern
 #
 # USAGE:
+#   # With account ID + role name (ARN is built automatically):
 #   jobs:
 #     sync:
 #       uses: vi-technologies/shared-workflows/.github/workflows/git-sync-s3.yaml@main
 #       with:
-#         aws-role-arn: 'arn:aws:iam::123456789012:role/GithubActionsRole'
+#         aws-account-id: '123456789012'
+#         aws-role-name: 'GithubActionsRole'
 #         github-folder-path: 'dags'
 #         s3-bucket-name: 'my-airflow-bucket'
 #         s3-bucket-path: 'dags'
 #         exclude-patterns: '*.pyc __pycache__/* .git/*'
 #         include-patterns: '*.py *.sql'
 #
-#   # Root bucket sync (no prefix):
+#   # With full ARN (aws-account-id not needed):
 #   jobs:
 #     sync:
 #       uses: vi-technologies/shared-workflows/.github/workflows/git-sync-s3.yaml@main
 #       with:
-#         aws-role-arn: 'arn:aws:iam::123456789012:role/GithubActionsRole'
+#         aws-role-name: 'arn:aws:iam::123456789012:role/GithubActionsRole'
 #         github-folder-path: 'config'
 #         s3-bucket-name: 'my-bucket'
 # =============================================================================
@@ -47,8 +49,14 @@ on:
       # -----------------------------------------------------------------------
       # AWS Configuration
       # -----------------------------------------------------------------------
-      aws-role-arn:
-        description: 'AWS IAM role ARN to assume (OIDC)'
+      aws-account-id:
+        description: 'AWS account ID. If provided, the role ARN is built as arn:aws:iam::<account-id>:role/<role-name>. If omitted, aws-role-name must be a full ARN.'
+        required: false
+        type: string
+        default: ''
+
+      aws-role-name:
+        description: 'AWS IAM role name (e.g., "GithubActionsRole") or full ARN (e.g., "arn:aws:iam::123456789012:role/GithubActionsRole")'
         required: true
         type: string
 
@@ -128,7 +136,7 @@ jobs:
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ inputs.aws-role-arn }}
+          role-to-assume: ${{ inputs.aws-account-id != '' && format('arn:aws:iam::{0}:role/{1}', inputs.aws-account-id, inputs.aws-role-name) || inputs.aws-role-name }}
           role-duration-seconds: 3600
           aws-region: ${{ inputs.aws-region }}
 
