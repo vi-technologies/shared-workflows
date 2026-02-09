@@ -60,3 +60,74 @@ jobs:
 |-------|------|-------|
 | `MyStackStaging` | 🟢 +1 🟡 ~2 | ✅ In Sync |
 | `MyStackProduction` | ✅ No changes | 🚨 Drifted |
+
+---
+
+### Git Sync to S3 (`git-sync-s3.yaml`)
+
+A reusable workflow that syncs files from a Git repository folder to an S3 bucket path — **ArgoCD-style for files**: what's in Git is what's in S3.
+
+#### Features
+- 🔄 Syncs a repo folder to S3 using `aws s3 sync --delete`
+- 🔐 OIDC-based keyless AWS authentication
+- 📁 Supports root bucket path or nested prefixes
+- 🔍 Dry-run mode to preview changes
+- 🚫 Configurable file exclusion patterns
+
+#### Use Cases
+- Sync Airflow DAGs from Git to S3
+- Deploy static config/data files managed in Git
+- Any "Git as source of truth → S3" pattern
+
+#### Usage
+
+```yaml
+name: Sync DAGs to S3
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'dags/**'
+
+jobs:
+  sync:
+    uses: vi-technologies/shared-workflows/.github/workflows/git-sync-s3.yaml@main
+    with:
+      aws-role-arn: 'arn:aws:iam::123456789012:role/GithubActionsRole'
+      github-folder-path: 'dags'
+      s3-bucket-name: 'my-airflow-bucket'
+      s3-bucket-path: 'dags'
+```
+
+#### Root Bucket Sync (no prefix)
+
+```yaml
+jobs:
+  sync:
+    uses: vi-technologies/shared-workflows/.github/workflows/git-sync-s3.yaml@main
+    with:
+      aws-role-arn: 'arn:aws:iam::123456789012:role/GithubActionsRole'
+      github-folder-path: 'config'
+      s3-bucket-name: 'my-bucket'
+```
+
+#### Inputs
+
+| Input | Description | Required | Default |
+|-------|-------------|----------|---------|
+| `aws-role-arn` | AWS IAM role ARN to assume (OIDC) | **Yes** | - |
+| `aws-region` | AWS region | No | `us-east-1` |
+| `s3-bucket-name` | S3 bucket name | **Yes** | - |
+| `s3-bucket-path` | S3 prefix/path (empty = bucket root) | No | `''` |
+| `github-folder-path` | Repo folder to sync | **Yes** | - |
+| `dry-run` | Preview changes without applying | No | `false` |
+| `exclude-patterns` | Space-separated exclude patterns | No | `''` |
+| `extra-args` | Additional `aws s3 sync` arguments | No | `''` |
+
+#### Outputs
+
+| Output | Description |
+|--------|-------------|
+| `files-synced` | Number of files in the source folder |
+| `s3-destination` | Full S3 destination URI |
