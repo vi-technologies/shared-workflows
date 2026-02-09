@@ -1,13 +1,12 @@
 #!/usr/bin/env node
 /**
- * Generates a comprehensive resource-map.json for CDK cost estimation.
- * 
+ * Generates resource-map.json by fetching Infracost's Go source from GitHub,
+ * parsing out AWS Pricing API service codes & product families, then mapping
+ * Terraform resource names → CloudFormation resource types.
+ *
  * Usage: node generate-resource-map.mjs [--validate]
- *   --validate: Check each mapping against the live AWS Pricing API
- * 
- * Requires: @aws-sdk/client-pricing (npm install @aws-sdk/client-pricing)
+ * Requires: @aws-sdk/client-pricing (only for --validate)
  */
-import { PricingClient, GetProductsCommand } from '@aws-sdk/client-pricing';
 import { writeFileSync } from 'fs';
 import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
@@ -16,371 +15,360 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const OUT = join(__dirname, '..', 'pricing', 'resource-map.json');
 const validate = process.argv.includes('--validate');
 
-const pricing = new PricingClient({ region: 'us-east-1' });
-const LOCATION = 'US East (N. Virginia)';
+// ═══════════════════════════════════════════════════════════════════════════════
+// 1. Terraform resource name → CloudFormation resource type
+//    This is the only manual mapping needed. Covers all Infracost-supported AWS
+//    resources. Add new entries here as Infracost adds resources.
+// ═══════════════════════════════════════════════════════════════════════════════
+const TF_TO_CFN = {
+  aws_instance:                           'AWS::EC2::Instance',
+  aws_autoscaling_group:                  'AWS::AutoScaling::AutoScalingGroup',
+  aws_ebs_volume:                         'AWS::EC2::Volume',
+  aws_ebs_snapshot:                       'AWS::EBS::Snapshot',
+  aws_ebs_snapshot_copy:                  'AWS::EBS::Snapshot',
+  aws_eip:                                'AWS::EC2::EIP',
+  aws_nat_gateway:                        'AWS::EC2::NatGateway',
+  aws_ec2_client_vpn_endpoint:            'AWS::EC2::ClientVpnEndpoint',
+  aws_ec2_client_vpn_network_association: null, // sub-resource
+  aws_ec2_host:                           'AWS::EC2::Host',
+  aws_ec2_traffic_mirror_session:         'AWS::EC2::TrafficMirrorSession',
+  aws_ec2_transit_gateway_peering_attachment: 'AWS::EC2::TransitGatewayPeeringAttachment',
+  aws_ec2_transit_gateway_vpc_attachment: 'AWS::EC2::TransitGatewayAttachment',
+  aws_vpn_connection:                     'AWS::EC2::VPNConnection',
+  aws_vpc_endpoint:                       'AWS::EC2::VPCEndpoint',
+  aws_lb:                                 'AWS::ElasticLoadBalancingV2::LoadBalancer',
+  aws_alb:                                'AWS::ElasticLoadBalancingV2::LoadBalancer',
+  aws_elb:                                'AWS::ElasticLoadBalancing::LoadBalancer',
+  aws_lambda_function:                    'AWS::Lambda::Function',
+  aws_lambda_provisioned_concurrency_config: null,
+  aws_sfn_state_machine:                  'AWS::StepFunctions::StateMachine',
+  aws_ecs_service:                        'AWS::ECS::Service',
+  aws_eks_cluster:                        'AWS::EKS::Cluster',
+  aws_eks_node_group:                     'AWS::EKS::Nodegroup',
+  aws_eks_fargate_profile:                'AWS::EKS::FargateProfile',
+  aws_ecr_repository:                     'AWS::ECR::Repository',
+  aws_db_instance:                        'AWS::RDS::DBInstance',
+  aws_rds_cluster:                        'AWS::RDS::DBCluster',
+  aws_rds_cluster_instance:               'AWS::RDS::DBInstance',
+  aws_dynamodb_table:                     'AWS::DynamoDB::Table',
+  aws_elasticache_cluster:                'AWS::ElastiCache::CacheCluster',
+  aws_elasticache_replication_group:      'AWS::ElastiCache::ReplicationGroup',
+  aws_docdb_cluster:                      'AWS::DocDB::DBCluster',
+  aws_docdb_cluster_instance:             'AWS::DocDB::DBInstance',
+  aws_docdb_cluster_snapshot:             null,
+  aws_neptune_cluster:                    'AWS::Neptune::DBCluster',
+  aws_neptune_cluster_instance:           'AWS::Neptune::DBInstance',
+  aws_neptune_cluster_snapshot:           null,
+  aws_redshift_cluster:                   'AWS::Redshift::Cluster',
+  aws_s3_bucket:                          'AWS::S3::Bucket',
+  aws_s3_bucket_analytics_configuration:  null,
+  aws_s3_bucket_inventory:                null,
+  aws_efs_file_system:                    'AWS::EFS::FileSystem',
+  aws_fsx_windows_file_system:            'AWS::FSx::FileSystem',
+  aws_fsx_openzfs_file_system:            'AWS::FSx::FileSystem',
+  aws_backup_vault:                       'AWS::Backup::BackupVault',
+  aws_cloudfront_distribution:            'AWS::CloudFront::Distribution',
+  aws_cloudfront_function:                null,
+  aws_global_accelerator:                 'AWS::GlobalAccelerator::Accelerator',
+  aws_global_accelerator_endpoint_group:  null,
+  aws_sqs_queue:                          'AWS::SQS::Queue',
+  aws_sns_topic:                          'AWS::SNS::Topic',
+  aws_sns_topic_subscription:             null,
+  aws_kinesis_stream:                     'AWS::Kinesis::Stream',
+  aws_kinesis_firehose_delivery_stream:   'AWS::KinesisFirehose::DeliveryStream',
+  aws_kinesisanalyticsv2_application:     'AWS::KinesisAnalyticsV2::Application',
+  aws_kinesisanalyticsv2_application_snapshot: null,
+  aws_kms_key:                            'AWS::KMS::Key',
+  aws_kms_external_key:                   'AWS::KMS::Key',
+  aws_secretsmanager_secret:              'AWS::SecretsManager::Secret',
+  aws_wafv2_web_acl:                      'AWS::WAFv2::WebACL',
+  aws_waf_web_acl:                        'AWS::WAF::WebACL',
+  aws_networkfirewall_firewall:           'AWS::NetworkFirewall::Firewall',
+  aws_elasticsearch_domain:               'AWS::Elasticsearch::Domain',
+  aws_opensearch_domain:                  'AWS::OpenSearchService::Domain',
+  aws_msk_cluster:                        'AWS::MSK::Cluster',
+  aws_mwaa_environment:                   'AWS::MWAA::Environment',
+  aws_glue_job:                           'AWS::Glue::Job',
+  aws_glue_crawler:                       'AWS::Glue::Crawler',
+  aws_glue_catalog_database:              null,
+  aws_route53_zone:                       'AWS::Route53::HostedZone',
+  aws_route53_health_check:               'AWS::Route53::HealthCheck',
+  aws_route53_record:                     null,
+  aws_route53_resolver_endpoint:          'AWS::Route53Resolver::ResolverEndpoint',
+  aws_api_gateway_rest_api:               'AWS::ApiGateway::RestApi',
+  aws_api_gateway_stage:                  null,
+  aws_apigatewayv2_api:                   'AWS::ApiGatewayV2::Api',
+  aws_dx_connection:                      'AWS::DirectConnect::Connection',
+  aws_dx_gateway_association:             null,
+  aws_cloudwatch_dashboard:               'AWS::CloudWatch::Dashboard',
+  aws_cloudwatch_log_group:               'AWS::Logs::LogGroup',
+  aws_cloudwatch_metric_alarm:            null,
+  aws_cloudwatch_event_bus:               null,
+  aws_codebuild_project:                  'AWS::CodeBuild::Project',
+  aws_transfer_server:                    'AWS::Transfer::Server',
+  aws_cloudhsm_v2_hsm:                    'AWS::CloudHSM::Cluster',
+  aws_cloudtrail:                         'AWS::CloudTrail::Trail',
+  aws_dms_replication_instance:           'AWS::DMS::ReplicationInstance',
+  aws_lightsail_instance:                 'AWS::Lightsail::Instance',
+  aws_mq_broker:                          'AWS::MQ::Broker',
+  aws_grafana_workspace:                  'AWS::Grafana::Workspace',
+  aws_directory_service_directory:        'AWS::DirectoryService::MicrosoftAD',
+  aws_config_config_rule:                 null,
+  aws_config_configuration_recorder:      null,
+  aws_ssm_parameter:                      null,
+  aws_ssm_activation:                     null,
+  aws_acm_certificate:                    null,
+  aws_acmpca_certificate_authority:       'AWS::ACMPCA::CertificateAuthority',
+  aws_app_autoscaling_target:             null,
+  aws_data_transfer:                      null,
+  aws_elastic_beanstalk_environment:      null,
+  aws_launch_configuration:               null,
+  aws_launch_template:                    null,
+  aws_search_domain:                      null, // alias for opensearch
+};
 
-// ── Free resources (no direct cost) ──────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════════
+// 2. Free resources — no direct cost
+// ═══════════════════════════════════════════════════════════════════════════════
 const FREE = [
-  'AWS::IAM::Role', 'AWS::IAM::Policy', 'AWS::IAM::ManagedPolicy',
-  'AWS::IAM::InstanceProfile', 'AWS::IAM::User', 'AWS::IAM::Group',
-  'AWS::IAM::AccessKey', 'AWS::IAM::ServiceLinkedRole',
-  'AWS::IAM::OIDCProvider', 'AWS::IAM::SAMLProvider',
-  'AWS::S3::BucketPolicy', 'AWS::SQS::QueuePolicy',
-  'AWS::SNS::TopicPolicy', 'AWS::SNS::Subscription',
-  'AWS::Lambda::Permission', 'AWS::Lambda::EventSourceMapping',
-  'AWS::Lambda::Alias', 'AWS::Lambda::Version', 'AWS::Lambda::LayerVersion',
+  'AWS::IAM::Role','AWS::IAM::Policy','AWS::IAM::ManagedPolicy',
+  'AWS::IAM::InstanceProfile','AWS::IAM::User','AWS::IAM::Group',
+  'AWS::IAM::AccessKey','AWS::IAM::ServiceLinkedRole',
+  'AWS::IAM::OIDCProvider','AWS::IAM::SAMLProvider',
+  'AWS::S3::BucketPolicy','AWS::SQS::QueuePolicy',
+  'AWS::SNS::TopicPolicy','AWS::SNS::Subscription',
+  'AWS::Lambda::Permission','AWS::Lambda::EventSourceMapping',
+  'AWS::Lambda::Alias','AWS::Lambda::Version','AWS::Lambda::LayerVersion',
   'AWS::Lambda::EventInvokeConfig',
-  'AWS::EC2::SecurityGroup', 'AWS::EC2::SubnetRouteTableAssociation',
-  'AWS::EC2::Route', 'AWS::EC2::RouteTable',
-  'AWS::EC2::Subnet', 'AWS::EC2::InternetGateway',
-  'AWS::EC2::VPCGatewayAttachment', 'AWS::EC2::NetworkAclEntry',
-  'AWS::EC2::NetworkAcl', 'AWS::EC2::SubnetNetworkAclAssociation',
-  'AWS::EC2::PlacementGroup', 'AWS::EC2::KeyPair',
-  'AWS::EC2::LaunchTemplate',
-  'AWS::CloudFormation::Stack', 'AWS::CloudFormation::WaitCondition',
-  'AWS::CloudFormation::WaitConditionHandle', 'AWS::CloudFormation::CustomResource',
+  'AWS::EC2::SecurityGroup','AWS::EC2::SubnetRouteTableAssociation',
+  'AWS::EC2::Route','AWS::EC2::RouteTable',
+  'AWS::EC2::Subnet','AWS::EC2::InternetGateway',
+  'AWS::EC2::VPCGatewayAttachment','AWS::EC2::NetworkAclEntry',
+  'AWS::EC2::NetworkAcl','AWS::EC2::SubnetNetworkAclAssociation',
+  'AWS::EC2::PlacementGroup','AWS::EC2::KeyPair','AWS::EC2::LaunchTemplate',
+  'AWS::EC2::VPC',
+  'AWS::CloudFormation::Stack','AWS::CloudFormation::WaitCondition',
+  'AWS::CloudFormation::WaitConditionHandle','AWS::CloudFormation::CustomResource',
   'AWS::CloudFormation::Macro',
   'AWS::CloudWatch::Alarm',
-  'AWS::Logs::LogGroup', 'AWS::Logs::MetricFilter',
-  'AWS::Logs::SubscriptionFilter',
-  'AWS::Events::Rule', 'AWS::Events::EventBus',
+  'AWS::Logs::MetricFilter','AWS::Logs::SubscriptionFilter',
+  'AWS::Events::Rule','AWS::Events::EventBus',
   'AWS::ApplicationAutoScaling::ScalableTarget',
   'AWS::ApplicationAutoScaling::ScalingPolicy',
   'AWS::AutoScaling::LaunchConfiguration',
-  'AWS::AutoScaling::ScalingPolicy', 'AWS::AutoScaling::ScheduledAction',
+  'AWS::AutoScaling::ScalingPolicy','AWS::AutoScaling::ScheduledAction',
   'AWS::AutoScaling::LifecycleHook',
-  'AWS::SSM::Parameter', 'AWS::SSM::Association', 'AWS::SSM::Document',
-  'AWS::ServiceDiscovery::PrivateDnsNamespace',
-  'AWS::ServiceDiscovery::Service',
-  'AWS::ECS::TaskDefinition', 'AWS::ECS::Cluster',
+  'AWS::SSM::Parameter','AWS::SSM::Association','AWS::SSM::Document',
+  'AWS::ServiceDiscovery::PrivateDnsNamespace','AWS::ServiceDiscovery::Service',
+  'AWS::ECS::TaskDefinition','AWS::ECS::Cluster',
   'AWS::EKS::Addon',
-  'AWS::CodeDeploy::Application', 'AWS::CodeDeploy::DeploymentGroup',
+  'AWS::CodeDeploy::Application','AWS::CodeDeploy::DeploymentGroup',
   'AWS::CodePipeline::Pipeline',
   'AWS::CertificateManager::Certificate',
-  'AWS::Config::ConfigRule', 'AWS::Config::ConfigurationRecorder',
+  'AWS::Config::ConfigRule','AWS::Config::ConfigurationRecorder',
   'AWS::Config::DeliveryChannel',
   'AWS::CDK::Metadata',
-  'Custom::S3AutoDeleteObjects', 'Custom::VpcRestrictDefaultSG',
-  'Custom::AWS', 'Custom::CrossRegionExportWriter',
+  'AWS::WAFv2::IPSet','AWS::KMS::Alias','AWS::Glue::Database',
+  'Custom::S3AutoDeleteObjects','Custom::VpcRestrictDefaultSG',
+  'Custom::AWS','Custom::CrossRegionExportWriter',
 ];
 
-// ── Priced resources: [cfnType, serviceCode, unit, multiplierKey, multiplierVal, filters, note?] ──
-const PRICED = [
-  // ─── Compute ───
-  ['AWS::EC2::Instance', 'AmazonEC2', 'Hrs', 'monthlyHours', 730, [
-    ['instanceType', {cfProperty:'InstanceType'}], ['operatingSystem', {default:'Linux'}],
-    ['tenancy', {default:'Shared'}], ['capacitystatus', {default:'Used'}],
-    ['preInstalledSw', {default:'NA'}], ['productFamily', {default:'Compute Instance'}]
-  ]],
-  ['AWS::EC2::NatGateway', 'AmazonEC2', 'Hrs', 'monthlyHours', 730, [
-    ['productFamily', {default:'NAT Gateway'}], ['group', {default:'NGW:NatGateway'}]
-  ]],
-  ['AWS::EC2::Volume', 'AmazonEC2', 'GB-Mo', null, null, [
-    ['productFamily', {default:'Storage'}], ['volumeApiName', {cfProperty:'VolumeType', default:'gp3'}]
-  ], 'EBS volume'],
-  ['AWS::EC2::VPNConnection', 'AmazonVPC', 'Hrs', 'monthlyHours', 730, [
-    ['productFamily', {default:'VPNConnection'}]
-  ]],
-  ['AWS::EC2::TransitGateway', 'AmazonVPC', 'Hrs', 'monthlyHours', 730, [
-    ['productFamily', {default:'TransitGateway'}]
-  ]],
-  ['AWS::EC2::TransitGatewayAttachment', 'AmazonVPC', 'Hrs', 'monthlyHours', 730, [
-    ['productFamily', {default:'TransitGateway'}],
-    ['usagetype', {default:'USE1-TransitGateway-Hours'}]
-  ]],
-  ['AWS::EC2::ClientVpnEndpoint', 'AmazonVPC', 'Hrs', 'monthlyHours', 730, [
-    ['productFamily', {default:'VPNConnection'}],
-    ['usagetype', {default:'USE1-ClientVPN-ConnectionHours'}]
-  ]],
-  ['AWS::EC2::EIP', 'AmazonEC2', 'Hrs', 'monthlyHours', 730, [
-    ['productFamily', {default:'IP Address'}],
-    ['usagetype', {default:'USE1-PublicIPv4:InUseAddress'}]
-  ], 'Public IPv4 address cost (since Feb 2024)'],
-  ['AWS::EC2::VPCEndpoint', 'AmazonVPC', 'Hrs', 'monthlyHours', 730, [
-    ['productFamily', {default:'VpcEndpoint'}],
-    ['usagetype', {default:'USE1-VpcEndpoint-Hours'}]
-  ], 'Interface endpoint hourly cost. Gateway endpoints are free.'],
-  ['AWS::EC2::Host', 'AmazonEC2', 'Hrs', 'monthlyHours', 730, [
-    ['productFamily', {default:'Dedicated Host'}]
-  ]],
-  // ─── Load Balancers ───
-  ['AWS::ElasticLoadBalancingV2::LoadBalancer', 'AmazonEC2', 'Hrs', 'monthlyHours', 730, [
-    ['productFamily', {default:'Load Balancer-Application'}],
-    ['usagetype', {default:'USE1-LoadBalancerUsage'}]
-  ]],
-  ['AWS::ElasticLoadBalancing::LoadBalancer', 'AmazonEC2', 'Hrs', 'monthlyHours', 730, [
-    ['productFamily', {default:'Load Balancer'}],
-    ['usagetype', {default:'USE1-LoadBalancerUsage'}]
-  ]],
-  // ─── Auto Scaling ───
-  ['AWS::AutoScaling::AutoScalingGroup', 'AmazonEC2', 'Hrs', 'monthlyHours', 730, [
-    ['productFamily', {default:'Compute Instance'}],
-    ['instanceType', {cfProperty:'LaunchConfigurationName', default:'t3.medium'}],
-    ['operatingSystem', {default:'Linux'}], ['tenancy', {default:'Shared'}],
-    ['capacitystatus', {default:'Used'}], ['preInstalledSw', {default:'NA'}]
-  ], 'Estimate based on instance type from launch config'],
-  // ─── Serverless ───
-  ['AWS::Lambda::Function', 'AWSLambda', 'Lambda-GB-Second', 'monthlyQuantity', 400000, [
-    ['productFamily', {default:'Serverless'}], ['group', {default:'AWS-Lambda-Duration'}],
-    ['usagetype', {default:'USE1-Lambda-GB-Second'}]
-  ], 'Estimate based on 400k GB-seconds/month (free tier boundary)'],
-  ['AWS::StepFunctions::StateMachine', 'AmazonStates', 'StateTransition', 'monthlyQuantity', 10000, [
-    ['productFamily', {default:'AWS Step Functions'}],
-    ['usagetype', {default:'USE1-StateTransition'}]
-  ], 'Estimate based on 10k transitions/month'],
-  // ─── Containers ───
-  ['AWS::ECS::Service', 'AmazonECS', 'Hrs', 'monthlyHours', 730, [
-    ['productFamily', {default:'Compute'}],
-    ['usagetype', {default:'USE1-Fargate-vCPU-Hours:perCPU'}]
-  ], 'Fargate vCPU pricing. Estimate based on 1 task running 24/7.'],
-  ['AWS::EKS::Cluster', 'AmazonEKS', 'Hrs', 'monthlyHours', 730, [
-    ['productFamily', {default:'Compute'}],
-    ['usagetype', {default:'USE1-AmazonEKS-Hours:perCluster'}]
-  ]],
-  ['AWS::EKS::Nodegroup', 'AmazonEKS', 'Hrs', 'monthlyHours', 730, [
-    ['productFamily', {default:'Compute'}],
-    ['usagetype', {default:'USE1-AmazonEKS-Hours:perCluster'}]
-  ], 'EKS control plane cost only. Node costs depend on EC2 instance type.'],
-  ['AWS::EKS::FargateProfile', 'AmazonEKS', 'Hrs', 'monthlyHours', 730, [
-    ['productFamily', {default:'Compute'}],
-    ['usagetype', {default:'USE1-Fargate-vCPU-Hours:perCPU'}]
-  ]],
-  ['AWS::ECR::Repository', 'AmazonECR', 'GB-Mo', 'monthlyQuantity', 10, [
-    ['productFamily', {default:'EC2 Container Registry'}]
-  ], 'Estimate based on 10 GB stored images'],
-  // ─── Databases ───
-  ['AWS::RDS::DBInstance', 'AmazonRDS', 'Hrs', 'monthlyHours', 730, [
-    ['productFamily', {default:'Database Instance'}],
-    ['instanceType', {cfProperty:'DBInstanceClass'}],
-    ['databaseEngine', {cfProperty:'Engine'}]
-  ]],
-  ['AWS::RDS::DBCluster', 'AmazonRDS', 'Hrs', 'monthlyHours', 730, [
-    ['productFamily', {default:'Database Instance'}],
-    ['databaseEngine', {cfProperty:'Engine'}]
-  ], 'Aurora cluster. Cost is per-instance; multiply by instance count.'],
-  ['AWS::RDS::DBProxy', 'AmazonRDS', 'Hrs', 'monthlyHours', 730, [
-    ['productFamily', {default:'RDS Proxy'}]
-  ]],
-  ['AWS::DynamoDB::Table', 'AmazonDynamoDB', 'WriteCapacityUnit-Hrs', 'monthlyHours', 730, [
-    ['productFamily', {default:'Database'}], ['group', {default:'DDB-WriteUnits'}]
-  ], 'Provisioned WCU cost. On-demand and RCU costs not included.'],
-  ['AWS::DynamoDB::GlobalTable', 'AmazonDynamoDB', 'WriteCapacityUnit-Hrs', 'monthlyHours', 730, [
-    ['productFamily', {default:'Database'}], ['group', {default:'DDB-WriteUnits'}]
-  ], 'Global table provisioned WCU cost per replica region.'],
-  ['AWS::ElastiCache::CacheCluster', 'AmazonElastiCache', 'Hrs', 'monthlyHours', 730, [
-    ['productFamily', {default:'Cache Instance'}],
-    ['instanceType', {cfProperty:'CacheNodeType'}]
-  ]],
-  ['AWS::ElastiCache::ReplicationGroup', 'AmazonElastiCache', 'Hrs', 'monthlyHours', 730, [
-    ['productFamily', {default:'Cache Instance'}],
-    ['instanceType', {cfProperty:'CacheNodeType'}]
-  ]],
-  ['AWS::ElastiCache::ServerlessCache', 'AmazonElastiCache', 'ElastiCacheProcessingUnits', 'monthlyHours', 730, [
-    ['productFamily', {default:'ElastiCache Serverless'}]
-  ], 'Serverless ElastiCache ECPU-based pricing'],
-  ['AWS::DocDB::DBInstance', 'AmazonDocDB', 'Hrs', 'monthlyHours', 730, [
-    ['productFamily', {default:'Database Instance'}],
-    ['instanceType', {cfProperty:'DBInstanceClass'}]
-  ]],
-  ['AWS::DocDB::DBCluster', 'AmazonDocDB', 'Hrs', 'monthlyHours', 730, [
-    ['productFamily', {default:'Database Instance'}]
-  ]],
-  ['AWS::Neptune::DBInstance', 'AmazonNeptune', 'Hrs', 'monthlyHours', 730, [
-    ['productFamily', {default:'Database Instance'}],
-    ['instanceType', {cfProperty:'DBInstanceClass'}]
-  ]],
-  ['AWS::Neptune::DBCluster', 'AmazonNeptune', 'Hrs', 'monthlyHours', 730, [
-    ['productFamily', {default:'Database Instance'}]
-  ]],
-  ['AWS::Redshift::Cluster', 'AmazonRedshift', 'Hrs', 'monthlyHours', 730, [
-    ['productFamily', {default:'Compute Instance'}],
-    ['instanceType', {cfProperty:'NodeType'}]
-  ]],
-  ['AWS::MemoryDB::Cluster', 'AmazonMemoryDB', 'Hrs', 'monthlyHours', 730, [
-    ['productFamily', {default:'MemoryDB'}]
-  ]],
-  ['AWS::Timestream::Table', 'AmazonTimestream', 'GB-Mo', 'monthlyQuantity', 10, [
-    ['productFamily', {default:'Storage'}]
-  ], 'Estimate based on 10 GB stored data'],
-  // ─── Storage ───
-  ['AWS::S3::Bucket', 'AmazonS3', 'GB-Mo', 'monthlyQuantity', 100, [
-    ['productFamily', {default:'Storage'}], ['volumeType', {default:'Standard'}]
-  ], 'Estimate based on 100 GB standard storage'],
-  ['AWS::EFS::FileSystem', 'AmazonEFS', 'GB-Mo', 'monthlyQuantity', 100, [
-    ['productFamily', {default:'Storage'}],
-    ['usagetype', {default:'USE1-TimedStorage-ByteHrs'}]
-  ], 'Estimate based on 100 GB standard storage'],
-  ['AWS::FSx::FileSystem', 'AmazonFSx', 'GB-Mo', 'monthlyQuantity', 1024, [
-    ['productFamily', {default:'Storage'}]
-  ], 'Estimate based on 1 TB storage'],
-  ['AWS::Backup::BackupVault', 'AWSBackup', 'GB-Mo', 'monthlyQuantity', 100, [
-    ['productFamily', {default:'AWS Backup Storage'}]
-  ], 'Estimate based on 100 GB backup storage'],
-  // ─── CDN / Edge ───
-  ['AWS::CloudFront::Distribution', 'AmazonCloudFront', 'Requests', 'monthlyQuantity', 10000000, [
-    ['productFamily', {default:'Request'}]
-  ], 'Estimate based on 10M HTTP requests/month'],
-  ['AWS::GlobalAccelerator::Accelerator', 'AWSGlobalAccelerator', 'Hrs', 'monthlyHours', 730, [
-    ['productFamily', {default:'Global Accelerator'}]
-  ]],
-  // ─── Messaging ───
-  ['AWS::SQS::Queue', 'AWSQueueService', 'Requests', 'monthlyQuantity', 1000000, [
-    ['productFamily', {default:'Queue'}], ['queueType', {default:'Standard'}]
-  ], 'Estimate based on 1M requests/month'],
-  ['AWS::SNS::Topic', 'AmazonSNS', 'Requests', 'monthlyQuantity', 1000000, [
-    ['productFamily', {default:'Message Delivery'}]
-  ], 'Estimate based on 1M publishes/month'],
-  ['AWS::Kinesis::Stream', 'AmazonKinesis', 'Shard-Hours', 'monthlyHours', 730, [
-    ['productFamily', {default:'Kinesis Streams'}]
-  ]],
-  ['AWS::KinesisFirehose::DeliveryStream', 'AmazonKinesisFirehose', 'GB', 'monthlyQuantity', 100, [
-    ['productFamily', {default:'Kinesis Firehose'}]
-  ], 'Estimate based on 100 GB ingested/month'],
-  ['AWS::KinesisAnalyticsV2::Application', 'AmazonKinesisAnalytics', 'KPU-Hour', 'monthlyHours', 730, [
-    ['productFamily', {default:'Kinesis Analytics'}]
-  ], 'Estimate based on 1 KPU running 24/7'],
-  // ─── Security ───
-  ['AWS::KMS::Key', 'awskms', 'months', null, null, [
-    ['productFamily', {default:'Encryption Key'}]
-  ], '$1/month per CMK'],
-  ['AWS::KMS::Alias', '_free', null, null, null, []], // alias is free
-  ['AWS::SecretsManager::Secret', 'AWSSecretsManager', 'months', null, null, [
-    ['productFamily', {default:'Secret'}]
-  ], '$0.40/month per secret'],
-  ['AWS::WAFv2::WebACL', 'awswaf', 'months', null, null, [
-    ['productFamily', {default:'Web Application Firewall'}]
-  ], '$5/month per Web ACL'],
-  ['AWS::WAFv2::IPSet', '_free', null, null, null, []],
-  ['AWS::WAFv2::RuleGroup', 'awswaf', 'months', null, null, [
-    ['productFamily', {default:'Web Application Firewall'}]
-  ]],
-  ['AWS::NetworkFirewall::Firewall', 'AmazonVPC', 'Hrs', 'monthlyHours', 730, [
-    ['productFamily', {default:'Network Firewall'}]
-  ]],
-  ['AWS::GuardDuty::Detector', 'AmazonGuardDuty', 'Events', 'monthlyQuantity', 1000000, [
-    ['productFamily', {default:'Security & Monitoring'}]
-  ], 'Estimate based on 1M events/month'],
-  // ─── Search / Analytics ───
-  ['AWS::Elasticsearch::Domain', 'AmazonES', 'Hrs', 'monthlyHours', 730, [
-    ['productFamily', {default:'Compute Instance'}],
-    ['instanceType', {cfProperty:'ElasticsearchClusterConfig.InstanceType'}]
-  ]],
-  ['AWS::OpenSearchService::Domain', 'AmazonES', 'Hrs', 'monthlyHours', 730, [
-    ['productFamily', {default:'Compute Instance'}],
-    ['instanceType', {cfProperty:'ClusterConfig.InstanceType'}]
-  ]],
-  ['AWS::Athena::WorkGroup', 'AmazonAthena', 'Terabytes', 'monthlyQuantity', 1, [
-    ['productFamily', {default:'Athena'}]
-  ], 'Estimate based on 1 TB scanned/month'],
-  // ─── Streaming / Big Data ───
-  ['AWS::MSK::Cluster', 'AmazonMSK', 'Hrs', 'monthlyHours', 730, [
-    ['productFamily', {default:'Managed Streaming for Apache Kafka (MSK)'}],
-    ['instanceType', {cfProperty:'BrokerNodeGroupInfo.InstanceType'}]
-  ]],
-  ['AWS::MSK::ServerlessCluster', 'AmazonMSK', 'Hrs', 'monthlyHours', 730, [
-    ['productFamily', {default:'Managed Streaming for Apache Kafka (MSK)'}]
-  ]],
-  ['AWS::MWAA::Environment', 'AmazonMWAA', 'Hrs', 'monthlyHours', 730, [
-    ['productFamily', {default:'Managed Workflows for Apache Airflow'}],
-    ['usagetype', {cfProperty:'EnvironmentClass', default:'USE1-EnvironmentHours:mw1.small'}]
-  ]],
-  ['AWS::Glue::Job', 'AWSGlue', 'DPU-Hour', 'monthlyHours', 20, [
-    ['productFamily', {default:'AWS Glue'}],
-    ['usagetype', {default:'USE1-Glue-DPU-Hour'}]
-  ], 'Estimate based on 20 DPU-hours/month'],
-  ['AWS::Glue::Crawler', 'AWSGlue', 'DPU-Hour', 'monthlyHours', 10, [
-    ['productFamily', {default:'AWS Glue'}],
-    ['usagetype', {default:'USE1-Glue-DPU-Hour'}]
-  ], 'Estimate based on 10 DPU-hours/month'],
-  ['AWS::Glue::Database', '_free', null, null, null, []],
-  // ─── DNS / Networking ───
-  ['AWS::Route53::HostedZone', 'AmazonRoute53', 'months', null, null, [
-    ['productFamily', {default:'DNS Zone'}],
-    ['usagetype', {default:'HostedZone'}]
-  ], '$0.50/month per hosted zone'],
-  ['AWS::Route53::HealthCheck', 'AmazonRoute53', 'months', null, null, [
-    ['productFamily', {default:'DNS Health Check'}]
-  ]],
-  ['AWS::Route53Resolver::ResolverEndpoint', 'AmazonRoute53', 'Hrs', 'monthlyHours', 730, [
-    ['productFamily', {default:'DNS Query'}],
-    ['usagetype', {default:'USE1-ResolverNetworkInterface'}]
-  ]],
-  ['AWS::EC2::VPC', '_free', null, null, null, []],
-  // ─── API Gateway ───
-  ['AWS::ApiGateway::RestApi', 'AmazonApiGateway', 'Requests', 'monthlyQuantity', 1000000, [
-    ['productFamily', {default:'API Calls'}]
-  ], 'Estimate based on 1M API calls/month'],
-  ['AWS::ApiGatewayV2::Api', 'AmazonApiGateway', 'Requests', 'monthlyQuantity', 1000000, [
-    ['productFamily', {default:'WebSocket'}]
-  ], 'Estimate based on 1M messages/month'],
-  // ─── Data Transfer / DX ───
-  ['AWS::DirectConnect::Connection', 'AWSDirectConnect', 'Hrs', 'monthlyHours', 730, [
-    ['productFamily', {default:'Direct Connect'}]
-  ]],
-  // ─── Monitoring ───
-  ['AWS::CloudWatch::Dashboard', 'AmazonCloudWatch', 'months', null, null, [
-    ['productFamily', {default:'Dashboard'}]
-  ], '$3/month per dashboard'],
-  // ─── Misc ───
-  ['AWS::CodeBuild::Project', 'CodeBuild', 'Minutes', 'monthlyQuantity', 500, [
-    ['productFamily', {default:'Compute'}]
-  ], 'Estimate based on 500 build-minutes/month'],
-  ['AWS::Transfer::Server', 'AWSTransferFamily', 'Hrs', 'monthlyHours', 730, [
-    ['productFamily', {default:'AWS Transfer Family'}]
-  ]],
-  ['AWS::CloudHSM::Cluster', 'CloudHSM', 'Hrs', 'monthlyHours', 730, [
-    ['productFamily', {default:'CloudHSM'}]
-  ]],
-  ['AWS::CloudTrail::Trail', 'AWSCloudTrail', 'Events', 'monthlyQuantity', 100000, [
-    ['productFamily', {default:'Management Tools - AWS CloudTrail'}]
-  ], 'First trail in each region is free. Estimate for additional trails.'],
-  ['AWS::DMS::ReplicationInstance', 'AWSDatabaseMigrationSvc', 'Hrs', 'monthlyHours', 730, [
-    ['productFamily', {default:'Database Migration'}],
-    ['instanceType', {cfProperty:'ReplicationInstanceClass'}]
-  ]],
-  ['AWS::Lightsail::Instance', 'AmazonLightsail', 'Hrs', 'monthlyHours', 730, [
-    ['productFamily', {default:'Lightsail Instance'}]
-  ]],
-  ['AWS::MQ::Broker', 'AmazonMQ', 'Hrs', 'monthlyHours', 730, [
-    ['productFamily', {default:'Broker Instances'}],
-    ['instanceType', {cfProperty:'HostInstanceType'}]
-  ]],
-  ['AWS::Grafana::Workspace', 'AmazonGrafana', 'Hrs', 'monthlyHours', 730, [
-    ['productFamily', {default:'Amazon Managed Grafana'}]
-  ]],
-  ['AWS::DirectoryService::MicrosoftAD', 'AWSDirectoryService', 'Hrs', 'monthlyHours', 730, [
-    ['productFamily', {default:'AWS Directory Service'}]
-  ]],
-];
+// ═══════════════════════════════════════════════════════════════════════════════
+// 3. Reasonable monthly usage defaults (for usage-based resources)
+// ═══════════════════════════════════════════════════════════════════════════════
+const DEFAULTS = {
+  'AWS::Lambda::Function':       { monthlyQuantity: 400000, note: 'Estimate based on 400k GB-seconds/month' },
+  'AWS::S3::Bucket':             { monthlyQuantity: 100, note: 'Estimate based on 100 GB standard storage' },
+  'AWS::EFS::FileSystem':        { monthlyQuantity: 100, note: 'Estimate based on 100 GB standard storage' },
+  'AWS::FSx::FileSystem':        { monthlyQuantity: 1024, note: 'Estimate based on 1 TB storage' },
+  'AWS::CloudFront::Distribution': { monthlyQuantity: 10000000, note: 'Estimate based on 10M requests/month' },
+  'AWS::SQS::Queue':             { monthlyQuantity: 1000000, note: 'Estimate based on 1M requests/month' },
+  'AWS::SNS::Topic':             { monthlyQuantity: 1000000, note: 'Estimate based on 1M publishes/month' },
+  'AWS::KinesisFirehose::DeliveryStream': { monthlyQuantity: 100, note: 'Estimate based on 100 GB ingested/month' },
+  'AWS::ECR::Repository':        { monthlyQuantity: 10, note: 'Estimate based on 10 GB stored images' },
+  'AWS::Backup::BackupVault':    { monthlyQuantity: 100, note: 'Estimate based on 100 GB backup storage' },
+  'AWS::ApiGateway::RestApi':    { monthlyQuantity: 1000000, note: 'Estimate based on 1M API calls/month' },
+  'AWS::ApiGatewayV2::Api':      { monthlyQuantity: 1000000, note: 'Estimate based on 1M messages/month' },
+  'AWS::StepFunctions::StateMachine': { monthlyQuantity: 10000, note: 'Estimate based on 10k transitions/month' },
+  'AWS::Glue::Job':              { monthlyHours: 20, note: 'Estimate based on 20 DPU-hours/month' },
+  'AWS::Glue::Crawler':          { monthlyHours: 10, note: 'Estimate based on 10 DPU-hours/month' },
+  'AWS::CodeBuild::Project':     { monthlyQuantity: 500, note: 'Estimate based on 500 build-minutes/month' },
+  'AWS::DynamoDB::Table':        { note: 'Provisioned WCU cost. On-demand and RCU costs not included.' },
+  'AWS::ECS::Service':           { note: 'Fargate vCPU pricing. Estimate based on 1 task running 24/7.' },
+  'AWS::EKS::Nodegroup':         { note: 'EKS control plane cost only. Node costs depend on EC2 instance type.' },
+  'AWS::RDS::DBCluster':         { note: 'Aurora cluster. Cost per-instance; multiply by instance count.' },
+  'AWS::EC2::Volume':            { note: 'EBS volume' },
+  'AWS::EC2::EIP':               { note: 'Public IPv4 address cost (since Feb 2024)' },
+  'AWS::EC2::VPCEndpoint':       { note: 'Interface endpoint hourly cost. Gateway endpoints are free.' },
+  'AWS::KMS::Key':               { note: '$1/month per CMK' },
+  'AWS::SecretsManager::Secret': { note: '$0.40/month per secret' },
+  'AWS::WAFv2::WebACL':          { note: '$5/month per Web ACL' },
+  'AWS::Route53::HostedZone':    { note: '$0.50/month per hosted zone' },
+  'AWS::CloudWatch::Dashboard':  { note: '$3/month per dashboard' },
+  'AWS::CloudTrail::Trail':      { note: 'First trail in each region is free. Estimate for additional trails.' },
+};
 
-// ── Build the JSON ───────────────────────────────────────────────────────────
-function buildMap() {
+// ═══════════════════════════════════════════════════════════════════════════════
+// 4. Fetch and parse Infracost Go source from GitHub
+// ═══════════════════════════════════════════════════════════════════════════════
+const INFRACOST_API = 'https://api.github.com/repos/infracost/infracost/contents/internal/resources/aws';
+const RAW_BASE = 'https://raw.githubusercontent.com/infracost/infracost/master/internal/resources/aws';
+
+async function fetchJSON(url) {
+  const r = await fetch(url, { headers: { 'User-Agent': 'resource-map-gen' } });
+  if (!r.ok) throw new Error(`${r.status} ${url}`);
+  return r.json();
+}
+
+async function fetchText(url) {
+  const r = await fetch(url, { headers: { 'User-Agent': 'resource-map-gen' } });
+  if (!r.ok) throw new Error(`${r.status} ${url}`);
+  return r.text();
+}
+
+/** Parse a Go source file for Service and ProductFamily strings */
+function parseGoFile(src) {
+  const services = new Set();
+  const families = new Set();
+  const attrs = [];
+
+  // Match: Service: strPtr("AmazonEC2") or Service: strPtr("awskms")
+  for (const m of src.matchAll(/Service:\s*strPtr\("([^"]+)"\)/g)) {
+    services.add(m[1]);
+  }
+  // Match: ProductFamily: strPtr("Compute Instance")
+  for (const m of src.matchAll(/ProductFamily:\s*strPtr\("([^"]+)"\)/g)) {
+    families.add(m[1]);
+  }
+  // Match attribute filters: {Key: "instanceType", Value: strPtr("...")}
+  for (const m of src.matchAll(/Key:\s*"(\w+)",\s*Value:\s*strPtr\("([^"]+)"\)/g)) {
+    attrs.push({ key: m[1], value: m[2] });
+  }
+
+  return {
+    services: [...services],
+    families: [...families],
+    attrs,
+  };
+}
+
+/** Derive a Terraform resource name from a Go filename */
+function filenameToTfName(filename) {
+  return 'aws_' + filename.replace('.go', '');
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 5. Build the resource map
+// ═══════════════════════════════════════════════════════════════════════════════
+async function buildMap() {
+  console.log('Fetching Infracost AWS resource file list...');
+  const files = await fetchJSON(INFRACOST_API);
+  const goFiles = files
+    .filter(f => f.name.endsWith('.go') && !f.name.includes('_test') && !f.name.startsWith('util'))
+    .map(f => f.name);
+
+  console.log(`Found ${goFiles.length} Go resource files. Fetching and parsing...`);
+
   const map = {
-    _comment: 'Auto-generated by generate-resource-map.mjs. Maps CloudFormation resource types to AWS Pricing API query params.',
+    _comment: 'Auto-generated from Infracost source (github.com/infracost/infracost). Run generate-resource-map.mjs to update.',
     _free: FREE,
   };
 
-  for (const [cfn, svc, unit, mulKey, mulVal, rawFilters, note] of PRICED) {
-    if (svc === '_free') {
-      if (!map._free.includes(cfn)) map._free.push(cfn);
+  let matched = 0, skipped = 0;
+
+  for (const file of goFiles) {
+    const tfName = filenameToTfName(file);
+    const cfnType = TF_TO_CFN[tfName];
+
+    if (cfnType === undefined) {
+      console.log(`  ? ${tfName} (${file}) — no TF→CFN mapping, skipping`);
+      skipped++;
       continue;
     }
-    const entry = { serviceCode: svc, unit };
+    if (cfnType === null) {
+      // Explicitly marked as sub-resource or not applicable
+      skipped++;
+      continue;
+    }
+    if (map[cfnType]) {
+      // Already mapped (e.g. aws_alb and aws_lb both map to same CFN type)
+      continue;
+    }
+
+    const src = await fetchText(`${RAW_BASE}/${file}`);
+    const parsed = parseGoFile(src);
+
+    if (parsed.services.length === 0) {
+      console.log(`  - ${cfnType} (${file}) — no service code found in source`);
+      skipped++;
+      continue;
+    }
+
+    const serviceCode = parsed.services[0];
+    const productFamily = parsed.families[0] || null;
+
+    // Determine unit and multiplier based on common patterns
+    let unit = 'Hrs', mulKey = 'monthlyHours', mulVal = 730;
+
+    // Storage-based
+    if (/Storage|GB-Mo|TimedStorage/i.test(parsed.families.join(' ') + ' ' + parsed.attrs.map(a => a.value).join(' '))) {
+      unit = 'GB-Mo'; mulKey = null; mulVal = null;
+    }
+    // Request-based
+    if (/Request|Queue|Message|Transition/i.test(parsed.families.join(' '))) {
+      unit = 'Requests'; mulKey = 'monthlyQuantity'; mulVal = 1000000;
+    }
+    // Per-month flat
+    if (/months|month/i.test(unit) || /Secret|Encryption Key|DNS Zone|Dashboard|Web Application Firewall/i.test(parsed.families.join(' '))) {
+      unit = 'months'; mulKey = null; mulVal = null;
+    }
+
+    // Build filters from first service + product family + static attrs
+    const filters = [];
+    if (productFamily) {
+      filters.push({ Field: 'productFamily', Value: { default: productFamily } });
+    }
+    for (const attr of parsed.attrs) {
+      if (attr.key === 'usagetype' || attr.key === 'group' || attr.key === 'volumeApiName' || attr.key === 'queueType') {
+        if (!attr.value.includes('/') && !attr.value.includes('$')) { // skip regex patterns
+          filters.push({ Field: attr.key, Value: { default: attr.value } });
+        }
+      }
+    }
+
+    const entry = { serviceCode, unit };
+    // Apply defaults from our manual overrides
+    const defs = DEFAULTS[cfnType];
+    if (defs) {
+      if (defs.monthlyHours) { mulKey = 'monthlyHours'; mulVal = defs.monthlyHours; }
+      if (defs.monthlyQuantity) { mulKey = 'monthlyQuantity'; mulVal = defs.monthlyQuantity; }
+      if (defs.note) entry.note = defs.note;
+    }
     if (mulKey && mulVal) entry[mulKey] = mulVal;
-    if (note) entry.note = note;
-    entry.filters = rawFilters.map(([field, val]) => ({ Field: field, Value: val }));
-    map[cfn] = entry;
+    entry.filters = filters;
+
+    map[cfnType] = entry;
+    matched++;
+    process.stdout.write(`  ✓ ${cfnType} ← ${serviceCode}/${productFamily || '?'}\n`);
   }
+
+  console.log(`\nDone: ${matched} mapped, ${skipped} skipped`);
   return map;
 }
 
-// ── Validate against live Pricing API ────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════════
+// 6. Optional: validate against live AWS Pricing API
+// ═══════════════════════════════════════════════════════════════════════════════
 async function validateMap(map) {
-  let ok = 0, fail = 0, skip = 0;
+  const { PricingClient, GetProductsCommand } = await import('@aws-sdk/client-pricing');
+  const pricing = new PricingClient({ region: 'us-east-1' });
+  const LOCATION = 'US East (N. Virginia)';
+  let ok = 0, fail = 0;
+
   for (const [cfn, entry] of Object.entries(map)) {
     if (cfn.startsWith('_')) continue;
     const filters = entry.filters
-      .filter(f => f.Value.default) // only validate defaults
+      .filter(f => f.Value.default)
       .map(f => ({ Type: 'TERM_MATCH', Field: f.Field, Value: f.Value.default }));
     filters.push({ Type: 'TERM_MATCH', Field: 'location', Value: LOCATION });
 
@@ -388,30 +376,27 @@ async function validateMap(map) {
       const resp = await pricing.send(new GetProductsCommand({
         ServiceCode: entry.serviceCode, Filters: filters, MaxResults: 1,
       }));
-      if (resp.PriceList?.length > 0) {
-        console.log(`  ✓ ${cfn}`);
-        ok++;
-      } else {
-        console.log(`  ✗ ${cfn} — no results (serviceCode=${entry.serviceCode})`);
-        fail++;
-      }
+      if (resp.PriceList?.length > 0) { console.log(`  ✓ ${cfn}`); ok++; }
+      else { console.log(`  ✗ ${cfn} — no pricing results`); fail++; }
     } catch (e) {
-      console.log(`  ✗ ${cfn} — ${e.message}`);
-      fail++;
+      console.log(`  ✗ ${cfn} — ${e.message}`); fail++;
     }
   }
-  console.log(`\nValidation: ${ok} ok, ${fail} failed, ${skip} skipped`);
+  console.log(`\nValidation: ${ok} ok, ${fail} failed`);
 }
 
-// ── Main ─────────────────────────────────────────────────────────────────────
-const map = buildMap();
+// ═══════════════════════════════════════════════════════════════════════════════
+// Main
+// ═══════════════════════════════════════════════════════════════════════════════
+const map = await buildMap();
 const json = JSON.stringify(map, null, 2);
 writeFileSync(OUT, json + '\n');
-console.log(`Wrote ${OUT}`);
-console.log(`  Priced resources: ${Object.keys(map).filter(k => !k.startsWith('_')).length}`);
-console.log(`  Free resources:   ${map._free.length}`);
+
+const pricedCount = Object.keys(map).filter(k => !k.startsWith('_')).length;
+console.log(`\nWrote ${OUT}`);
+console.log(`  Priced: ${pricedCount} | Free: ${map._free.length}`);
 
 if (validate) {
-  console.log('\nValidating against AWS Pricing API...');
+  console.log('\nValidating against AWS Pricing API...\n');
   await validateMap(map);
 }
