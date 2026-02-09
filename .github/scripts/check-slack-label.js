@@ -13,13 +13,17 @@
  *   notify - "true" or "false"
  */
 
-if (!process.env.SLACK_WEBHOOK) { core.setOutput('notify', 'false'); return; }
+let notify = 'false';
 const prNum = parseInt(process.env.PR_NUM || '0', 10);
-if (!prNum) { core.setOutput('notify', 'false'); return; }
-const { data: pr } = await github.rest.pulls.get({
-  owner: context.repo.owner,
-  repo: context.repo.repo,
-  pull_number: prNum,
-});
-const label = process.env.SLACK_NOTIFY_LABEL || 'slack-notify';
-core.setOutput('notify', pr.labels.some(l => l.name === label) ? 'true' : 'false');
+if (process.env.SLACK_WEBHOOK && prNum) {
+  const { data: pr } = await github.rest.pulls.get({
+    owner: context.repo.owner,
+    repo: context.repo.repo,
+    pull_number: prNum,
+  });
+  const label = process.env.SLACK_NOTIFY_LABEL || 'slack-notify';
+  if (pr.labels.some(l => l.name === label)) {
+    notify = 'true';
+  }
+}
+core.setOutput('notify', notify);
