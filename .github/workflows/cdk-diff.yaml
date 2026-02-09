@@ -100,7 +100,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: vi-technologies/shared-workflows
-          ref: ${{ github.job_workflow_sha }}
+          ref: VE-7478-discovery-use-ai-to-calculate-costs-changes-in-pr
           sparse-checkout: .github/scripts
           path: _shared
 
@@ -149,7 +149,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: vi-technologies/shared-workflows
-          ref: ${{ github.job_workflow_sha }}
+          ref: VE-7478-discovery-use-ai-to-calculate-costs-changes-in-pr
           sparse-checkout: .github/scripts
           path: _shared
 
@@ -205,7 +205,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: vi-technologies/shared-workflows
-          ref: ${{ github.job_workflow_sha }}
+          ref: VE-7478-discovery-use-ai-to-calculate-costs-changes-in-pr
           sparse-checkout: .github/scripts
           path: _shared
 
@@ -246,7 +246,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: vi-technologies/shared-workflows
-          ref: ${{ github.job_workflow_sha }}
+          ref: VE-7478-discovery-use-ai-to-calculate-costs-changes-in-pr
           sparse-checkout: .github/scripts
           path: _shared
 
@@ -279,7 +279,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: vi-technologies/shared-workflows
-          ref: ${{ github.job_workflow_sha }}
+          ref: VE-7478-discovery-use-ai-to-calculate-costs-changes-in-pr
           sparse-checkout: |
             .github/scripts
             .github/pricing
