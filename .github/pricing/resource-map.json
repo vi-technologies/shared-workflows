@@ -1,0 +1,314 @@
+{
+  "_comment": "Maps CloudFormation resource types to AWS Pricing API (GetProducts) query parameters. serviceCode is the AWS pricing service code. filters map CF properties to Pricing API attribute filters. cfProperty reads from the CDK diff; default provides a static value. monthlyHours/monthlyQuantity converts unit prices to monthly estimates. The AWS Pricing API is free and requires no extra API key — OIDC credentials are sufficient.",
+
+  "AWS::EC2::Instance": {
+    "serviceCode": "AmazonEC2",
+    "unit": "Hrs",
+    "monthlyHours": 730,
+    "filters": [
+      { "Field": "instanceType", "Value": { "cfProperty": "InstanceType" } },
+      { "Field": "operatingSystem", "Value": { "default": "Linux" } },
+      { "Field": "tenancy", "Value": { "default": "Shared" } },
+      { "Field": "capacitystatus", "Value": { "default": "Used" } },
+      { "Field": "preInstalledSw", "Value": { "default": "NA" } },
+      { "Field": "productFamily", "Value": { "default": "Compute Instance" } }
+    ]
+  },
+
+  "AWS::EC2::NatGateway": {
+    "serviceCode": "AmazonEC2",
+    "unit": "Hrs",
+    "monthlyHours": 730,
+    "filters": [
+      { "Field": "productFamily", "Value": { "default": "NAT Gateway" } },
+      { "Field": "group", "Value": { "default": "NGW:NatGateway" } }
+    ]
+  },
+
+  "AWS::EC2::Volume": {
+    "serviceCode": "AmazonEC2",
+    "unit": "GB-Mo",
+    "note": "EBS volume. Uses cfProperty VolumeType, defaults to gp3.",
+    "filters": [
+      { "Field": "productFamily", "Value": { "default": "Storage" } },
+      { "Field": "volumeApiName", "Value": { "cfProperty": "VolumeType", "default": "gp3" } }
+    ]
+  },
+
+  "AWS::EC2::VPNConnection": {
+    "serviceCode": "AmazonVPC",
+    "unit": "Hrs",
+    "monthlyHours": 730,
+    "filters": [
+      { "Field": "productFamily", "Value": { "default": "VPNConnection" } }
+    ]
+  },
+
+  "AWS::EC2::TransitGateway": {
+    "serviceCode": "AmazonVPC",
+    "unit": "Hrs",
+    "monthlyHours": 730,
+    "filters": [
+      { "Field": "productFamily", "Value": { "default": "TransitGateway" } }
+    ]
+  },
+
+  "AWS::EC2::ClientVpnEndpoint": {
+    "serviceCode": "AmazonVPC",
+    "unit": "Hrs",
+    "monthlyHours": 730,
+    "filters": [
+      { "Field": "productFamily", "Value": { "default": "VPNConnection" } },
+      { "Field": "usagetype", "Value": { "default": "USE1-ClientVPN-ConnectionHours" } }
+    ]
+  },
+
+  "AWS::ElasticLoadBalancingV2::LoadBalancer": {
+    "serviceCode": "AmazonEC2",
+    "unit": "Hrs",
+    "monthlyHours": 730,
+    "filters": [
+      { "Field": "productFamily", "Value": { "default": "Load Balancer-Application" } },
+      { "Field": "usagetype", "Value": { "default": "USE1-LoadBalancerUsage" } }
+    ]
+  },
+
+  "AWS::Lambda::Function": {
+    "serviceCode": "AWSLambda",
+    "unit": "Lambda-GB-Second",
+    "monthlyQuantity": 400000,
+    "note": "Estimate based on 400k GB-seconds/month (free tier boundary)",
+    "filters": [
+      { "Field": "productFamily", "Value": { "default": "Serverless" } },
+      { "Field": "group", "Value": { "default": "AWS-Lambda-Duration" } },
+      { "Field": "usagetype", "Value": { "default": "USE1-Lambda-GB-Second" } }
+    ]
+  },
+
+  "AWS::ECS::Service": {
+    "serviceCode": "AmazonECS",
+    "unit": "Hrs",
+    "monthlyHours": 730,
+    "note": "Fargate vCPU pricing. Estimate based on 1 task running 24/7.",
+    "filters": [
+      { "Field": "productFamily", "Value": { "default": "Compute" } },
+      { "Field": "usagetype", "Value": { "default": "USE1-Fargate-vCPU-Hours:perCPU" } }
+    ]
+  },
+
+  "AWS::EKS::Cluster": {
+    "serviceCode": "AmazonEKS",
+    "unit": "Hrs",
+    "monthlyHours": 730,
+    "filters": [
+      { "Field": "productFamily", "Value": { "default": "Compute" } },
+      { "Field": "usagetype", "Value": { "default": "USE1-AmazonEKS-Hours:perCluster" } }
+    ]
+  },
+
+  "AWS::EKS::Nodegroup": {
+    "serviceCode": "AmazonEKS",
+    "unit": "Hrs",
+    "monthlyHours": 730,
+    "note": "EKS cluster control plane cost only. Node costs depend on EC2 instance type.",
+    "filters": [
+      { "Field": "productFamily", "Value": { "default": "Compute" } },
+      { "Field": "usagetype", "Value": { "default": "USE1-AmazonEKS-Hours:perCluster" } }
+    ]
+  },
+
+  "AWS::RDS::DBInstance": {
+    "serviceCode": "AmazonRDS",
+    "unit": "Hrs",
+    "monthlyHours": 730,
+    "filters": [
+      { "Field": "productFamily", "Value": { "default": "Database Instance" } },
+      { "Field": "instanceType", "Value": { "cfProperty": "DBInstanceClass" } },
+      { "Field": "databaseEngine", "Value": { "cfProperty": "Engine" } }
+    ]
+  },
+
+  "AWS::RDS::DBCluster": {
+    "serviceCode": "AmazonRDS",
+    "unit": "Hrs",
+    "monthlyHours": 730,
+    "note": "Aurora cluster. Cost is per-instance; multiply by instance count.",
+    "filters": [
+      { "Field": "productFamily", "Value": { "default": "Database Instance" } },
+      { "Field": "databaseEngine", "Value": { "cfProperty": "Engine" } }
+    ]
+  },
+
+  "AWS::DynamoDB::Table": {
+    "serviceCode": "AmazonDynamoDB",
+    "unit": "WriteCapacityUnit-Hrs",
+    "monthlyHours": 730,
+    "note": "Provisioned WCU cost. On-demand and RCU costs not included.",
+    "filters": [
+      { "Field": "productFamily", "Value": { "default": "Database" } },
+      { "Field": "group", "Value": { "default": "DDB-WriteUnits" } }
+    ]
+  },
+
+  "AWS::ElastiCache::CacheCluster": {
+    "serviceCode": "AmazonElastiCache",
+    "unit": "Hrs",
+    "monthlyHours": 730,
+    "filters": [
+      { "Field": "productFamily", "Value": { "default": "Cache Instance" } },
+      { "Field": "instanceType", "Value": { "cfProperty": "CacheNodeType" } }
+    ]
+  },
+
+  "AWS::ElastiCache::ReplicationGroup": {
+    "serviceCode": "AmazonElastiCache",
+    "unit": "Hrs",
+    "monthlyHours": 730,
+    "filters": [
+      { "Field": "productFamily", "Value": { "default": "Cache Instance" } },
+      { "Field": "instanceType", "Value": { "cfProperty": "CacheNodeType" } }
+    ]
+  },
+
+  "AWS::DocDB::DBInstance": {
+    "serviceCode": "AmazonDocDB",
+    "unit": "Hrs",
+    "monthlyHours": 730,
+    "filters": [
+      { "Field": "productFamily", "Value": { "default": "Database Instance" } },
+      { "Field": "instanceType", "Value": { "cfProperty": "DBInstanceClass" } }
+    ]
+  },
+
+  "AWS::Neptune::DBInstance": {
+    "serviceCode": "AmazonNeptune",
+    "unit": "Hrs",
+    "monthlyHours": 730,
+    "filters": [
+      { "Field": "productFamily", "Value": { "default": "Database Instance" } },
+      { "Field": "instanceType", "Value": { "cfProperty": "DBInstanceClass" } }
+    ]
+  },
+
+  "AWS::S3::Bucket": {
+    "serviceCode": "AmazonS3",
+    "unit": "GB-Mo",
+    "monthlyQuantity": 100,
+    "note": "Estimate based on 100 GB standard storage",
+    "filters": [
+      { "Field": "productFamily", "Value": { "default": "Storage" } },
+      { "Field": "volumeType", "Value": { "default": "Standard" } }
+    ]
+  },
+
+  "AWS::EFS::FileSystem": {
+    "serviceCode": "AmazonEFS",
+    "unit": "GB-Mo",
+    "monthlyQuantity": 100,
+    "note": "Estimate based on 100 GB standard storage",
+    "filters": [
+      { "Field": "productFamily", "Value": { "default": "Storage" } },
+      { "Field": "usagetype", "Value": { "default": "USE1-TimedStorage-ByteHrs" } }
+    ]
+  },
+
+  "AWS::CloudFront::Distribution": {
+    "serviceCode": "AmazonCloudFront",
+    "unit": "Requests",
+    "monthlyQuantity": 10000000,
+    "note": "Estimate based on 10M HTTP requests/month",
+    "filters": [
+      { "Field": "productFamily", "Value": { "default": "Request" } }
+    ]
+  },
+
+  "AWS::Elasticsearch::Domain": {
+    "serviceCode": "AmazonES",
+    "unit": "Hrs",
+    "monthlyHours": 730,
+    "filters": [
+      { "Field": "productFamily", "Value": { "default": "Compute Instance" } },
+      { "Field": "instanceType", "Value": { "cfProperty": "ElasticsearchClusterConfig.InstanceType" } }
+    ]
+  },
+
+  "AWS::OpenSearchService::Domain": {
+    "serviceCode": "AmazonES",
+    "unit": "Hrs",
+    "monthlyHours": 730,
+    "filters": [
+      { "Field": "productFamily", "Value": { "default": "Compute Instance" } },
+      { "Field": "instanceType", "Value": { "cfProperty": "ClusterConfig.InstanceType" } }
+    ]
+  },
+
+  "AWS::MSK::Cluster": {
+    "serviceCode": "AmazonMSK",
+    "unit": "Hrs",
+    "monthlyHours": 730,
+    "filters": [
+      { "Field": "productFamily", "Value": { "default": "Managed Streaming for Apache Kafka (MSK)" } },
+      { "Field": "instanceType", "Value": { "cfProperty": "BrokerNodeGroupInfo.InstanceType" } }
+    ]
+  },
+
+  "AWS::MWAA::Environment": {
+    "serviceCode": "AmazonMWAA",
+    "unit": "Hrs",
+    "monthlyHours": 730,
+    "filters": [
+      { "Field": "productFamily", "Value": { "default": "Managed Workflows for Apache Airflow" } },
+      { "Field": "usagetype", "Value": { "cfProperty": "EnvironmentClass", "default": "USE1-EnvironmentHours:mw1.small" } }
+    ]
+  },
+
+  "AWS::Redshift::Cluster": {
+    "serviceCode": "AmazonRedshift",
+    "unit": "Hrs",
+    "monthlyHours": 730,
+    "filters": [
+      { "Field": "productFamily", "Value": { "default": "Compute Instance" } },
+      { "Field": "instanceType", "Value": { "cfProperty": "NodeType" } }
+    ]
+  },
+
+  "AWS::SQS::Queue": {
+    "serviceCode": "AWSQueueService",
+    "unit": "Requests",
+    "monthlyQuantity": 1000000,
+    "note": "Estimate based on 1M requests/month",
+    "filters": [
+      { "Field": "productFamily", "Value": { "default": "Queue" } },
+      { "Field": "queueType", "Value": { "default": "Standard" } }
+    ]
+  },
+
+  "AWS::SNS::Topic": {
+    "serviceCode": "AmazonSNS",
+    "unit": "Requests",
+    "monthlyQuantity": 1000000,
+    "note": "Estimate based on 1M publishes/month",
+    "filters": [
+      { "Field": "productFamily", "Value": { "default": "Message Delivery" } }
+    ]
+  },
+
+  "AWS::Kinesis::Stream": {
+    "serviceCode": "AmazonKinesis",
+    "unit": "Shard-Hours",
+    "monthlyHours": 730,
+    "filters": [
+      { "Field": "productFamily", "Value": { "default": "Kinesis Streams" } }
+    ]
+  },
+
+  "AWS::KinesisFirehose::DeliveryStream": {
+    "serviceCode": "AmazonKinesisFirehose",
+    "unit": "GB",
+    "monthlyQuantity": 100,
+    "note": "Estimate based on 100 GB ingested/month",
+    "filters": [
+      { "Field": "productFamily", "Value": { "default": "Kinesis Firehose" } }
+    ]
+  }
+}
