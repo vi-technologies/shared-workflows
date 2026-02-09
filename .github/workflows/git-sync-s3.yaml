@@ -140,10 +140,14 @@ jobs:
         env:
           EXCLUDE_PATTERNS: ${{ inputs.exclude-patterns }}
           INCLUDE_PATTERNS: ${{ inputs.include-patterns }}
+          DRY_RUN: ${{ inputs.dry-run }}
+          EXTRA_ARGS: ${{ inputs.extra-args }}
         run: |
           ARGS="--delete"
           for p in $EXCLUDE_PATTERNS; do ARGS="$ARGS --exclude \"$p\""; done
           for p in $INCLUDE_PATTERNS; do ARGS="$ARGS --include \"$p\""; done
+          if [ "$DRY_RUN" = "true" ]; then ARGS="$ARGS --dryrun"; fi
+          if [ -n "$EXTRA_ARGS" ]; then ARGS="$ARGS $EXTRA_ARGS"; fi
           echo "flags=$ARGS" >> $GITHUB_OUTPUT
 
       # =======================================================================
@@ -152,7 +156,7 @@ jobs:
       - name: Sync to S3
         uses: jakejarvis/s3-sync-action@v0.5.1
         with:
-          args: ${{ steps.args.outputs.flags }} ${{ inputs.dry-run == true && '--dryrun' || '' }} ${{ inputs.extra-args }}
+          args: ${{ steps.args.outputs.flags }}
         env:
           AWS_S3_BUCKET: ${{ inputs.s3-bucket-name }}
           AWS_REGION: ${{ inputs.aws-region }}
