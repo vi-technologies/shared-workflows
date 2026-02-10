@@ -109,6 +109,12 @@ on:
         type: string
         default: ''
 
+      delete-removed-files:
+        description: 'If true, delete S3 objects that no longer exist in the source folder (--delete). Set to false for add-only mode.'
+        required: false
+        type: boolean
+        default: false
+
       extra-args:
         description: 'Additional raw arguments to pass to aws s3 sync'
         required: false
@@ -157,6 +163,7 @@ jobs:
           EXCLUDE_PATTERNS: ${{ inputs.exclude-patterns }}
           INCLUDE_PATTERNS: ${{ inputs.include-patterns }}
           DRY_RUN: ${{ inputs.dry-run }}
+          DELETE_REMOVED: ${{ inputs.delete-removed-files }}
           EXTRA_ARGS: ${{ inputs.extra-args }}
         run: bash _shared/.github/scripts/build-s3-sync-args.sh
 
