@@ -1,0 +1,76 @@
+# =============================================================================
+# UPDATE CONFLUENCE PAGE WORKFLOW
+# =============================================================================
+# This reusable workflow runs a Python script from the caller repo that
+# generates content and updates a Confluence page via the REST API.
+#
+# FEATURES:
+#   - Runs any Python script that generates Confluence content
+#   - Supports dry-run mode on PRs (no Confluence writes)
+#   - Caller provides the script path and Confluence page details
+#
+# USAGE (in caller repo):
+#   jobs:
+#     update-confluence:
+#       uses: vi-technologies/shared-workflows/.github/workflows/update-confluence.yaml@main
+#       with:
+#         script-path: 'scripts/update_confluence_sso_access.py'
+#         python-version: '3.12'
+#       secrets:
+#         confluence-api-token: ${{ secrets.CONFLUENCE_API_TOKEN }}
+# =============================================================================
+
+name: Update Confluence Page
+
+on:
+  workflow_call:
+    inputs:
+      # -----------------------------------------------------------------------
+      # Script Configuration
+      # -----------------------------------------------------------------------
+      script-path:
+        description: 'Path to the Python script that generates and updates the Confluence page'
+        required: true
+        type: string
+
+      python-version:
+        description: 'Python version to use'
+        required: false
+        type: string
+        default: '3.12'
+
+      dry-run:
+        description: 'If true, run the script in dry-run mode (no Confluence writes)'
+        required: false
+        type: boolean
+        default: false
+
+    secrets:
+      confluence-api-token:
+        description: 'Atlassian API token for Confluence authentication'
+        required: false
+
+jobs:
+  update-confluence:
+    name: Update Confluence Page
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python-version }}
+
+      - name: Run script (dry-run)
+        if: inputs.dry-run || github.event_name == 'pull_request'
+        run: python ${{ inputs.script-path }}
+        env:
+          DRY_RUN: "true"
+
+      - name: Run script (update Confluence)
+        if: "!inputs.dry-run && github.event_name != 'pull_request'"
+        run: python ${{ inputs.script-path }}
+        env:
+          CONFLUENCE_API_TOKEN: ${{ secrets.confluence-api-token }}
