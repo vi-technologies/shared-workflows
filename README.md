@@ -13,6 +13,7 @@ A reusable workflow that runs CDK diff and drift detection, then posts a formatt
 - 🔍 Stack drift detection using AWS CloudFormation
 - 📦 Collapsible detailed diff output per stack
 - 🎯 Supports both Python and TypeScript CDK apps
+- 💰 Optional cost estimation using the native AWS Pricing API
 
 #### Usage
 
@@ -49,6 +50,7 @@ jobs:
 | `stacks` | Space-separated list of stack names | **Yes** | - |
 | `install-command` | Command to install dependencies | No | `npm ci` |
 | `enable-drift-detection` | Run drift detection | No | `true` |
+| `enable-cost-estimate` | Estimate monthly cost impact using AWS Pricing API | No | `false` |
 
 #### Example Output
 
@@ -60,6 +62,47 @@ jobs:
 |-------|------|-------|
 | `MyStackStaging` | 🟢 +1 🟡 ~2 | ✅ In Sync |
 | `MyStackProduction` | ✅ No changes | 🚨 Drifted |
+
+---
+
+#### Cost Estimation
+
+Enable `enable-cost-estimate: true` to append a cost impact table to the PR comment. Uses the native AWS Pricing API -- no external services or API keys needed.
+
+```yaml
+jobs:
+  cdk-diff:
+    uses: vi-technologies/shared-workflows/.github/workflows/cdk-diff.yaml@main
+    with:
+      working-directory: 'iac'
+      aws-role-arn: 'arn:aws:iam::123456789012:role/GithubActionsRole'
+      stacks: 'Stack1 Stack2'
+      enable-cost-estimate: true
+```
+
+**Supported resources (out of the box):** EC2, NAT Gateway, EBS, VPN, Transit Gateway, ALB/NLB, Lambda, ECS (Fargate), EKS, RDS, Aurora, DynamoDB, ElastiCache, DocumentDB, Neptune, S3, EFS, CloudFront, OpenSearch, MSK, MWAA, Redshift, SQS, SNS, Kinesis, Kinesis Firehose.
+
+To add new resource types, edit `.github/pricing/resource-map.json`:
+
+```json
+{
+  "AWS::EC2::Instance": {
+    "serviceCode": "AmazonEC2",
+    "unit": "Hrs",
+    "monthlyHours": 730,
+    "filters": [
+      { "Field": "instanceType", "Value": { "cfProperty": "InstanceType" } },
+      { "Field": "operatingSystem", "Value": { "default": "Linux" } },
+      { "Field": "productFamily", "Value": { "default": "Compute Instance" } }
+    ]
+  }
+}
+```
+
+- `cfProperty` -- reads the value from CDK diff property changes (old/new for before/after pricing)
+- `default` -- static fallback value
+- `monthlyHours` -- multiplier for per-hour resources (730 = 24/7)
+- `monthlyQuantity` -- multiplier for per-unit resources (e.g., requests, GB)
 
 ---
 

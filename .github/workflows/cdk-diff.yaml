@@ -70,6 +70,11 @@ on:
         required: false
         type: number
         default: 0
+      enable-cost-estimate:
+        description: 'Estimate monthly cost impact using AWS Pricing API'
+        required: false
+        type: boolean
+        default: false
       slack-notify-label:
         description: 'PR label that triggers Slack notification'
         required: false
@@ -91,24 +96,20 @@ jobs:
       matrix: ${{ steps.matrix.outputs.matrix }}
       is-multi-account: ${{ steps.matrix.outputs.is_multi }}
     steps:
+      - name: Checkout scripts
+        uses: actions/checkout@v4
+        with:
+          repository: vi-technologies/shared-workflows
+          ref: VE-7478-discovery-use-ai-to-calculate-costs-changes-in-pr
+          sparse-checkout: .github/scripts
+          path: _shared
+
       - name: Build matrix
         id: matrix
-        run: |
-          if [ -n '${{ inputs.aws-role-arns }}' ] && [ -n '${{ inputs.stacks-per-account }}' ]; then
-            echo "is_multi=true" >> $GITHUB_OUTPUT
-            # Build matrix from role ARNs and stacks
-            MATRIX=$(echo '${{ inputs.aws-role-arns }}' | jq -c --argjson stacks '${{ inputs.stacks-per-account }}' '
-              to_entries | map({
-                account: .key,
-                role: .value,
-                stacks: ($stacks[.key] // "")
-              }) | {include: .}
-            ')
-            echo "matrix=$MATRIX" >> $GITHUB_OUTPUT
-          else
-            echo "is_multi=false" >> $GITHUB_OUTPUT
-            echo 'matrix={"include":[]}' >> $GITHUB_OUTPUT
-          fi
+        env:
+          ROLE_ARNS: ${{ inputs.aws-role-arns }}
+          STACKS_PER_ACCOUNT: ${{ inputs.stacks-per-account }}
+        run: bash _shared/.github/scripts/build-diff-matrix.sh
 
   # ===========================================================================
   # SINGLE ACCOUNT MODE
@@ -143,55 +144,23 @@ jobs:
           role-to-assume: ${{ inputs.aws-role-arn }}
           role-duration-seconds: 3600
           aws-region: ${{ inputs.aws-region }}
+
+      - name: Checkout scripts
+        uses: actions/checkout@v4
+        with:
+          repository: vi-technologies/shared-workflows
+          ref: VE-7478-discovery-use-ai-to-calculate-costs-changes-in-pr
+          sparse-checkout: .github/scripts
+          path: _shared
+
       - name: Run diff
         id: diff
         env:
           STACKS: ${{ inputs.stacks }}
           ENABLE_DRIFT: ${{ inputs.enable-drift-detection }}
-        run: |
-          npx cdk synth --quiet --output cdk.out
-          
-          mkdir -p /tmp/cdk-runner && cd /tmp/cdk-runner
-          echo '{"type":"module","dependencies":{"@aws-cdk/toolkit-lib":"*"}}' > package.json
-          npm install --silent
-          
-          cat > run.js << 'SCRIPT'
-          import { Toolkit, StackSelectionStrategy } from '@aws-cdk/toolkit-lib';
-          const stacks = (process.env.STACKS || '').split(' ').filter(Boolean);
-          const enableDrift = process.env.ENABLE_DRIFT === 'true';
-          async function main() {
-            const output = { success: false, stacks: [], error: '' };
-            try {
-              const toolkit = new Toolkit({ ioHost: { notify: async () => {}, requestResponse: async (msg) => msg.defaultResponse } });
-              const cx = await toolkit.fromAssemblyDirectory(process.env.CDK_OUT);
-              const selector = stacks.length ? { strategy: StackSelectionStrategy.PATTERN_MUST_MATCH, patterns: stacks } : { strategy: StackSelectionStrategy.ALL_STACKS };
-              const diffResults = await toolkit.diff(cx, { stacks: selector });
-              const fmtVal = (v) => v === undefined || v === null ? null : typeof v === 'object' ? JSON.stringify(v) : String(v);
-              for (const [name, diff] of Object.entries(diffResults)) {
-                const result = { stackName: name, hasDiff: false, resources: [] };
-                for (const [logicalId, resDiff] of Object.entries(diff.resources?.diffs || {})) {
-                  const type = resDiff.resourceTypes?.newType || resDiff.resourceTypes?.oldType || 'Unknown';
-                  const action = resDiff.isAddition ? 'ADD' : resDiff.isRemoval ? 'REMOVE' : 'UPDATE';
-                  const properties = Object.entries(resDiff.propertyDiffs || {}).filter(([_, p]) => p.isDifferent).map(([n, p]) => ({ name: n, impact: p.changeImpact || 'UNKNOWN', oldValue: fmtVal(p.oldValue), newValue: fmtVal(p.newValue) }));
-                  result.resources.push({ logicalId, type, action, properties });
-                  result.hasDiff = true;
-                }
-                if (enableDrift) { try { const dr = await toolkit.drift(cx, { stacks: { strategy: StackSelectionStrategy.PATTERN_MUST_MATCH, patterns: [name] } }); result.drift = { status: (dr[name]?.numResourcesWithDrift || 0) > 0 ? 'DRIFTED' : 'IN_SYNC', count: dr[name]?.numResourcesWithDrift || 0 }; } catch {} }
-                output.stacks.push(result);
-              }
-              output.success = true;
-            } catch (e) { output.error = e.message || String(e); }
-            console.log(JSON.stringify(output));
-          }
-          main();
-          SCRIPT
-          
-          cd ${{ github.workspace }}/${{ inputs.working-directory }}
-          CDK_OUT="$(pwd)/cdk.out" node /tmp/cdk-runner/run.js > /tmp/result.json 2>&1 || true
-          RESULT=$(cat /tmp/result.json | tail -1 || echo '{"success":false,"error":"no output","stacks":[]}')
-          echo "result<<EOF" >> $GITHUB_OUTPUT
-          echo "$RESULT" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
+          WORK_DIR: ${{ github.workspace }}/${{ inputs.working-directory }}
+          SCRIPT_PATH: ${{ github.workspace }}/_shared/.github/scripts/run-cdk-diff.mjs
+        run: bash ${{ github.workspace }}/_shared/.github/scripts/run-cdk-diff-wrapper.sh
 
   # ===========================================================================
   # MULTI-ACCOUNT: Parallel matrix jobs
@@ -232,6 +201,14 @@ jobs:
           role-duration-seconds: 3600
           aws-region: ${{ inputs.aws-region }}
 
+      - name: Checkout scripts
+        uses: actions/checkout@v4
+        with:
+          repository: vi-technologies/shared-workflows
+          ref: VE-7478-discovery-use-ai-to-calculate-costs-changes-in-pr
+          sparse-checkout: .github/scripts
+          path: _shared
+
       - name: Run diff
         id: diff
         env:
@@ -239,52 +216,11 @@ jobs:
           ENABLE_DRIFT: ${{ inputs.enable-drift-detection }}
           CDK_DEFAULT_ACCOUNT: ${{ matrix.account }}
           CDK_DEFAULT_REGION: ${{ inputs.aws-region }}
+          WORK_DIR: ${{ github.workspace }}/${{ inputs.working-directory }}
+          SCRIPT_PATH: ${{ github.workspace }}/_shared/.github/scripts/run-cdk-diff.mjs
         run: |
           [ -z "$STACKS" ] && echo 'result={"success":true,"stacks":[]}' >> $GITHUB_OUTPUT && exit 0
-          
-          npx cdk synth --quiet --output cdk.out
-          
-          mkdir -p /tmp/cdk-runner && cd /tmp/cdk-runner
-          echo '{"type":"module","dependencies":{"@aws-cdk/toolkit-lib":"*"}}' > package.json
-          npm install --silent
-          
-          cat > run.js << 'SCRIPT'
-          import { Toolkit, StackSelectionStrategy } from '@aws-cdk/toolkit-lib';
-          const stacks = (process.env.STACKS || '').split(' ').filter(Boolean);
-          const enableDrift = process.env.ENABLE_DRIFT === 'true';
-          async function main() {
-            const output = { success: false, stacks: [], error: '' };
-            try {
-              const toolkit = new Toolkit({ ioHost: { notify: async () => {}, requestResponse: async (msg) => msg.defaultResponse } });
-              const cx = await toolkit.fromAssemblyDirectory(process.env.CDK_OUT);
-              const selector = stacks.length ? { strategy: StackSelectionStrategy.PATTERN_MUST_MATCH, patterns: stacks } : { strategy: StackSelectionStrategy.ALL_STACKS };
-              const diffResults = await toolkit.diff(cx, { stacks: selector });
-              const fmtVal = (v) => v === undefined || v === null ? null : typeof v === 'object' ? JSON.stringify(v) : String(v);
-              for (const [name, diff] of Object.entries(diffResults)) {
-                const result = { stackName: name, hasDiff: false, resources: [] };
-                for (const [logicalId, resDiff] of Object.entries(diff.resources?.diffs || {})) {
-                  const type = resDiff.resourceTypes?.newType || resDiff.resourceTypes?.oldType || 'Unknown';
-                  const action = resDiff.isAddition ? 'ADD' : resDiff.isRemoval ? 'REMOVE' : 'UPDATE';
-                  const properties = Object.entries(resDiff.propertyDiffs || {}).filter(([_, p]) => p.isDifferent).map(([n, p]) => ({ name: n, impact: p.changeImpact || 'UNKNOWN', oldValue: fmtVal(p.oldValue), newValue: fmtVal(p.newValue) }));
-                  result.resources.push({ logicalId, type, action, properties });
-                  result.hasDiff = true;
-                }
-                if (enableDrift) { try { const dr = await toolkit.drift(cx, { stacks: { strategy: StackSelectionStrategy.PATTERN_MUST_MATCH, patterns: [name] } }); result.drift = { status: (dr[name]?.numResourcesWithDrift || 0) > 0 ? 'DRIFTED' : 'IN_SYNC', count: dr[name]?.numResourcesWithDrift || 0 }; } catch {} }
-                output.stacks.push(result);
-              }
-              output.success = true;
-            } catch (e) { output.error = e.message || String(e); }
-            console.log(JSON.stringify(output));
-          }
-          main();
-          SCRIPT
-          
-          cd ${{ github.workspace }}/${{ inputs.working-directory }}
-          CDK_OUT="$(pwd)/cdk.out" node /tmp/cdk-runner/run.js > /tmp/result.json 2>&1 || true
-          RESULT=$(cat /tmp/result.json | tail -1 || echo '{"success":false,"error":"no output","stacks":[]}')
-          echo "result<<EOF" >> $GITHUB_OUTPUT
-          echo "$RESULT" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
+          bash ${{ github.workspace }}/_shared/.github/scripts/run-cdk-diff-wrapper.sh
 
       - name: Upload result
         uses: actions/upload-artifact@v4
@@ -306,6 +242,14 @@ jobs:
     outputs:
       combined: ${{ steps.combine.outputs.result }}
     steps:
+      - name: Checkout scripts
+        uses: actions/checkout@v4
+        with:
+          repository: vi-technologies/shared-workflows
+          ref: VE-7478-discovery-use-ai-to-calculate-costs-changes-in-pr
+          sparse-checkout: .github/scripts
+          path: _shared
+
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
@@ -314,21 +258,12 @@ jobs:
 
       - name: Combine results
         id: combine
-        run: |
-          ALL_STACKS='[]'
-          for f in /tmp/diffs/*/result.json; do
-            if [ -f "$f" ]; then
-              STACKS=$(cat "$f" | tail -1 | jq -c '.stacks // []')
-              ALL_STACKS=$(echo "$ALL_STACKS" | jq --argjson new "$STACKS" '. + $new')
-            fi
-          done
-          RESULT='{"success":true,"stacks":'$ALL_STACKS'}'
-          echo "result<<EOF" >> $GITHUB_OUTPUT
-          echo "$RESULT" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
+        env:
+          DIFFS_DIR: /tmp/diffs
+        run: bash _shared/.github/scripts/combine-diff-results.sh
 
   # ===========================================================================
-  # COMMENT: Post PR comment and Slack (inline formatter)
+  # COMMENT: Post PR comment, cost estimate, and Slack
   # ===========================================================================
   comment:
     name: Post Comment
@@ -336,8 +271,40 @@ jobs:
     if: always() && (needs.diff-single.result == 'success' || needs.aggregate.result == 'success')
     runs-on: ubuntu-latest
     permissions:
+      id-token: write
+      contents: read
       pull-requests: write
     steps:
+      - name: Checkout (for scripts and resource-map)
+        uses: actions/checkout@v4
+        with:
+          repository: vi-technologies/shared-workflows
+          ref: VE-7478-discovery-use-ai-to-calculate-costs-changes-in-pr
+          sparse-checkout: |
+            .github/scripts
+            .github/pricing
+          path: _shared
+
+      - name: Resolve pricing role ARN
+        if: inputs.enable-cost-estimate
+        id: pricing-role
+        env:
+          SINGLE_ROLE_ARN: ${{ inputs.aws-role-arn }}
+          MULTI_ROLE_ARNS: ${{ inputs.aws-role-arns }}
+        run: bash _shared/.github/scripts/resolve-pricing-role.sh
+
+      - name: Configure AWS credentials (for Pricing API)
+        if: inputs.enable-cost-estimate && steps.pricing-role.outputs.arn != ''
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ steps.pricing-role.outputs.arn }}
+          role-duration-seconds: 3600
+          aws-region: us-east-1
+
+      - name: Install AWS SDK Pricing client
+        if: inputs.enable-cost-estimate
+        run: npm install @aws-sdk/client-pricing
+
       - name: Generate comment and Slack blocks
         id: format
         env:
@@ -347,184 +314,45 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           PR_URL: ${{ github.event.pull_request.html_url }}
           PR_NUM: ${{ inputs.pr-number || github.event.pull_request.number }}
-        run: |
-          DIFF_JSON="${DIFF_SINGLE:-$DIFF_MULTI}"
-          if [ -z "$DIFF_JSON" ]; then
-            echo "comment=## 🔍 CDK Diff\n\n⚠️ No diff results" >> $GITHUB_OUTPUT
-            echo 'slack_blocks=[]' >> $GITHUB_OUTPUT
-            exit 0
-          fi
-          
-          # Create inline formatter script
-          cat > /tmp/format-cdk-diff.js << 'FORMATTER_SCRIPT'
-          const getEnv = (n) => n.toLowerCase().includes('prod') ? 'production' : n.toLowerCase().includes('staging') ? 'staging' : 'dev';
-          const cleanId = (id) => id.replace(/[A-F0-9]{8}$/i, '').replace(/([a-z])([A-Z])/g, '$1 $2');
-          const shortType = (t) => t.split('::').pop();
-          
-          function formatMarkdown(data, context) {
-            const { repo, runUrl, prUrl, prNum, isDeployment } = context;
-            const changed = data.stacks?.filter(s => s.hasDiff) || [];
-            const unchanged = data.stacks?.filter(s => !s.hasDiff) || [];
-            const adds = data.stacks?.reduce((n, s) => n + s.resources.filter(r => r.action === 'ADD').length, 0) || 0;
-            const updates = data.stacks?.reduce((n, s) => n + s.resources.filter(r => r.action === 'UPDATE').length, 0) || 0;
-            const removes = data.stacks?.reduce((n, s) => n + s.resources.filter(r => r.action === 'REMOVE').length, 0) || 0;
-            
-            let md = `## 🔍 CDK Diff\n\n`;
-            md += `| 🟢 Add | 🟡 Update | 🔴 Remove | 📦 Stacks |\n|:---:|:---:|:---:|:---:|\n| ${adds} | ${updates} | ${removes} | ${changed.length} |\n\n`;
-            
-            for (const stack of changed) {
-              const env = getEnv(stack.stackName);
-              md += `### 📦 ${stack.stackName} _(${env})_\n`;
-              if (stack.drift?.status === 'DRIFTED') md += `> ⚠️ **Drift detected**: ${stack.drift.count} resources\n\n`;
-              
-              const byAction = { ADD: [], UPDATE: [], REMOVE: [] };
-              for (const res of stack.resources) byAction[res.action].push(res);
-              
-              if (byAction.ADD.length) {
-                md += `\n#### 🟢 Create\n`;
-                for (const r of byAction.ADD) {
-                  md += `- **${cleanId(r.logicalId)}** \`${shortType(r.type)}\`\n`;
-                  for (const p of (r.properties || []).slice(0, 3)) {
-                    if (p.newValue) md += `  - \`${p.name}\`:\n\`\`\`\n${p.newValue}\n\`\`\`\n`;
-                  }
-                  if ((r.properties || []).length > 3) md += `  - _+${r.properties.length - 3} more properties..._\n`;
-                }
-              }
-              if (byAction.UPDATE.length) {
-                md += `\n#### 🟡 Update\n`;
-                for (const r of byAction.UPDATE) {
-                  md += `- **${cleanId(r.logicalId)}** \`${shortType(r.type)}\`\n`;
-                  for (const p of (r.properties || []).slice(0, 3)) {
-                    md += `  - \`${p.name}\`${p.impact === 'WILL_REPLACE' ? ' ⚠️ **REPLACE**' : ''}\n`;
-                    md += `    | OLD | NEW |\n    |-----|-----|\n    | \`${p.oldValue || '(none)'}\` | \`${p.newValue || '(removed)'}\` |\n`;
-                  }
-                  if ((r.properties || []).length > 3) md += `  - _+${r.properties.length - 3} more properties..._\n`;
-                }
-              }
-              if (byAction.REMOVE.length) {
-                md += `\n#### 🔴 Destroy\n`;
-                for (const r of byAction.REMOVE) md += `- **${cleanId(r.logicalId)}** \`${shortType(r.type)}\`\n`;
-              }
-              md += '\n---\n';
-            }
-            if (unchanged.length) md += `\n<details><summary>📋 ${unchanged.length} unchanged stacks</summary>\n\n${unchanged.map(s => `- ${s.stackName}`).join('\n')}\n</details>\n`;
-            return md;
-          }
-          
-          function formatSlackBlocks(data, context) {
-            const { repo, runUrl, prUrl, prNum } = context;
-            const changed = data.stacks?.filter(s => s.hasDiff) || [];
-            const adds = data.stacks?.reduce((n, s) => n + s.resources.filter(r => r.action === 'ADD').length, 0) || 0;
-            const updates = data.stacks?.reduce((n, s) => n + s.resources.filter(r => r.action === 'UPDATE').length, 0) || 0;
-            const removes = data.stacks?.reduce((n, s) => n + s.resources.filter(r => r.action === 'REMOVE').length, 0) || 0;
-            
-            const blocks = [
-              { type: 'header', text: { type: 'plain_text', text: '🔍 CDK Diff', emoji: true } },
-              { type: 'context', elements: [{ type: 'mrkdwn', text: `<${prUrl}|PR #${prNum}> in \`${repo}\`` }] },
-              { type: 'section', fields: [
-                { type: 'mrkdwn', text: `🟢 *Add*\n${adds}` }, { type: 'mrkdwn', text: `🟡 *Update*\n${updates}` },
-                { type: 'mrkdwn', text: `🔴 *Remove*\n${removes}` }, { type: 'mrkdwn', text: `📦 *Stacks*\n${changed.length}` }
-              ]},
-              { type: 'actions', elements: [
-                { type: 'button', text: { type: 'plain_text', text: 'View PR' }, url: prUrl },
-                { type: 'button', text: { type: 'plain_text', text: 'Workflow' }, url: runUrl }
-              ]}
-            ];
-            
-            for (const stack of changed.slice(0, 5)) {
-              blocks.push({ type: 'divider' });
-              let txt = `📦 *${stack.stackName}* _(${getEnv(stack.stackName)})_`;
-              const byAction = { ADD: [], UPDATE: [], REMOVE: [] };
-              for (const res of stack.resources) byAction[res.action].push(res);
-              
-              if (byAction.ADD.length) {
-                txt += '\n🟢 *Create*';
-                for (const r of byAction.ADD) {
-                  txt += `\n• \`${shortType(r.type)}\` *${cleanId(r.logicalId)}*`;
-                  for (const p of (r.properties || []).slice(0, 3)) {
-                    if (p.newValue) txt += `\n   \`${p.name}\`:\n\`\`\`${p.newValue}\`\`\``;
-                  }
-                  if ((r.properties || []).length > 3) txt += `\n   _+${r.properties.length - 3} more..._`;
-                }
-              }
-              if (byAction.UPDATE.length) {
-                txt += '\n🟡 *Update*';
-                for (const r of byAction.UPDATE) {
-                  txt += `\n• \`${shortType(r.type)}\` *${cleanId(r.logicalId)}*`;
-                  for (const p of (r.properties || []).slice(0, 2)) {
-                    txt += `\n   \`${p.name}\`${p.impact === 'WILL_REPLACE' ? ' ⚠️' : ''}`;
-                    txt += `\n   *OLD:*\n\`\`\`${p.oldValue || '(none)'}\`\`\``;
-                    txt += `\n   *NEW:*\n\`\`\`${p.newValue || '(removed)'}\`\`\``;
-                  }
-                  if ((r.properties || []).length > 2) txt += `\n   _+${r.properties.length - 2} more properties..._`;
-                }
-              }
-              if (byAction.REMOVE.length) {
-                txt += '\n🔴 *Destroy*';
-                for (const r of byAction.REMOVE) txt += `\n• \`${shortType(r.type)}\` *${cleanId(r.logicalId)}*`;
-              }
-              blocks.push({ type: 'section', text: { type: 'mrkdwn', text: txt } });
-            }
-            if (changed.length > 5) blocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: `_+${changed.length - 5} more stacks..._` }] });
-            return blocks;
-          }
-          
-          try {
-            const data = JSON.parse(process.argv[2]);
-            const context = JSON.parse(process.argv[3]);
-            console.log(JSON.stringify({ markdown: formatMarkdown(data, context), slack_blocks: formatSlackBlocks(data, context) }));
-          } catch (e) {
-            console.log(JSON.stringify({ markdown: `## 🔍 CDK Diff\n\n❌ Error: ${e.message}`, slack_blocks: [] }));
-          }
-          FORMATTER_SCRIPT
-          
-          # Build context for formatter
-          CONTEXT_JSON=$(jq -nc \
-            --arg repo "$REPO" \
-            --arg runUrl "$RUN_URL" \
-            --arg prUrl "$PR_URL" \
-            --arg prNum "$PR_NUM" \
-            --argjson isDeployment false \
-            '{repo: $repo, runUrl: $runUrl, prUrl: $prUrl, prNum: $prNum, isDeployment: $isDeployment}')
-          
-          # Use inline formatter script
-          FORMATTED=$(node /tmp/format-cdk-diff.js "$DIFF_JSON" "$CONTEXT_JSON")
-          
-          # Extract outputs
-          MARKDOWN=$(echo "$FORMATTED" | jq -r '.markdown')
-          SLACK_BLOCKS=$(echo "$FORMATTED" | jq -c '.slack_blocks')
-          
-          # Save outputs (use delimiter for multiline)
-          echo "comment<<COMMENT_EOF" >> $GITHUB_OUTPUT
-          echo "$MARKDOWN" >> $GITHUB_OUTPUT
-          echo "COMMENT_EOF" >> $GITHUB_OUTPUT
-          
-          echo "slack_blocks=$SLACK_BLOCKS" >> $GITHUB_OUTPUT
+          SCRIPT_PATH: _shared/.github/scripts/format-cdk-diff.js
+        run: bash _shared/.github/scripts/generate-diff-comment.sh
+
+      - name: Estimate cost impact
+        if: inputs.enable-cost-estimate
+        id: cost
+        env:
+          DIFF_JSON: ${{ needs.diff-single.outputs.result || needs.aggregate.outputs.combined }}
+          PRICING_REGION: ${{ inputs.aws-region }}
+          SCRIPT_PATH: _shared/.github/scripts/estimate-cost.js
+          RESOURCE_MAP_PATH: _shared/.github/pricing/resource-map.json
+        run: bash _shared/.github/scripts/estimate-cost-wrapper.sh
 
       - name: Post PR comment
         uses: marocchino/sticky-pull-request-comment@v2
         with:
           header: cdk-diff
           number: ${{ inputs.pr-number || github.event.pull_request.number }}
-          message: ${{ steps.format.outputs.comment }}
+          message: |
+            ${{ steps.format.outputs.comment }}
+            ${{ steps.cost.outputs.cost_comment || '' }}
 
       - name: Check Slack label
         id: check-label
         env:
           SLACK_WEBHOOK: ${{ secrets.slack-webhook-url }}
+          PR_NUM: ${{ inputs.pr-number || github.event.pull_request.number || 0 }}
+          SLACK_NOTIFY_LABEL: ${{ inputs.slack-notify-label }}
         uses: actions/github-script@v7
         with:
           script: |
-            if (!process.env.SLACK_WEBHOOK) { core.setOutput('notify', 'false'); return; }
-            const prNum = ${{ inputs.pr-number || github.event.pull_request.number || 0 }};
-            if (!prNum) { core.setOutput('notify', 'false'); return; }
-            const { data: pr } = await github.rest.pulls.get({ owner: context.repo.owner, repo: context.repo.repo, pull_number: prNum });
-            core.setOutput('notify', pr.labels.some(l => l.name === '${{ inputs.slack-notify-label }}') ? 'true' : 'false');
+            const fs = require('fs');
+            const scriptContent = fs.readFileSync('_shared/.github/scripts/check-slack-label.js', 'utf8');
+            const fn = new Function('github', 'context', 'core', `return (async () => { ${scriptContent} })();`);
+            await fn(github, context, core);
 
       - name: Send Slack
         if: steps.check-label.outputs.notify == 'true'
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.slack-webhook-url }}
-        run: |
-          PAYLOAD=$(jq -nc --argjson blocks '${{ steps.format.outputs.slack_blocks }}' '{blocks: $blocks}')
-          curl -X POST -H 'Content-type: application/json' --data "$PAYLOAD" "$SLACK_WEBHOOK_URL"
+          SLACK_BLOCKS: ${{ steps.format.outputs.slack_blocks }}
+        run: bash _shared/.github/scripts/send-slack.sh

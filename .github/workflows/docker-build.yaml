@@ -93,6 +93,14 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Checkout scripts
+        uses: actions/checkout@v4
+        with:
+          repository: vi-technologies/shared-workflows
+          ref: VE-7478-discovery-use-ai-to-calculate-costs-changes-in-pr
+          sparse-checkout: .github/scripts
+          path: _shared
+
       - name: Detect changed service folders
         id: detect
         env:
@@ -100,110 +108,12 @@ jobs:
           SERVICES_CONFIG: ${{ inputs.ecr-services-repo-names }}
           BUILD_ALL: ${{ inputs.build-all }}
           SHARED_PATHS: ${{ inputs.shared-paths }}
-        run: |
-          set -euo pipefail
-          
-          # Determine diff range based on event type
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            BASE_SHA="${{ github.event.pull_request.base.sha }}"
-            HEAD_SHA="${{ github.event.pull_request.head.sha }}"
-            DIFF_RANGE="${BASE_SHA}...${HEAD_SHA}"
-          elif [ "${{ github.event_name }}" = "push" ]; then
-            DIFF_RANGE="${{ github.event.before }}...${{ github.sha }}"
-          else
-            # workflow_dispatch or other - compare to main
-            # Note: fetch-depth: 0 in checkout already fetches all branches
-            # Only fetch main if it's not already available
-            git fetch origin main || true
-            DIFF_RANGE="origin/main...HEAD"
-          fi
-          
-          echo "Using diff range: $DIFF_RANGE"
-          
-          # Get list of configured services from services-config
-          CONFIGURED_SERVICES=$(echo "$SERVICES_CONFIG" | jq -r 'keys[]')
-          echo "Configured services: $CONFIGURED_SERVICES"
-          
-          # Find all service folders that have a non-empty Dockerfile AND are in config
-          ALL_SERVICES=""
-          for SERVICE_NAME in $CONFIGURED_SERVICES; do
-            dir="${SERVICES_FOLDER}/${SERVICE_NAME}/"
-            if [ -d "$dir" ] && [ -f "${dir}Dockerfile" ] && [ -s "${dir}Dockerfile" ]; then
-              ALL_SERVICES="$ALL_SERVICES $SERVICE_NAME"
-            fi
-          done
-          ALL_SERVICES=$(echo "$ALL_SERVICES" | xargs)
-          echo "All available services: $ALL_SERVICES"
-          
-          # If build-all is true, build everything
-          if [ "$BUILD_ALL" = "true" ]; then
-            echo "Build all requested - building all services"
-            SERVICES="$ALL_SERVICES"
-            CHANGED_FILES="(build-all requested)"
-          else
-            # Check if any shared paths changed (triggers all services)
-            SHARED_CHANGED=""
-            if [ -n "$SHARED_PATHS" ]; then
-              for shared_path in $SHARED_PATHS; do
-                SHARED_FILES=$(git diff --name-only "$DIFF_RANGE" -- "$shared_path" 2>/dev/null || true)
-                if [ -n "$SHARED_FILES" ]; then
-                  SHARED_CHANGED="$SHARED_CHANGED $SHARED_FILES"
-                fi
-              done
-              SHARED_CHANGED=$(echo "$SHARED_CHANGED" | xargs)
-            fi
-            
-            if [ -n "$SHARED_CHANGED" ]; then
-              echo "Shared paths changed - rebuilding all services"
-              echo "Changed shared files: $SHARED_CHANGED"
-              SERVICES="$ALL_SERVICES"
-              CHANGED_FILES="$SHARED_CHANGED"
-            else
-              # Get changed files in the services folder
-              CHANGED_FILES=$(git diff --name-only "$DIFF_RANGE" -- "${SERVICES_FOLDER}/**" 2>/dev/null || true)
-              
-              echo "Changed files:"
-              echo "$CHANGED_FILES"
-              
-              # Extract unique service names from changed files (only if in config)
-              SERVICES=""
-              for file in $CHANGED_FILES; do
-                # Extract the service folder name (second component after services folder)
-                SERVICE_NAME=$(echo "$file" | sed -n "s|^${SERVICES_FOLDER}/\([^/]*\)/.*|\1|p")
-                # Only include if in config and has non-empty Dockerfile
-                if [ -n "$SERVICE_NAME" ] && \
-                   echo "$SERVICES_CONFIG" | jq -e ".[\"$SERVICE_NAME\"]" > /dev/null 2>&1 && \
-                   [ -f "${SERVICES_FOLDER}/${SERVICE_NAME}/Dockerfile" ] && \
-                   [ -s "${SERVICES_FOLDER}/${SERVICE_NAME}/Dockerfile" ]; then
-                  SERVICES="$SERVICES $SERVICE_NAME"
-                fi
-              done
-              SERVICES=$(echo "$SERVICES" | tr ' ' '\n' | sort -u | tr '\n' ' ' | xargs || true)
-            fi
-          fi
-          
-          echo "Services to build: $SERVICES"
-          
-          # Set outputs
-          echo "services=$SERVICES" >> $GITHUB_OUTPUT
-          
-          # Create JSON array for matrix
-          if [ -n "$SERVICES" ]; then
-            SERVICES_JSON=$(echo "$SERVICES" | tr ' ' '\n' | jq -R -s -c 'split("\n") | map(select(length > 0))')
-          else
-            SERVICES_JSON="[]"
-          fi
-          echo "services_json=$SERVICES_JSON" >> $GITHUB_OUTPUT
-          
-          echo "changed_files<<EOF" >> $GITHUB_OUTPUT
-          echo "$CHANGED_FILES" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
-          
-          if [ -z "$SERVICES" ]; then
-            echo "has_changes=false" >> $GITHUB_OUTPUT
-          else
-            echo "has_changes=true" >> $GITHUB_OUTPUT
-          fi
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+          PUSH_SHA: ${{ github.sha }}
+        run: bash _shared/.github/scripts/detect-docker-changes.sh
 
   # ===========================================================================
   # JOB 2: POST PR COMMENT (for pull_request events)
@@ -217,6 +127,14 @@ jobs:
       contents: read
       pull-requests: write
     steps:
+      - name: Checkout scripts
+        uses: actions/checkout@v4
+        with:
+          repository: vi-technologies/shared-workflows
+          ref: VE-7478-discovery-use-ai-to-calculate-costs-changes-in-pr
+          sparse-checkout: .github/scripts
+          path: _shared
+
       - name: Build PR comment
         id: comment
         uses: actions/github-script@v7
@@ -229,61 +147,10 @@ jobs:
           SHARED_PATHS: ${{ inputs.shared-paths }}
         with:
           script: |
-            const services = (process.env.SERVICES || '').trim();
-            const servicesConfig = JSON.parse(process.env.SERVICES_CONFIG || '{}');
-            const changedFiles = (process.env.CHANGED_FILES || '').trim();
-            const servicesFolder = process.env.SERVICES_FOLDER;
-            const commitSha = process.env.COMMIT_SHA.substring(0, 7);
-            
-            const lines = [];
-            lines.push('## 🐳 Docker Build Preview');
-            lines.push('');
-            
-            if (!services) {
-              lines.push(`✅ No changes detected in \`${servicesFolder}/\` - no images will be built.`);
-            } else {
-              const serviceList = services.split(/\s+/);
-              lines.push(`**${serviceList.length} service(s) will be built on merge:**`);
-              lines.push('');
-              lines.push('| Service | Staging Image | Production Image |');
-              lines.push('|---------|---------------|------------------|');
-              for (const svc of serviceList) {
-                const config = servicesConfig[svc] || {};
-                const stagingImage = config.staging || '(not configured)';
-                const prodImage = config.production || '(not configured)';
-                lines.push(`| \`${svc}\` | \`${stagingImage}\` | \`${prodImage}\` |`);
-              }
-              lines.push('');
-              lines.push(`> Tags: \`:latest\` and \`:${commitSha}\``);
-              lines.push('');
-            }
-            
-            if (changedFiles && changedFiles !== '(build-all requested)') {
-              // Check if this was triggered by shared paths
-              const sharedPaths = process.env.SHARED_PATHS || '';
-              const isSharedTrigger = sharedPaths && changedFiles.split('\n').some(f => 
-                sharedPaths.split(/\s+/).some(sp => f.startsWith(sp.replace(/\/$/, '')))
-              );
-              
-              if (isSharedTrigger) {
-                lines.push(`> ⚠️ **Shared code changed** - all services will be rebuilt`);
-                lines.push('');
-              }
-              
-              lines.push('<details>');
-              lines.push('<summary>Changed files</summary>');
-              lines.push('');
-              lines.push('```');
-              lines.push(changedFiles);
-              lines.push('```');
-              lines.push('</details>');
-            }
-            
-            lines.push('');
-            lines.push('---');
-            lines.push(`<sub>Services folder: \`${servicesFolder}/\`</sub>`);
-            
-            core.setOutput('body', lines.join('\n'));
+            const fs = require('fs');
+            const scriptContent = fs.readFileSync('_shared/.github/scripts/format-docker-comment.js', 'utf8');
+            const fn = new Function('github', 'context', 'core', `return (async () => { ${scriptContent} })();`);
+            await fn(github, context, core);
 
       - name: Post sticky comment
         uses: marocchino/sticky-pull-request-comment@v2
@@ -312,34 +179,23 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Checkout scripts
+        uses: actions/checkout@v4
+        with:
+          repository: vi-technologies/shared-workflows
+          ref: VE-7478-discovery-use-ai-to-calculate-costs-changes-in-pr
+          sparse-checkout: .github/scripts
+          path: _shared
+
       - name: Determine environment and account
         id: env
         env:
           INPUT_ENV: ${{ inputs.environment }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          GITHUB_REF: ${{ github.ref }}
           AWS_ACCOUNT_STAGING: ${{ secrets.aws-account-id-staging }}
           AWS_ACCOUNT_PROD: ${{ secrets.aws-account-id-prod }}
-        run: |
-          # Determine environment
-          if [ -n "$INPUT_ENV" ]; then
-            TARGET_ENV="$INPUT_ENV"
-          elif [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            TARGET_ENV="staging"
-          elif [ "${{ github.ref }}" = "refs/heads/main" ]; then
-            TARGET_ENV="production"
-          else
-            TARGET_ENV="staging"
-          fi
-          
-          echo "TARGET_ENV=$TARGET_ENV" >> $GITHUB_OUTPUT
-          
-          # Select AWS account
-          if [ "$TARGET_ENV" = "production" ] || [ "$TARGET_ENV" = "prod" ]; then
-            echo "AWS_ACCOUNT_ID=$AWS_ACCOUNT_PROD" >> $GITHUB_OUTPUT
-          else
-            echo "AWS_ACCOUNT_ID=$AWS_ACCOUNT_STAGING" >> $GITHUB_OUTPUT
-          fi
-          
-          echo "Environment: $TARGET_ENV"
+        run: bash _shared/.github/scripts/resolve-docker-env.sh
 
       - name: Get image name from config
         id: image
@@ -349,32 +205,7 @@ jobs:
           AWS_ACCOUNT_ID: ${{ steps.env.outputs.AWS_ACCOUNT_ID }}
           AWS_REGION: ${{ inputs.aws-region }}
           SERVICES_CONFIG: ${{ inputs.ecr-services-repo-names }}
-        run: |
-          # Get image name from services-config based on environment
-          # Normalize environment name for config lookup
-          if [ "$TARGET_ENV" = "prod" ]; then
-            CONFIG_ENV="production"
-          else
-            CONFIG_ENV="$TARGET_ENV"
-          fi
-          
-          IMAGE_NAME=$(echo "$SERVICES_CONFIG" | jq -r ".[\"$SERVICE\"][\"$CONFIG_ENV\"] // empty")
-          
-          if [ -z "$IMAGE_NAME" ]; then
-            echo "ERROR: No image name configured for service '$SERVICE' in environment '$CONFIG_ENV'"
-            echo "Available config: $SERVICES_CONFIG"
-            exit 1
-          fi
-          
-          ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
-          FULL_IMAGE="${ECR_REGISTRY}/${IMAGE_NAME}"
-          
-          echo "IMAGE_NAME=$IMAGE_NAME" >> $GITHUB_OUTPUT
-          echo "ECR_REGISTRY=$ECR_REGISTRY" >> $GITHUB_OUTPUT
-          echo "FULL_IMAGE=$FULL_IMAGE" >> $GITHUB_OUTPUT
-          
-          echo "Image name: $IMAGE_NAME"
-          echo "Full image: $FULL_IMAGE"
+        run: bash _shared/.github/scripts/resolve-ecr-image.sh
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -387,13 +218,7 @@ jobs:
         env:
           IMAGE_NAME: ${{ steps.image.outputs.IMAGE_NAME }}
           AWS_REGION: ${{ inputs.aws-region }}
-        run: |
-          if ! aws ecr describe-repositories --repository-names "$IMAGE_NAME" --region "$AWS_REGION" 2>/dev/null; then
-            echo "ERROR: ECR repository '$IMAGE_NAME' does not exist!"
-            echo "Please create the repository before running this workflow."
-            exit 1
-          fi
-          echo "✅ ECR repository exists: $IMAGE_NAME"
+        run: bash _shared/.github/scripts/verify-ecr-repo.sh
 
       - name: Login to Amazon ECR
         uses: aws-actions/amazon-ecr-login@v2
