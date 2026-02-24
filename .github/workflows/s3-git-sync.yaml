@@ -1,0 +1,226 @@
+# =============================================================================
+# S3 GIT SYNC (REUSABLE WORKFLOW)
+# =============================================================================
+# Sync a folder from a GitHub repository to S3 using OIDC credentials.
+#
+# USAGE:
+#   jobs:
+#     sync:
+#       uses: vi-technologies/shared-workflows/.github/workflows/s3-git-sync.yaml@main
+#       with:
+#         aws-account-id: '123456789012'
+#         aws-region: 'us-east-1'
+#         aws-role-arn: 'arn:aws:iam::123456789012:role/GithubActionsRole'
+#         github-folder-path: 'dags'
+#         s3-bucket-name: 'my-airflow-bucket'
+#         s3-bucket-path: 'dags'
+#         exclude-patterns: '*.pyc __pycache__/* .git/*'
+#         dry-run: 'false'
+#         delete-removed-files: 'false'
+#
+# ROOT BUCKET PATH:
+#   - To sync to bucket root (no prefix), set:
+#       s3-bucket-path: ''
+# =============================================================================
+name: S3 Git Sync
+
+on:
+  workflow_call:
+    inputs:
+      aws-account-id:
+        description: 'AWS account ID (for documentation / validation; role is assumed via aws-role-arn)'
+        required: true
+        type: string
+      aws-region:
+        description: 'AWS region for credentials'
+        required: true
+        type: string
+      aws-role-arn:
+        description: 'AWS IAM role ARN to assume via OIDC (e.g., arn:aws:iam::123456789012:role/GithubActionsRole)'
+        required: true
+        type: string
+      github-folder-path:
+        description: 'Repo folder path to sync (relative to repo root)'
+        required: true
+        type: string
+      s3-bucket-name:
+        description: 'S3 bucket name'
+        required: true
+        type: string
+      s3-bucket-path:
+        description: 'S3 bucket prefix/path (leave empty to sync to bucket root)'
+        required: false
+        type: string
+        default: ''
+      exclude-patterns:
+        description: 'Space-separated glob patterns to exclude (e.g., "*.pyc __pycache__/* .git/*")'
+        required: false
+        type: string
+        default: ''
+      dry-run:
+        description: 'If true, only preview changes without applying (--dryrun)'
+        required: false
+        type: string
+        default: 'false'
+      delete-removed-files:
+        description: 'If true, delete S3 objects that no longer exist in the source folder (--delete). Default false (add-only).'
+        required: false
+        type: string
+        default: 'false'
+
+jobs:
+  sync:
+    name: Sync Git folder to S3
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+      pull-requests: write
+
+    steps:
+      - name: Print resolved sync args
+        id: plan
+        shell: bash
+        env:
+          AWS_ACCOUNT_ID: ${{ inputs.aws-account-id }}
+          AWS_REGION: ${{ inputs.aws-region }}
+          AWS_ROLE_ARN: ${{ inputs.aws-role-arn }}
+          SOURCE_DIR_RAW: ${{ inputs.github-folder-path }}
+          S3_BUCKET: ${{ inputs.s3-bucket-name }}
+          S3_BUCKET_PATH_RAW: ${{ inputs.s3-bucket-path }}
+          EXCLUDE_PATTERNS: ${{ inputs.exclude-patterns }}
+          DRY_RUN: ${{ inputs.dry-run }}
+          DELETE_REMOVED: ${{ inputs.delete-removed-files }}
+        run: |
+          set -euo pipefail
+
+          SOURCE_DIR="${SOURCE_DIR_RAW#./}"
+          SOURCE_DIR="${SOURCE_DIR%/}"
+          if [ -z "${SOURCE_DIR}" ]; then SOURCE_DIR="."; fi
+
+          DEST_DIR="${S3_BUCKET_PATH_RAW#/}"
+          DEST_DIR="${DEST_DIR%/}"
+          if [ -n "${DEST_DIR}" ]; then
+            DEST="s3://${S3_BUCKET}/${DEST_DIR}/"
+          else
+            DEST="s3://${S3_BUCKET}/"
+          fi
+
+          FLAGS=()
+          if [ "${DELETE_REMOVED}" = "true" ]; then FLAGS+=(--delete); fi
+          EXCLUDE_LIST=()
+          if [ -n "${EXCLUDE_PATTERNS}" ]; then
+            read -r -a EXCLUDE_LIST <<<"${EXCLUDE_PATTERNS}"
+          fi
+          for p in "${EXCLUDE_LIST[@]}"; do FLAGS+=(--exclude "${p}"); done
+          if [ "${DRY_RUN}" = "true" ]; then FLAGS+=(--dryrun); fi
+
+          echo "Inputs:"
+          echo "  aws-account-id: ${AWS_ACCOUNT_ID}"
+          echo "  aws-region: ${AWS_REGION}"
+          echo "  aws-role-arn: ${AWS_ROLE_ARN}"
+          echo "  github-folder-path: ${SOURCE_DIR_RAW}"
+          echo "  s3-bucket-name: ${S3_BUCKET}"
+          echo "  s3-bucket-path: ${S3_BUCKET_PATH_RAW}"
+          echo "  exclude-patterns: ${EXCLUDE_PATTERNS}"
+          echo "  dry-run: ${DRY_RUN}"
+          echo "  delete-removed-files: ${DELETE_REMOVED}"
+          echo ""
+          echo "Resolved sync plan:"
+          echo "  source: ./${SOURCE_DIR}/"
+          echo "  dest: ${DEST}"
+          echo "  flags: ${FLAGS[*]-}"
+          echo ""
+          echo "Command preview:"
+          echo "  aws s3 sync \"./${SOURCE_DIR}/\" \"${DEST}\" ${FLAGS[*]-}"
+
+          {
+            echo "source_dir=${SOURCE_DIR}"
+            echo "dest=${DEST}"
+            printf 'flags='
+            printf '%q ' "${FLAGS[@]}"
+            echo
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ inputs.aws-role-arn }}
+          role-duration-seconds: 3600
+          aws-region: ${{ inputs.aws-region }}
+
+      - name: Pull request S3 files sync
+        if: ${{ github.event_name == 'pull_request' || github.event_name == 'pull_request_target' }}
+        uses: actions/github-script@v7
+        env:
+          DEST: ${{ steps.plan.outputs.dest }}
+          SOURCE_DIR: ${{ steps.plan.outputs.source_dir }}
+          FLAGS: ${{ steps.plan.outputs.flags }}
+        with:
+          script: |
+            const { execSync } = require('node:child_process');
+            const marker = '<!-- s3-git-sync-diff -->';
+            const flags = process.env.FLAGS || '';
+            const syncFlags = flags.includes('--dryrun') ? flags : `${flags} --dryrun`;
+            const cmd = `aws s3 sync "./${process.env.SOURCE_DIR}/" "${process.env.DEST}" ${syncFlags} 2>&1`;
+            const dryrunLog = execSync(cmd, { encoding: 'utf8' });
+            const willAddOrReplace = [];
+            const willRemove = [];
+
+            for (const line of dryrunLog.split(/\r?\n/)) {
+              if (line.startsWith('upload: ')) {
+                willAddOrReplace.push(line.slice(8));
+              } else if (line.startsWith('delete: ')) {
+                willRemove.push(line.slice(8));
+              }
+            }
+
+            const body = [
+              marker,
+              's3-git-sync diff',
+              'will add/replace:',
+              ...(willAddOrReplace.length ? willAddOrReplace.map((x) => `- ${x}`) : ['- none']),
+              '',
+              'will remove:',
+              ...(willRemove.length ? willRemove.map((x) => `- ${x}`) : ['- none'])
+            ].join('\n');
+
+            const issue_number = context.payload.pull_request.number;
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number
+            });
+            const existing = comments.find((comment) => comment.body && comment.body.includes(marker));
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number,
+                body
+              });
+            }
+
+      - name: Sync to S3
+        if: ${{ github.event_name != 'pull_request' && github.event_name != 'pull_request_target' }}
+        shell: bash
+        env:
+          SOURCE_DIR: ${{ steps.plan.outputs.source_dir }}
+          DEST: ${{ steps.plan.outputs.dest }}
+          FLAGS: ${{ steps.plan.outputs.flags }}
+        run: |
+          set -euo pipefail
+
+          echo "Running: aws s3 sync \"./${SOURCE_DIR}/\" \"${DEST}\" ${FLAGS}"
+          eval aws s3 sync "./${SOURCE_DIR}/" "${DEST}" ${FLAGS}
