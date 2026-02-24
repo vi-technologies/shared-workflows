@@ -138,7 +138,9 @@ jobs:
             echo "source_dir=${SOURCE_DIR}"
             echo "dest=${DEST}"
             printf 'flags='
-            printf '%q ' "${FLAGS[@]}"
+            if [ ${#FLAGS[@]} -gt 0 ]; then
+              printf '%q ' "${FLAGS[@]}"
+            fi
             echo
           } >> "${GITHUB_OUTPUT}"
 
