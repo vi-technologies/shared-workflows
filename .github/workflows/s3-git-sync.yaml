@@ -172,11 +172,17 @@ jobs:
             const willAddOrReplace = [];
             const willRemove = [];
 
+            core.info('aws s3 sync --dryrun output (raw):');
+            core.info(dryrunLog || '<empty>');
+
             for (const line of dryrunLog.split(/\r?\n/)) {
-              if (line.startsWith('upload: ')) {
-                willAddOrReplace.push(line.slice(8));
-              } else if (line.startsWith('delete: ')) {
-                willRemove.push(line.slice(8));
+              const uploadMatch = line.match(/(?:^|\s)(?:\(dryrun\)\s*)?(?:upload|copy):\s+(.+)$/i);
+              const deleteMatch = line.match(/(?:^|\s)(?:\(dryrun\)\s*)?delete:\s+(.+)$/i);
+
+              if (uploadMatch) {
+                willAddOrReplace.push(uploadMatch[1]);
+              } else if (deleteMatch) {
+                willRemove.push(deleteMatch[1]);
               }
             }
 
