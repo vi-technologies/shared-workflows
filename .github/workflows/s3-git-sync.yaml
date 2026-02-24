@@ -192,14 +192,18 @@ jobs:
               `**from:** \`./${process.env.SOURCE_DIR}/\``,
               `**to:** \`${process.env.DEST}\``,
               '',
-              '**will add/replace:**',
               '```diff',
-              ...(willAddOrReplace.length ? willAddOrReplace.map((x) => `+ ${x}`) : ['+ none']),
+              '+ will add/replace:',
+              '```',
+              '```text',
+              ...(willAddOrReplace.length ? willAddOrReplace : ['none']),
               '```',
               '',
-              '**will remove:**',
               '```diff',
-              ...(willRemove.length ? willRemove.map((x) => `- ${x}`) : ['- none']),
+              '- will remove:',
+              '```',
+              '```text',
+              ...(willRemove.length ? willRemove : ['none']),
               '```'
             ].join('\n');
 
