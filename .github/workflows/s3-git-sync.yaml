@@ -188,12 +188,19 @@ jobs:
 
             const body = [
               marker,
-              's3-git-sync diff',
-              'will add/replace:',
-              ...(willAddOrReplace.length ? willAddOrReplace.map((x) => `- ${x}`) : ['- none']),
+              '**s3-git-sync diff**',
+              `**from:** \`./${process.env.SOURCE_DIR}/\``,
+              `**to:** \`${process.env.DEST}\``,
               '',
-              'will remove:',
-              ...(willRemove.length ? willRemove.map((x) => `- ${x}`) : ['- none'])
+              '**will add/replace:**',
+              '```diff',
+              ...(willAddOrReplace.length ? willAddOrReplace.map((x) => `+ ${x}`) : ['+ none']),
+              '```',
+              '',
+              '**will remove:**',
+              '```diff',
+              ...(willRemove.length ? willRemove.map((x) => `- ${x}`) : ['- none']),
+              '```'
             ].join('\n');
 
             const issue_number = context.payload.pull_request.number;
