@@ -196,7 +196,7 @@ jobs:
               `**from:** \`./${process.env.SOURCE_DIR}/\``,
               `**to:** \`${process.env.DEST}\``,
               '',
-              '🟩 !!S3 WILL SYNC AND REUPLOAD THE FOLLOWING FILES:!! ',
+              '**🟩 !!S3 WILL SYNC AND REUPLOAD THE FOLLOWING FILES!!**',
               '```text',
               ...(willAddOrReplace.length ? willAddOrReplace : ['none']),
               '```',
