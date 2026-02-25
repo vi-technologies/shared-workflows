@@ -59,7 +59,7 @@ on:
         type: string
         default: ''
       dry-run:
-        description: 'If true, only preview changes without applying (--dryrun)'
+        description: 'For Pull request set to true, only preview changes without applying (--dryrun)'
         required: false
         type: string
         default: 'false'
