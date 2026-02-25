@@ -3,6 +3,9 @@
 # =============================================================================
 # Sync a folder from a GitHub repository to S3 using OIDC credentials.
 # 
+# !!S3 SYNC DOES NOT SUPPORT RSYNC OPTION! IT RE-UPOADS ALL FILES TO DESTINATION!
+# 
+#
 # If you are adding new folders or s3 buckets contact your DevOps.
 # USAGE:
 #   jobs:
@@ -193,7 +196,7 @@ jobs:
               `**from:** \`./${process.env.SOURCE_DIR}/\``,
               `**to:** \`${process.env.DEST}\``,
               '',
-              '🟩 will add/replace:',
+              '🟩 !!S3 WILL SYNC AND REUPLOAD THE FOLLOWING FILES:!! ',
               '```text',
               ...(willAddOrReplace.length ? willAddOrReplace : ['none']),
               '```',
@@ -237,6 +240,5 @@ jobs:
           FLAGS: ${{ steps.plan.outputs.flags }}
         run: |
           set -euo pipefail
-
           echo "Running: aws s3 sync \"./${SOURCE_DIR}/\" \"${DEST}\" ${FLAGS}"
           eval aws s3 sync "./${SOURCE_DIR}/" "${DEST}" ${FLAGS}
