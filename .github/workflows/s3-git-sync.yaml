@@ -2,7 +2,8 @@
 # S3 GIT SYNC (REUSABLE WORKFLOW)
 # =============================================================================
 # Sync a folder from a GitHub repository to S3 using OIDC credentials.
-#
+# 
+# If you are adding new folders or s3 buckets contact your DevOps.
 # USAGE:
 #   jobs:
 #     sync:
