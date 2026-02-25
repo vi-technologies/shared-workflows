@@ -111,7 +111,7 @@ jobs:
           fi
 
           FLAGS=()
-          FLAGS+=(--no-overwrite)
+          FLAGS+=(--size-only)
           if [ "${DELETE_REMOVED}" = "true" ]; then FLAGS+=(--delete); fi
           EXCLUDE_LIST=()
           if [ -n "${EXCLUDE_PATTERNS}" ]; then
